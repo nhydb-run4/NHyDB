@@ -101,9 +101,9 @@ Abschnitt 3.
 
 | Symbol | Bedeutung | Wertebereich (im Code geprüft) | Rust-Bezeichner |
 |---|---|---|---|
-| `R` | Realm-Nummer | ganze Zahl `R ≥ 1`, sonst `ValueError("realm_id muss > 0 sein")` | `realm`, `realm_id` |
-| `u` | erste Koordinate | `u ≥ 1`, sonst `ValueError("u muss > 0 sein")` | `u` |
-| `v` | **lokale** zweite Koordinate | `1 ≤ v ≤ T`; `v = 0` ⇒ `RealmLimitError("lokales v muss bei 1 beginnen")`, `v > T` ⇒ `RealmLimitError("Realm R: lokale v-Grenze erreicht …")` | `v_local`, `local_v` |
+| `R` | Realm-Nummer | ganze Zahl `R ≥ 1`, sonst `ValueError("realm_id must be > 0")` | `realm`, `realm_id` |
+| `u` | erste Koordinate | `u ≥ 1`, sonst `ValueError("u must be > 0")` | `u` |
+| `v` | **lokale** zweite Koordinate | `1 ≤ v ≤ T`; `v = 0` ⇒ `RealmLimitError("local v must start at 1")`, `v > T` ⇒ `RealmLimitError("Realm R: local v limit reached …")` | `v_local`, `local_v` |
 | `lane` | Spur | genau `0` (NL) oder `1` (NR) | `Lane = u8`, `NL = 0`, `NR = 1` |
 | `T` | Realm-Spannweite | Konstante `10^100` | `realm_span()` |
 | `V` | globale zweite Koordinate | `V ≥ 1` | `vg`, Feld `v` der Adress-Dicts |
@@ -125,7 +125,7 @@ Koordinaten (zur physischen Dekodiergrenze siehe Abschnitt 3.6).
 |---|---|
 | `0`, `"0"`, `"NL"`, `"L"`, `"DEFAULT"` (Groß-/Kleinschreibung egal, Leerraum entfernt), `None` | `0` (NL) |
 | `1`, `"1"`, `"NR"`, `"R"` | `1` (NR) |
-| sonst | `ValueError("lane muss 0/NL oder 1/NR sein")` bzw. `"lane muss 0 oder 1 sein"` |
+| sonst | `ValueError("lane must be 0/NL or 1/NR")` bzw. `"lane must be 0 or 1"` |
 
 Im Blockheader wird die Spur als Bit 0 der Flags gespeichert:
 `flags = 1` für NR, `0` für NL (`lane_flags`, `lane_from_flags = flags & 1`).
@@ -222,13 +222,13 @@ NR-Zellen `577 … 599`, `600 = N0(25)`.
 Algorithmus (nur ganzzahlige Operationen):
 
 ```text
-Eingabe N ≥ 1 (N = 0 ⇒ ValueError "N muss > 0 sein")
+Eingabe N ≥ 1 (N = 0 ⇒ ValueError "N must be > 0")
 m = isqrt(N)                 größtes m mit m² ≤ N
 d = N − m²                   es gilt 0 ≤ d ≤ 2m
 
-d = 0          ⇒ GZ(m):   AddressError "N… ist ein GZ-Punkt und keine NHyDB-Speicherzelle"
+d = 0          ⇒ GZ(m):   AddressError "N… is a GZ point, not an NHyDB storage cell"
 1 ≤ d < m      ⇒ NR:      G = m,     V = d,          u = m − d
-d = m          ⇒ N0(m+1): AddressError "N… ist ein N0-Punkt und keine NHyDB-Speicherzelle"
+d = m          ⇒ N0(m+1): AddressError "N… is an N0 point, not an NHyDB storage cell"
 m < d ≤ 2m     ⇒ NL:      G = m + 1, u = G² − N,     V = G − u
 
 (R, v) = split_global_v(V)
@@ -280,7 +280,7 @@ mit Präfix `_dyn_…`).
 
 Akzeptiert werden Dezimalzahlen mit optionalem führendem `N`/`n` und Leerraum
 (`"N589"`, `" n 12 "`, `"123"`); Ausgabe von N-Referenzen als `"N<zahl>"`
-(`N_ref`). Ungültiger Text ⇒ `AddressError("ungueltige N-Referenz '…'")`,
+(`N_ref`). Ungültiger Text ⇒ `AddressError("invalid N reference '…'")`,
 `0` ⇒ `ValueError`.
 
 ### 2.9 Geometrie der Layouts (logische Abbildungen über der Zelladresse)
@@ -411,7 +411,7 @@ pub enum Nat {
 
 | Funktion | Ablauf im Code |
 |---|---|
-| `require_positive(name, x)` | `x = 0` ⇒ `ValueError("<name> muss > 0 sein")` (negative Python-Zahlen bildet die PyO3-Schicht auf 0 ab, damit derselbe Text entsteht) |
+| `require_positive(name, x)` | `x = 0` ⇒ `ValueError("<name> must be > 0")` (negative Python-Zahlen bildet die PyO3-Schicht auf 0 ab, damit derselbe Text entsteht) |
 | `validate_local_v(v, R)` | `v = 0` ⇒ `RealmLimitError`; nur wenn `v` als `Nat::B` vorliegt, kann `v > T` gelten – dann `RealmLimitError` (Werte ≤ `u64::MAX` sind stets `< T`) |
 | `global_v_unchecked(R, v)` | `R = 1` ⇒ `V = v` (keine Multiplikation), sonst `(R−1)·T + v` über `BigUint` |
 | `split_global_v(V)` | `V` als `Nat::S` ⇒ sofort `(1, V)`; sonst `div_rem(V − 1, T)` |
@@ -465,7 +465,7 @@ n_to_address(N): isqrt über BigUint::sqrt ⇒ m = 22·T + 757;
 (Testfall `r23_u14_v744` in `address.rs`, zusätzlich NR-Rückrechnung.)
 
 **Beispiel D – Grenzzahl `n_to_address(552)`:** `isqrt(552) = 23`,
-`d = 552 − 529 = 23 = m` ⇒ `AddressError("N552 ist ein N0-Punkt und keine NHyDB-Speicherzelle")`.
+`d = 552 − 529 = 23 = m` ⇒ `AddressError("N552 is an N0 point, not an NHyDB storage cell")`.
 
 ### 3.4 Physische Kodierung der Koordinaten
 
@@ -509,12 +509,12 @@ Implementierung: `put_vu64` für `u64`, `put_vu_big` über
 `BigUint::to_radix_le(128)`; `get_vu64` dekodiert bis 64 Bit in einem
 `u128`-Akkumulator und fällt sonst auf `get_vu` (beliebige Größe) zurück.
 `get_vu_u64` wird für physische Felder (Längen, Zähler, IDs) verwendet und
-lehnt Werte > `u64::MAX` mit `CorruptionError("…: Wert zu gross")` ab.
+lehnt Werte > `u64::MAX` mit `CorruptionError("…: value too large")` ab.
 
 ### 3.6 Physische Grenze großer Koordinaten
 
 `get_vu` bricht ab, sobald die Schiebeweite 16 384 Bit überschreitet
-(`CorruptionError("VarUInt unplausibel gross")`). Eine einzelne in einer
+(`CorruptionError("VarUInt implausibly large")`). Eine einzelne in einer
 Datei gespeicherte VarUInt kann damit höchstens 2 341 Byte (≈ 16 387 Bit)
 lang sein. Das ist eine **Schutzgrenze des Dekoders** gegen manipulierte
 Dateien, keine Einschränkung der Adressmathematik selbst; Koordinaten der
@@ -527,7 +527,7 @@ Jede neu angelegte Datenbank schreibt in R0,u1 die Zelle
 `v9 = {"lane_NL": 0, "lane_NR": 1, "realm_span": 10**100}`. `check_record`
 (`db/system.rs`) prüft beim Öffnen, dass v9 – falls vorhanden – exakt diesem
 Wert entspricht und `realm_span` numerisch gleich `realm_span()` ist; sonst
-`CorruptionError("R0,u1,v9: feste Systemvorgaben verletzt …")`. Fehlt v9, gilt
+`CorruptionError("R0,u1,v9: fixed system constants violated …")`. Fehlt v9, gilt
 derselbe Wert.
 
 ### 3.8 Prüfung der Mathematik
@@ -781,8 +781,8 @@ Die Typcodes sind als `nhydb.TYPE_CODES` abrufbar.
 * **VarInt (`vi`):** ZigZag-Abbildung `n ≥ 0 → 2n`, `n < 0 → −2n−1`,
   anschließend VarUInt.
 * Dekodierfehler ergeben `CorruptionError` mit festen Texten
-  (`VarUInt endet zu frueh`, `VarUInt unplausibel gross`,
-  `Laengenwert endet hinter Payload`, `Fixed-Wert unvollstaendig`).
+  (`VarUInt ends prematurely`, `VarUInt implausibly large`,
+  `length value ends beyond the payload`, `fixed-width value incomplete`).
 
 ### 6.3 Enums
 
@@ -790,7 +790,7 @@ Ein Feld kann eine Enum-Abbildung `Label → Code` (Codes als `i64`) tragen.
 Beim Schreiben werden Labels in Codes übersetzt, beim Lesen zurück. Bei
 doppelten Codes gewinnt – wie beim Python-Dict-Comprehension – der letzte
 Eintrag. Unbekannte Labels ergeben
-`ValueError("<feld>: unbekannter Enumwert '<x>'")`.
+`ValueError("<feld>: unknown enum value '<x>'")`.
 
 ### 6.4 Selbsttypisierte Sparse-Zellen
 
@@ -798,7 +798,7 @@ Sparse-Zellen, für die kein Typ aus Shape, Extension oder Layout ableitbar
 ist, oder die mit explizitem `type=` geschrieben werden, speichern ihren
 Typcode als zusätzliches Byte („selbsttypisiert“). CUSTOM-Layoutzellen und
 MATH-Zellen sind stets selbsttypisiert. Ist kein Typ ableitbar und keiner
-angegeben, wird mit `SchemaError("…: kein Datentyp ableitbar; type=... angeben")`
+angegeben, wird mit `SchemaError("…: cannot derive a data type; specify type=...")`
 abgelehnt.
 
 ### 6.5 Der Werttyp `Val`
@@ -827,7 +827,7 @@ werden nicht gelesen; einen Konverter gibt es nicht. Alle Ganzzahlen sind Little
 | `X.nhydb` | Container (Superblöcke, Blöcke) | |
 | `X.nhydb.layout.enc` | verschlüsselter Layoutplan (1–2 Schema-Generationen) | Pfad wählbar |
 | `X.nhydb.layout.key` | 32-Byte-Schlüssel (JSON), Unix-Rechte `0600` | **separat sichern**; ohne ihn ist die DB nicht zu öffnen |
-| `X.nhydb.lock` | Sperrdatei der Rust-Engine (leer, bleibt bestehen) | nur Rust |
+| `X.nhydb.lock` | Sperrdatei für den exklusiven Schreibzugriff (leer, bleibt bestehen) | |
 
 Pfade von Plan und Schlüssel sind über `layout_path`/`key_path` bzw. die
 Konfiguration wählbar; R0,u1 speichert nur die **Dateinamen**, keine Pfade.
@@ -922,7 +922,7 @@ Ein optionaler historischer EXT-Bereich
 `0xEA vu(count) (vu(Δv<<1 | has_value) [wert])*` wird gelesen, aber nicht
 mehr geschrieben. Wegen der 32-Bit-Offsets darf der Recordbereich eines
 Batches höchstens 4 GiB umfassen
-(`ValueError("ein DATA-Batch darf maximal 4 GiB Recorddaten haben")`).
+(`ValueError("a DATA batch may contain at most 4 GiB of record data")`).
 
 ### 7.7 Sparse-Block
 
@@ -1179,10 +1179,18 @@ Speicherbedarf ist unabhängig von der Ergebnisgröße.
   verwendet (gemessene Halbierung des Schreibdurchsatzes).
 * Auf macOS garantiert `fsync(2)` nur die Übergabe an das Laufwerk, nicht das
   Leeren seines Schreibcaches; `full` garantiert zusätzlich das Leeren.
-* Wird ein Modus nicht unterstützt, schlägt die Operation fehl; es gibt
-  **keinen stillen Rückfall**.
-* Alle Syncs (Datenbank, Layoutplan, Verzeichnisse) folgen dem gewählten
-  Modus.
+* Unter Linux und Windows führt `full` denselben Aufruf aus wie `fsync`
+  (Linux: `fsync(2)` leert laut Kernel-Vertrag auch den Laufwerkscache;
+  Windows: `FlushFileBuffers`).
+* Wird ein Modus nicht unterstützt oder schlägt `F_FULLFSYNC` auf macOS fehl
+  (z. B. auf einem Dateisystem ohne Unterstützung), schlägt die Operation mit
+  einem Fehler fehl; es gibt **keinen stillen Rückfall** auf `fsync(2)`.
+* Alle Datei-Syncs (Datenbank, Layoutplan) folgen dem gewählten Modus, unter
+  Unix auch die Verzeichnis-Syncs. Unter Windows ist der Verzeichnis-Sync
+  (`sync_dir`) in beiden Modi wirkungslos (Verzeichnis-Metadaten schützt das
+  NTFS-Journal); der atomare Austausch (`atomic_replace`) verwendet dort
+  `MoveFileExW` mit `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`,
+  unter Unix `rename` mit anschließendem Verzeichnis-Sync.
 
 ### 9.7 Lebenszyklus
 
@@ -1257,7 +1265,7 @@ Schnittstelle das Trait `LayoutPlugin` (`plugin.rs`); die PyO3-Schicht
 stellt eine Brücke für Python-Objekte bereit.
 
 * Ohne registriertes Plugin schlagen Zugriffe, die die Adressfunktion
-  benötigen, mit `SchemaError("CUSTOM Layout benoetigt registriertes Plugin '…'")`
+  benötigen, mit `SchemaError("CUSTOM layout requires registered plugin '…'")`
   fehl; die Logik wird nicht simuliert.
 * **Einschränkung:** Rückrufe eines Plugins in dieselbe Datenbank während
   eines laufenden Schreibvorgangs (`put_object`, `put_objects_batch`,
@@ -1420,7 +1428,7 @@ wird als `**` gelesen.
 | Funktionen `abs`, `gcd`, `lcm`, `isqrt`, `min`, `max` (nur Positionsargumente) | `gcd(x, 6)` |
 
 Nicht erlaubt (Auswahl): Attribute, Indizes, Division `/`, Bitoperatoren,
-bedingte Ausdrücke (`a if c else b` → `MathSyntaxError("Syntaxelement IfExp ist nicht erlaubt")`).
+bedingte Ausdrücke (`a if c else b` → `MathSyntaxError("syntax element IfExp is not allowed")`).
 Semantik nach Python: beliebig große Ganzzahlen, Floor-Division und Modulo
 mit dem Vorzeichen des Divisors, `**` mit negativem Exponenten ⇒
 `MathDomainError`, `bool` in Arithmetik verboten.
@@ -1500,7 +1508,7 @@ flowchart TB
 
 Physische Realms eines MATH-Layouts sind für Shapes, Layouts, Extensions,
 Indizes und direkte `put_points` gesperrt
-(`SchemaError("Realm … gehoert exklusiv MATH Layout …")`).
+(`SchemaError("Realm … belongs exclusively to MATH layout …")`).
 `create_realm` auf einer solchen Realm-ID ist nicht
 gesperrt und ändert nur Name/Beschreibung.
 
@@ -1631,7 +1639,7 @@ FROM [realm.]layout [[AS] alias]
 | Strukturreferenzen | `@u`, `STRUCT.u` (`realm`, `u`, `v`, `lane`, `n`, `record_n`, `layout_id`, `layout_kind`, `layout_name`, `object`) |
 | Parameter | `?` (positionsnummeriert) und `:name`; werden beim Parsen eingesetzt |
 | Lexik | Kommentare `--` und `/* */`, Strings `'…'` mit `''`, Identifier `"…"`/`` `…` ``, Unicode-Ziffern nach CPython-Regeln |
-| Nicht implementiert | `DISTINCT`, `HAVING` (Fehler „noch nicht implementiert“), alle schreibenden Anweisungen |
+| Nicht implementiert | `DISTINCT`, `HAVING` (Fehler „… is not implemented in NHySQL“), alle schreibenden Anweisungen |
 
 Regeln: Feld- und Aliasauflösung case-insensitiv (casefold); nicht
 aggregierte Felder müssen gruppiert sein; `GROUP BY` ohne Aggregat ist ein
@@ -2244,7 +2252,7 @@ Weiteres Benchmark-Programm: `crates/nhydb-core/examples/bench_math.rs`
 
 Fehler aus intern verwendeten Bibliotheken erscheinen mit der passenden
 NHyDB-Fehlerklasse und eigenem Text, z. B.
-`CorruptionError("Layoutplan: Entschluesselung fehlgeschlagen")` bei einem
+`CorruptionError("layout plan: decryption/authentication failed (invalid AES-GCM tag)")` bei einem
 nicht entschlüsselbaren Layoutplan oder „invalid syntax (<unknown>, line 1)“
 bei Syntaxfehlern in MATH-Ausdrücken.
 

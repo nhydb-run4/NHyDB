@@ -1,9 +1,9 @@
-//! Python-API der Abfrageschicht (`nhydb_query_v027`): native `QueryEngine`,
-//! Laufzeit-Provider als Python-Callables, Umwandlung der Ausdrucksobjekte.
+//! Python API of the query layer (`nhydb.query`): native `QueryEngine`,
+//! runtime providers as Python callables, conversion of expression objects.
 //!
-//! Die Ausdrucksklassen (`Q`, `FieldPredicate`, …) sind schlanke Python-
-//! Dataclasses in `nhydb.query` (exakte Dataclass-Semantik); Planung und
-//! Auswertung laufen vollständig im Rust-Kern.
+//! The expression classes (`Q`, `FieldPredicate`, …) are lightweight Python
+//! dataclasses in `nhydb.query` (exact dataclass semantics); planning and
+//! evaluation run entirely in the Rust core.
 
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ fn mapping_val(obj: &Bound<'_, PyAny>) -> PyResult<Val> {
     to_val(&d)
 }
 
-/// Python-Ausdrucksobjekt → `Expr` (`ensure_expr`).
+/// Python expression object → `Expr` (`ensure_expr`).
 pub fn py_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
     let tn = obj.get_type().name()?.to_string();
     let attr = |n: &str| obj.getattr(n);
@@ -70,7 +70,7 @@ pub fn py_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
             domain: s("domain")?,
         },
         "AllPredicate" => Expr::All,
-        other => return Err(PyTypeError::new_err(format!("Query-Ausdruck erwartet, erhalten: {other}"))),
+        other => return Err(PyTypeError::new_err(format!("query expression expected, got: {other}"))),
     })
 }
 
@@ -79,13 +79,13 @@ fn is_expr(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
     obj.is_instance(&base)
 }
 
-/// `Expr` → Python-Ausdrucksobjekt.
+/// `Expr` → Python expression object.
 pub fn expr_to_py(py: Python<'_>, e: &Expr) -> PyResult<Py<PyAny>> {
     expr_to_py_ext(py, e, false)
 }
 
-/// `sql = true`: Werte von `tokens_all`/`tokens_any` als Tupel (wie
-/// `FieldRef.tokens_all(*values)` im SQL-Parser der Referenz).
+/// `sql = true`: values of `tokens_all`/`tokens_any` as a tuple (as
+/// produced by `FieldRef.tokens_all(*values)` in the SQL parser).
 pub fn expr_to_py_ext(py: Python<'_>, e: &Expr, sql: bool) -> PyResult<Py<PyAny>> {
     let m = query_mod(py)?;
     Ok(match e {
@@ -114,8 +114,8 @@ pub fn expr_to_py_ext(py: Python<'_>, e: &Expr, sql: bool) -> PyResult<Py<PyAny>
     })
 }
 
-/// `expr_from_spec` über Python-Objekten (Spezifikationen dürfen fertige
-/// Ausdrucksobjekte enthalten).
+/// `expr_from_spec` over Python objects (specifications may contain
+/// ready-made expression objects).
 pub fn spec_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
     if is_expr(obj)? {
         return py_to_expr(obj);
@@ -131,7 +131,7 @@ pub fn spec_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
                 let xs: Vec<Expr> = items.try_iter()?.map(|x| spec_to_expr(&x?)).collect::<PyResult<_>>()?;
                 let mut it = xs.into_iter();
                 let Some(mut out) = it.next() else {
-                    return Err(crate::exceptions::QueryPlanError::new_err(format!("{op} darf nicht leer sein")));
+                    return Err(crate::exceptions::QueryPlanError::new_err(format!("{op} must not be empty")));
                 };
                 for x in it {
                     out = if op == "and" { Expr::and(out, x) } else { Expr::or(out, x) };
@@ -143,10 +143,10 @@ pub fn spec_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
             return Ok(Expr::negate(spec_to_expr(&x)?));
         }
     }
-    q::expr_from_spec(&to_val(obj).map_err(|_| crate::exceptions::QueryPlanError::new_err("Query-Ausdruck muss ein Objekt sein"))?).py()
+    q::expr_from_spec(&to_val(obj).map_err(|_| crate::exceptions::QueryPlanError::new_err("query expression must be an object"))?).py()
 }
 
-/// Laufzeit-Provider als Python-Callable `function(engine, ctx, params)`.
+/// Runtime provider as a Python callable `function(engine, ctx, params)`.
 struct PyProvider {
     function: Py<PyAny>,
     estimator: Option<Py<PyAny>>,
@@ -219,7 +219,7 @@ fn lane_arg(lane: Option<&Bound<'_, PyAny>>) -> PyResult<Lane> {
 impl PyQueryEngine {
     #[new]
     fn new(db: &Bound<'_, PyAny>) -> PyResult<Self> {
-        db.cast::<NHyDB>().map_err(|_| PyTypeError::new_err("QueryEngine braucht eine NHyDB-Instanz"))?;
+        db.cast::<NHyDB>().map_err(|_| PyTypeError::new_err("QueryEngine requires an NHyDB instance"))?;
         Ok(PyQueryEngine { db: db.clone().unbind(), providers: Providers::default() })
     }
 
@@ -228,7 +228,7 @@ impl PyQueryEngine {
         self.db.clone_ref(py)
     }
 
-    /// Registrierte Provider `{name: {name, domain, description, builtin}}`.
+    /// Registered providers `{name: {name, domain, description, builtin}}`.
     #[getter]
     fn math_providers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
@@ -374,7 +374,7 @@ impl PyQueryEngine {
         from_val(slf.py(), &r)
     }
 
-    /// `execute_sql_numpy(text, parameters=None, *, lane=0)` → `{Spalte: ndarray}`
+    /// `execute_sql_numpy(text, parameters=None, *, lane=0)` → `{column: ndarray}`
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn execute_sql_numpy(slf: &Bound<'_, Self>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), sql_params(parameters)?, lane_arg(lane)?);
@@ -383,7 +383,7 @@ impl PyQueryEngine {
     }
 
     /// `execute_numpy(expr, *, realm=None, lane=0, select, order_by=None, limit=None,
-    /// offset=0)`: Projektion (`fields`) als `{"record_N": …, feld: ndarray}`.
+    /// offset=0)`: projection (`fields`) as `{"record_N": …, field: ndarray}`.
     #[pyo3(signature = (expr, *, realm=None, lane=None, select, order_by=None, limit=None, offset=None))]
     #[allow(clippy::too_many_arguments)]
     fn execute_numpy(
@@ -435,7 +435,7 @@ impl PyQueryEngine {
 // NHySQL
 // ----------------------------------------------------------------------
 
-/// Python-Parameter → `Params` (Sequenz für `?`, Mapping für `:name`).
+/// Python parameters → `Params` (sequence for `?`, mapping for `:name`).
 pub fn sql_params(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Params> {
     let Some(o) = obj.filter(|o| !o.is_none()) else { return Ok(Params::None) };
     let py = o.py();
@@ -535,7 +535,7 @@ fn parse_sql(py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<
     statement_py(py, &st)
 }
 
-/// `_sql_scan(text)` → Liste `SQLToken` (für Werkzeuge/Tests).
+/// `_sql_scan(text)` → list of `SQLToken` (for tools/tests).
 #[pyfunction]
 fn _sql_scan(py: Python<'_>, text: &str) -> PyResult<Py<PyAny>> {
     let cls = query_mod(py)?.getattr("SQLToken")?;
@@ -551,7 +551,7 @@ pub fn compile_sql_py(py: Python<'_>, db: &nhydb_core::db::Db, text: &str, param
     compiled_py(py, &cq)
 }
 
-/// Ergebniszeilen (`rows`, Spalten aus `columns` bzw. `select`) → `{Spalte: ndarray}`.
+/// Result rows (`rows`, columns from `columns` or `select`) → `{column: ndarray}`.
 pub fn rows_to_numpy(py: Python<'_>, result: &Val) -> PyResult<Py<PyAny>> {
     let names: Vec<String> = match result.get("columns") {
         Some(Val::List(c)) => c.iter().map(|x| x.py_str()).collect(),
@@ -572,7 +572,7 @@ pub fn rows_to_numpy(py: Python<'_>, result: &Val) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
-/// `expr_from_spec(raw)` → Python-Ausdruck.
+/// `expr_from_spec(raw)` → Python expression.
 #[pyfunction]
 fn expr_from_spec(py: Python<'_>, raw: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     if is_expr(raw)? {
@@ -581,7 +581,7 @@ fn expr_from_spec(py: Python<'_>, raw: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>>
     expr_to_py(py, &spec_to_expr(raw)?)
 }
 
-/// Kurzweg für `NHyDB.query`/`explain_query` (frische Engine ohne Laufzeit-Provider).
+/// Shortcut for `NHyDB.query`/`explain_query` (fresh engine without runtime providers).
 pub fn run_core<T>(db: &nhydb_core::db::Db, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T>) -> PyResult<T> {
     let providers = Providers::default();
     let eng = QueryEngine::new(db, &providers);

@@ -1,9 +1,9 @@
-//! Dynadron-Adressmathematik der NHyDB (v0.14 `normalize_lane` …
-//! `cell_address`). Siehe `docs/00_MATHEMATISCHE_GRUNDLAGEN.md`.
+//! Dynadron address mathematics of NHyDB (`normalize_lane` …
+//! `cell_address`).
 //!
-//! Zellidentität ist `(R, u, v_local, lane)`. `N` ist eine rein
-//! arithmetisch abgeleitete Referenz; GZ (`G²`) und N0 (`G(G-1)`) sind keine
-//! Speicherzellen. Alle Rechnungen sind exakt (keine Floats, kein u64-Zwang).
+//! Cell identity is `(R, u, v_local, lane)`. `N` is a purely
+//! arithmetically derived reference; GZ (`G²`) and N0 (`G(G-1)`) are not
+//! storage cells. All computations are exact (no floats, no u64 limit).
 
 use num_bigint::BigUint;
 use std::sync::OnceLock;
@@ -17,13 +17,13 @@ pub type Lane = u8;
 pub const NL: Lane = 0;
 pub const NR: Lane = 1;
 
-/// `T = 10^100` – konstante lokale Realm-Spannweite.
+/// `T = 10^100` – constant local realm span.
 pub fn realm_span() -> &'static Nat {
     static SPAN: OnceLock<Nat> = OnceLock::new();
     SPAN.get_or_init(|| Nat::pow10(100))
 }
 
-/// 10^200 – Platzhalterbreite unbegrenzter Layoutbereiche (v0.14).
+/// 10^200 – placeholder width of unbounded layout ranges.
 pub fn unbounded_width() -> &'static Nat {
     static W: OnceLock<Nat> = OnceLock::new();
     W.get_or_init(|| Nat::pow10(200))
@@ -33,22 +33,22 @@ pub fn lane_name(lane: Lane) -> &'static str {
     if lane == NR { "NR" } else { "NL" }
 }
 
-/// `normalize_lane` für Texteingaben.
+/// `normalize_lane` for text input.
 pub fn normalize_lane_str(s: &str) -> Result<Lane> {
     let x = s.trim().to_uppercase();
     match x.as_str() {
         "0" | "NL" | "L" | "DEFAULT" => Ok(NL),
         "1" | "NR" | "R" => Ok(NR),
-        _ => Err(Error::Value("lane muss 0/NL oder 1/NR sein".into())),
+        _ => Err(Error::Value("lane must be 0/NL or 1/NR".into())),
     }
 }
 
-/// `normalize_lane` für Ganzzahlen.
+/// `normalize_lane` for integers.
 pub fn normalize_lane_int(v: i64) -> Result<Lane> {
     match v {
         0 => Ok(NL),
         1 => Ok(NR),
-        _ => Err(Error::Value("lane muss 0 oder 1 sein".into())),
+        _ => Err(Error::Value("lane must be 0 or 1".into())),
     }
 }
 
@@ -62,20 +62,20 @@ pub fn lane_flags(lane: Lane) -> u16 {
 
 pub fn require_positive(name: &str, v: &Nat) -> Result<()> {
     if v.is_zero() {
-        return Err(Error::Value(format!("{name} muss > 0 sein")));
+        return Err(Error::Value(format!("{name} must be > 0")));
     }
     Ok(())
 }
 
 pub fn validate_local_v(v: &Nat, realm: Option<&Nat>) -> Result<()> {
     if v.is_zero() {
-        return Err(Error::RealmLimit("lokales v muss bei 1 beginnen".into()));
+        return Err(Error::RealmLimit("local v must start at 1".into()));
     }
     if let Nat::B(_) = v {
         if v > realm_span() {
             let prefix = realm.map(|r| format!("Realm {r}: ")).unwrap_or_default();
             return Err(Error::RealmLimit(format!(
-                "{prefix}lokale v-Grenze erreicht. Erlaubt sind 1..10^100; fuer weitere v-Positionen den naechsten Realm verwenden."
+                "{prefix}local v limit reached. Allowed range is 1..10^100; use the next realm for further v positions."
             )));
         }
     }
@@ -115,13 +115,13 @@ pub fn split_global_v(vg: &Nat) -> Result<(Nat, Nat)> {
     Ok((q.add_u64(1), r.add_u64(1)))
 }
 
-/// Ergebnis von `dynadron_address` (alle Werte exakt).
+/// Result of `dynadron_address` (all values exact).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DynAddress {
     pub realm: Nat,
     pub u: Nat,
     pub v_local: Nat,
-    /// globale Koordinate V
+    /// global coordinate V
     pub v: Nat,
     pub g: Nat,
     pub station: Nat,
@@ -162,10 +162,10 @@ fn square(g: &Nat) -> Nat {
     g.mul(g)
 }
 
-/// `N` für Spur NL: `G² - u`; NR: `G² + V`.
+/// `N` for lane NL: `G² - u`; NR: `G² + V`.
 fn n_pair(u: &Nat, vg: &Nat) -> (Nat, Nat, Nat) {
     let g = u.add(vg);
-    // schneller Pfad: alles in u128
+    // fast path: everything in u128
     if let (Nat::S(a), Nat::S(b)) = (u, vg) {
         let gg = *a as u128 + *b as u128;
         if gg < (1u128 << 63) {
@@ -203,7 +203,7 @@ pub fn dynadron_address(realm: &Nat, u: &Nat, local_v: &Nat) -> Result<DynAddres
     })
 }
 
-/// Nur die N-Zahl (ohne Zusatzmetadaten); validiert Eingaben.
+/// Only the N number (without extra metadata); validates inputs.
 pub fn dynadron_n(realm: &Nat, u: &Nat, local_v: &Nat, lane: Lane) -> Result<Nat> {
     require_positive("realm_id", realm)?;
     require_positive("u", u)?;
@@ -213,7 +213,7 @@ pub fn dynadron_n(realm: &Nat, u: &Nat, local_v: &Nat, lane: Lane) -> Result<Nat
     Ok(if lane == NR { nr } else { nl })
 }
 
-/// Vollständige Zelladresse (`cell_address`).
+/// Full cell address (`cell_address`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellAddress {
     pub dyn_: DynAddress,
@@ -235,7 +235,7 @@ impl CellAddress {
         format!("N{}", self.n)
     }
 
-    /// Dict wie v0.14 `cell_address`.
+    /// Dict in the shape of `cell_address`.
     pub fn to_val(&self) -> Val {
         let mut out = self.dyn_.to_val();
         out.set("lane", Val::Int(self.lane as i64));
@@ -245,7 +245,7 @@ impl CellAddress {
         out
     }
 
-    /// Dict wie v0.14 `n_to_dynadron_address`.
+    /// Dict in the shape of `n_to_dynadron_address`.
     pub fn to_n_val(&self) -> Val {
         vmap! {
             "N" => &self.n, "N_ref" => self.n_ref(), "realm" => &self.dyn_.realm,
@@ -262,7 +262,7 @@ pub fn cell_address(realm: &Nat, u: &Nat, local_v: &Nat, lane: Lane) -> Result<C
     Ok(CellAddress { dyn_: d, lane, n })
 }
 
-/// `parse_n_reference` für Texteingaben (`"N123"`, `"123"`).
+/// `parse_n_reference` for text input (`"N123"`, `"123"`).
 pub fn parse_n_reference(s: &str) -> Result<Nat> {
     let raw = s.trim();
     let raw = if raw.as_bytes().first().map(|c| c.eq_ignore_ascii_case(&b'N')).unwrap_or(false) {
@@ -270,7 +270,7 @@ pub fn parse_n_reference(s: &str) -> Result<Nat> {
     } else {
         raw
     };
-    let n = Nat::parse_decimal(raw).ok_or_else(|| Error::Address(format!("ungueltige N-Referenz '{s}'")))?;
+    let n = Nat::parse_decimal(raw).ok_or_else(|| Error::Address(format!("invalid N reference '{s}'")))?;
     require_positive("N", &n)?;
     Ok(n)
 }
@@ -291,18 +291,18 @@ fn isqrt(n: &Nat) -> Nat {
     }
 }
 
-/// Arithmetische Umkehrung `N → (R, u, v_local, lane)` (`n_to_dynadron_address`).
+/// Arithmetic inverse `N → (R, u, v_local, lane)` (`n_to_dynadron_address`).
 pub fn n_to_address(n: &Nat) -> Result<CellAddress> {
     require_positive("N", n)?;
     let m = isqrt(n);
     let d = n.checked_sub(&square(&m)).unwrap();
     let (u, vg, lane) = if d.is_zero() {
-        return Err(Error::Address(format!("N{n} ist ein GZ-Punkt und keine NHyDB-Speicherzelle")));
+        return Err(Error::Address(format!("N{n} is a GZ point, not an NHyDB storage cell")));
     } else if d < m {
         let u = m.checked_sub(&d).unwrap();
         (u, d, NR)
     } else if d == m {
-        return Err(Error::Address(format!("N{n} ist ein N0-Punkt und keine NHyDB-Speicherzelle")));
+        return Err(Error::Address(format!("N{n} is an N0 point, not an NHyDB storage cell")));
     } else {
         let g = m.add_u64(1);
         let u = square(&g).checked_sub(n).unwrap();
@@ -312,7 +312,7 @@ pub fn n_to_address(n: &Nat) -> Result<CellAddress> {
     let (realm, local_v) = split_global_v(&vg)?;
     let addr = cell_address(&realm, &u, &local_v, lane)?;
     if &addr.n != n {
-        return Err(Error::Address(format!("N{n} konnte nicht eindeutig aufgeloest werden")));
+        return Err(Error::Address(format!("N{n} could not be resolved unambiguously")));
     }
     Ok(addr)
 }
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn exhaustive_small_range() {
-        // Jede Zahl 1..200000 ist entweder GZ/N0 oder exakt invertierbar.
+        // Every number 1..200000 is either GZ/N0 or exactly invertible.
         let mut valid = 0;
         for n in 1u64..200_000 {
             let m = (n as f64).sqrt() as u64;

@@ -1,7 +1,7 @@
-//! Zustandslose Kernel-Funktionen für Python (Unicode, Krypto, JSON).
+//! Stateless kernel functions for Python (Unicode, crypto, JSON).
 //!
-//! Die mit `_` beginnenden Funktionen dienen den Konformitätstests gegen
-//! CPython bzw. `cryptography` und sind keine stabile Benutzer-API.
+//! Functions starting with `_` serve the conformance tests against
+//! CPython or `cryptography` and are not a stable user API.
 
 use num_bigint::BigInt;
 use pyo3::exceptions::PyValueError;
@@ -17,12 +17,12 @@ use crate::conv::{from_val, nat_py, to_val, IntoPy};
 use crate::exceptions::{CorruptionError, SchemaError};
 
 // ----------------------------------------------------------------------
-// Feld-/Shape-Objekte (Duck-Typing wie Python: .v, .name, .type, .enum)
+// Field/shape objects (duck typing: .v, .name, .type, .enum)
 // ----------------------------------------------------------------------
 
 fn field_of(obj: &Bound<'_, PyAny>) -> PyResult<FieldDef> {
     let typ: String = obj.getattr("type")?.extract()?;
-    let t = TypeCode::from_name(&typ).ok_or_else(|| SchemaError::new_err(format!("Typ {} unbekannt", Val::str(typ.as_str()).py_repr())))?;
+    let t = TypeCode::from_name(&typ).ok_or_else(|| SchemaError::new_err(format!("type {} unknown", Val::str(typ.as_str()).py_repr())))?;
     let v = match obj.getattr("v") {
         Ok(x) => crate::conv::to_nat(&x).unwrap_or(Nat::ZERO),
         Err(_) => Nat::ZERO,
@@ -68,7 +68,7 @@ fn dec_len<'py>(py: Python<'py>, buf: &[u8], pos: usize) -> PyResult<(Bound<'py,
     let mut p = pos;
     let ln = nhydb_core::nat::get_vu(buf, &mut p).py()?;
     let end = ln.as_u64().and_then(|l| p.checked_add(l as usize)).filter(|e| *e <= buf.len());
-    let end = end.ok_or_else(|| CorruptionError::new_err("Laengenwert endet hinter Payload"))?;
+    let end = end.ok_or_else(|| CorruptionError::new_err("length value ends beyond payload"))?;
     Ok((PyBytes::new(py, &buf[p..end]), end))
 }
 
@@ -88,7 +88,7 @@ fn encode_big_posting<'py>(py: Python<'py>, us: &Bound<'py, PyAny>) -> PyResult<
     let mut prev = BigInt::from(0);
     for x in bigints(us)? {
         if x <= prev {
-            return Err(PyValueError::new_err("Posting-u muss streng aufsteigend sein"));
+            return Err(PyValueError::new_err("posting u must be strictly increasing"));
         }
         prev = x.clone();
         v.push(Nat::from_bigint(&x).unwrap());
@@ -143,14 +143,14 @@ fn dec_value(py: Python<'_>, field: &Bound<'_, PyAny>, buf: &Bound<'_, PyAny>, p
 fn encode_row(sid: &str, fields: &[FieldDef], values: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
     if let Ok(d) = values.cast::<PyDict>() {
         for f in fields {
-            let v = d.get_item(f.name.as_str())?.ok_or_else(|| SchemaError::new_err(format!("Pflichtfeld {} fehlt", Val::str(f.name.as_str()).py_repr())))?;
+            let v = d.get_item(f.name.as_str())?.ok_or_else(|| SchemaError::new_err(format!("required field {} missing", Val::str(f.name.as_str()).py_repr())))?;
             encode_value(f, &to_val(&v)?, out).py()?;
         }
         return Ok(());
     }
     let vals: Vec<Bound<'_, PyAny>> = values.try_iter()?.collect::<PyResult<_>>()?;
     if vals.len() != fields.len() {
-        return Err(SchemaError::new_err(format!("Shape {sid} erwartet {} Werte, erhalten {}", fields.len(), vals.len())));
+        return Err(SchemaError::new_err(format!("shape {sid} expects {} values, got {}", fields.len(), vals.len())));
     }
     for (f, v) in fields.iter().zip(vals.iter()) {
         encode_value(f, &to_val(v)?, out).py()?;
@@ -166,7 +166,7 @@ fn encode_dense_row<'py>(py: Python<'py>, shape: &Bound<'py, PyAny>, values: &Bo
     Ok(PyBytes::new(py, &out))
 }
 
-/// Kompilierter Batch-Encoder (`compile_dense_batch_codec(shape)`).
+/// Compiled batch encoder (`compile_dense_batch_codec(shape)`).
 #[pyclass(module = "nhydb", frozen)]
 pub struct DenseBatchCodec {
     sid: String,
@@ -182,19 +182,19 @@ impl DenseBatchCodec {
             let row = row?;
             let vals: Vec<Bound<'_, PyAny>> = row.try_iter()?.collect::<PyResult<_>>()?;
             if vals.len() != self.fields.len() {
-                return Err(SchemaError::new_err(format!("Shape {} erwartet {} Werte", self.sid, self.fields.len())));
+                return Err(SchemaError::new_err(format!("shape {} expects {} values", self.sid, self.fields.len())));
             }
             for (f, v) in self.fields.iter().zip(vals.iter()) {
                 let mut val = to_val(v)?;
                 if f.enum_map.is_some() {
                     if let Val::Str(s) = &val {
-                        val = Val::Int(f.enum_code(s).ok_or_else(|| PyValueError::new_err("unbekannter Enumwert"))?);
+                        val = Val::Int(f.enum_code(s).ok_or_else(|| PyValueError::new_err("unknown enum value"))?);
                     }
                 }
                 encode_value(f, &val, &mut out).py()?;
             }
             if out.len() > u32::MAX as usize {
-                return Err(PyValueError::new_err("ein DATA-Batch darf maximal 4 GiB Recorddaten haben"));
+                return Err(PyValueError::new_err("a DATA batch may contain at most 4 GiB of record data"));
             }
             offsets.push(out.len() as u32);
         }
@@ -212,7 +212,7 @@ fn compile_dense_batch_codec(shape: &Bound<'_, PyAny>) -> PyResult<DenseBatchCod
     Ok(DenseBatchCodec { sid, fields })
 }
 
-/// Kompilierter selektiver Decoder (`compile_selective_decoder`).
+/// Compiled selective decoder (`compile_selective_decoder`).
 #[pyclass(module = "nhydb", frozen)]
 pub struct SelectiveDecoder {
     fields: Vec<FieldDef>,
@@ -250,7 +250,7 @@ fn compile_selective_decoder(shape: &Bound<'_, PyAny>, wanted_vs: &Bound<'_, PyA
     }
     let missing: Vec<String> = wanted.iter().filter(|w| !fields.iter().any(|f| &f.v == *w)).map(|w| w.to_string()).collect();
     if !missing.is_empty() {
-        return Err(SchemaError::new_err(format!("v nicht im Shape: [{}]", missing.join(", "))));
+        return Err(SchemaError::new_err(format!("v not in shape: [{}]", missing.join(", "))));
     }
     let max_v = wanted.iter().max().unwrap().clone();
     let flags: Vec<bool> = fields.iter().map(|f| wanted.contains(&f.v)).collect();
@@ -318,14 +318,14 @@ fn json_bytes<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'
     Ok(PyBytes::new(py, to_val(obj)?.to_json().py()?.as_bytes()))
 }
 
-/// Eigenschaftsbits aller Code Points 0..0x110000 (siehe `unicode::prop_bits`).
+/// Property bits of all code points 0..0x110000 (see `unicode::prop_bits`).
 #[pyfunction]
 fn _unicode_prop_table(py: Python<'_>) -> Bound<'_, PyBytes> {
     let v: Vec<u8> = py.detach(|| (0u32..0x110000).map(unicode::prop_bits).collect());
     PyBytes::new(py, &v)
 }
 
-/// Dezimalwerte aller Code Points (255 = keiner).
+/// Decimal values of all code points (255 = none).
 #[pyfunction]
 fn _unicode_decimal_table(py: Python<'_>) -> Bound<'_, PyBytes> {
     let v: Vec<u8> = (0u32..0x110000)
@@ -375,7 +375,7 @@ fn _json_dumps(obj: &Bound<'_, PyAny>, ensure_ascii: bool) -> PyResult<String> {
 }
 
 // ----------------------------------------------------------------------
-// Externer Layoutplan (private Helfer der Referenz, für Tests/Werkzeuge)
+// External layout plan (private helpers, for tests/tools)
 // ----------------------------------------------------------------------
 
 use nhydb_core::db::system;

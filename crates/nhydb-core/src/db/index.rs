@@ -1,9 +1,9 @@
-//! Sekundäre Inhaltsindizes (`SECONDARY`, Tag `SI10`).
+//! Secondary content indexes (`SECONDARY`, tag `SI10`).
 //!
-//! Wie v0.14 an BASE-/Dense-Records gekoppelt: indiziert werden Dense-
-//! Records (BASE-Felder aus den gespeicherten Rohwerten, Extension-Felder
-//! aus der zusammengeführten Recordsicht). Postinglisten werden als
-//! u32/u64-Arrays oder (bei u > 2^64) als VarUInt-Deltas zlib-komprimiert.
+//! Coupled to BASE/dense records: dense records are indexed
+//! (BASE fields from the stored raw values, extension fields
+//! from the merged record view). Posting lists are stored zlib-compressed as
+//! u32/u64 arrays or (for u > 2^64) as VarUInt deltas.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -22,21 +22,21 @@ use crate::vmap;
 
 use super::{BlockInfo, Db, PostingRef, SecondaryDir, SVal};
 
-/// Filterbedingung für `find_u`.
+/// Filter condition for `find_u`.
 #[derive(Clone, Debug)]
 pub enum Cond {
     Eq(Val),
     Range(Val, Val),
 }
 
-/// Postinginhalt eines Schlüssels während des Aufbaus.
+/// Posting content of a key during the build.
 #[derive(Clone, Debug)]
 pub(crate) enum Bucket {
-    /// Dokument-u (VALUE/TOKEN/TRIGRAM).
+    /// Document u (VALUE/TOKEN/TRIGRAM).
     Us(Vec<Nat>),
-    /// FULLTEXT: (u, Positionen).
+    /// FULLTEXT: (u, positions).
     Ft(Vec<(Nat, Vec<u64>)>),
-    /// FULLTEXT: (u, Dokumentlänge) unter `FULLTEXT_DOCLEN_KEY`.
+    /// FULLTEXT: (u, document length) under `FULLTEXT_DOCLEN_KEY`.
     Doc(Vec<(Nat, u64)>),
 }
 
@@ -54,7 +54,7 @@ impl Bucket {
 pub(crate) struct ValueMap {
     items: Vec<(Val, Bucket)>,
     pos: HashMap<ValKey, usize>,
-    /// Schneller Pfad für Textschlüssel (TOKEN/TRIGRAM/FULLTEXT).
+    /// Fast path for text keys (TOKEN/TRIGRAM/FULLTEXT).
     spos: HashMap<String, usize>,
 }
 
@@ -89,7 +89,7 @@ impl ValueMap {
     }
 }
 
-/// Header eines SECONDARY-Blocks (Verzeichnis wird erst bei Bedarf geladen).
+/// Header of a SECONDARY block (the directory is loaded only when needed).
 #[derive(Clone, Debug)]
 pub struct SecondaryMeta {
     pub index_id: u64,
@@ -103,15 +103,15 @@ pub struct SecondaryMeta {
     pub block_id: u64,
 }
 
-/// Python-Vergleich zweier Skalare (`lo <= value`).
+/// Python-style comparison of two scalars (`lo <= value`).
 pub fn py_cmp(a: &Val, b: &Val) -> Result<Ordering> {
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
-        return x.partial_cmp(&y).ok_or_else(|| Error::Type("Rangefilter passt nicht zum Indextyp".into()));
+        return x.partial_cmp(&y).ok_or_else(|| Error::Type("Range filter does not match the index type".into()));
     }
     match (a, b) {
         (Val::Str(x), Val::Str(y)) => Ok(x.cmp(y)),
         (Val::Bytes(x), Val::Bytes(y)) => Ok(x.cmp(y)),
-        _ => Err(Error::Type("Rangefilter passt nicht zum Indextyp".into())),
+        _ => Err(Error::Type("Range filter does not match the index type".into())),
     }
 }
 
@@ -126,14 +126,14 @@ pub fn json_key_encode(v: &Val) -> Result<String> {
 }
 
 pub fn json_key_decode(raw: &[u8]) -> Result<Val> {
-    let s = std::str::from_utf8(raw).map_err(|e| Error::Corruption(format!("SECONDARY Schluessel: {e}")))?;
+    let s = std::str::from_utf8(raw).map_err(|e| Error::Corruption(format!("SECONDARY key: {e}")))?;
     let v = Val::from_json(s)?;
     if let Val::Map(m) = &v {
         if m.len() == 1 && m[0].0 == "__bytes__" {
             if let Val::Str(h) = &m[0].1 {
                 let bytes: Option<Vec<u8>> =
                     (0..h.len() / 2).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()).collect();
-                return bytes.map(Val::Bytes).ok_or_else(|| Error::Corruption("SECONDARY Bytes-Schluessel".into()));
+                return bytes.map(Val::Bytes).ok_or_else(|| Error::Corruption("SECONDARY bytes key".into()));
             }
         }
     }
@@ -145,7 +145,7 @@ pub fn encode_big_posting(us: &[Nat]) -> Result<Vec<u8>> {
     let mut prev = Nat::ZERO;
     for u in us {
         let d = u.checked_sub(&prev).filter(|d| !d.is_zero()).ok_or_else(|| {
-            Error::Value("Big-u-Posting muss streng aufsteigend sein".into())
+            Error::Value("Big-u posting must be strictly ascending".into())
         })?;
         d.put_vu(&mut out);
         prev = u.clone();
@@ -160,18 +160,18 @@ pub fn decode_big_posting(raw: &[u8], count: u64) -> Result<Vec<Nat>> {
     for _ in 0..count {
         let d = get_vu(raw, &mut p)?;
         if d.is_zero() {
-            return Err(Error::Corruption("Big-u-Postingdelta muss >0 sein".into()));
+            return Err(Error::Corruption("Big-u posting delta must be >0".into()));
         }
         prev = prev.add(&d);
         out.push(prev.clone());
     }
     if p != raw.len() {
-        return Err(Error::Corruption("Big-u-Posting Restbytes".into()));
+        return Err(Error::Corruption("Big-u posting trailing bytes".into()));
     }
     Ok(out)
 }
 
-/// Vorab ausgewertete Schlüsselerzeugung eines Index.
+/// Pre-evaluated key generation of an index.
 pub(crate) struct KeyGen {
     casefold: bool,
     ngram: usize,
@@ -204,14 +204,14 @@ fn sort_dedup_check<T: Ord + Clone>(v: &mut [T]) {
 }
 
 
-/// Wertlisten je `(index_id, lane)` während des Aufbaus.
+/// Value lists per `(index_id, lane)` during the build.
 type IndexMaps = HashMap<(u64, Lane), ValueMap>;
-/// Positions-Postings je Anfrageterm (geteilt, ohne Kopie).
+/// Positional postings per query term (shared, without copying).
 pub type TermPostingsOwned = Vec<(String, Arc<Vec<FtPosting>>)>;
 
 impl Db {
     // ------------------------------------------------------------------
-    // SECONDARY-Blöcke: Header beim Öffnen, Verzeichnis bei Bedarf
+    // SECONDARY blocks: header on open, directory on demand
     // ------------------------------------------------------------------
 
     /// `_register_secondary_header`
@@ -220,7 +220,7 @@ impl Db {
         let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
         let raw = self.store.read_upto(payload_off, 128.min(info.payload_len as usize))?;
         if !raw.starts_with(SEC_TAG) {
-            return Err(Error::Corruption(format!("SECONDARY Block {}: Tag falsch", info.block_id)));
+            return Err(Error::Corruption(format!("SECONDARY block {}: wrong tag", info.block_id)));
         }
         let mut p = 4;
         let index_id = get_vu_u64(&raw, &mut p, "SECONDARY index")?;
@@ -231,7 +231,7 @@ impl Db {
         let payload_end = payload_off + info.payload_len;
         let postings_base = dir_off.saturating_add(dir_len);
         if postings_base > payload_end {
-            return Err(Error::Corruption("SECONDARY Directory ausserhalb des Blocks".into()));
+            return Err(Error::Corruption("SECONDARY directory outside the block".into()));
         }
         let meta = SecondaryMeta {
             index_id,
@@ -269,7 +269,7 @@ impl Db {
         for _ in 0..meta.entry_count {
             let klen = get_vu_u64(&dbytes, &mut q, "SECONDARY key")? as usize;
             if q + klen > dbytes.len() {
-                return Err(Error::Corruption("Laengenwert endet hinter Payload".into()));
+                return Err(Error::Corruption("Length value ends beyond payload".into()));
             }
             let value = json_key_decode(&dbytes[q..q + klen])?;
             q += klen;
@@ -277,14 +277,14 @@ impl Db {
             let clen = get_vu_u64(&dbytes, &mut q, "SECONDARY clen")?;
             let cnt = get_vu_u64(&dbytes, &mut q, "SECONDARY cnt")?;
             let Some(&width) = dbytes.get(q) else {
-                return Err(Error::Corruption("SECONDARY width fehlt".into()));
+                return Err(Error::Corruption("SECONDARY width missing".into()));
             };
             q += 1;
             if !matches!(width, 0 | 4 | 8 | PAYLOAD_FULLTEXT_POSITIONS | PAYLOAD_FULLTEXT_DOCLENS) {
-                return Err(Error::Corruption("SECONDARY payload codec ungueltig".into()));
+                return Err(Error::Corruption("SECONDARY payload codec invalid".into()));
             }
             if meta.postings_base.checked_add(rel).and_then(|a| a.checked_add(clen)).map(|e| e > meta.payload_end).unwrap_or(true) {
-                return Err(Error::Corruption("SECONDARY Postingliste zeigt ueber den Block hinaus".into()));
+                return Err(Error::Corruption("SECONDARY posting list points beyond the block".into()));
             }
             let r = PostingRef { value: value.clone(), abs_offset: meta.postings_base + rel, compressed_len: clen, raw_count: cnt, width };
             match dir.by_key.get(&ValKey(value.clone())) {
@@ -296,14 +296,14 @@ impl Db {
             }
         }
         if q != dbytes.len() {
-            return Err(Error::Corruption("SECONDARY Directory Restbytes".into()));
+            return Err(Error::Corruption("SECONDARY directory trailing bytes".into()));
         }
         let arc = Arc::new(dir);
         self.cache().sec_dirs.insert((index_id, lane), arc.clone());
         Ok(arc)
     }
 
-    /// `_secondary_keys_sorted`: natürliche Ordnung der Schlüssel.
+    /// `_secondary_keys_sorted`: natural ordering of the keys.
     fn secondary_keys_sorted(&self, index_id: u64, lane: Lane) -> Result<Arc<Vec<Val>>> {
         if let Some(k) = self.cache().sec_sorted.get(&(index_id, lane)) {
             return Ok(k.clone());
@@ -319,7 +319,7 @@ impl Db {
         }
         if !ok || keys.len() > 1 && keys.windows(2).any(|w| crate::val::py_cmp(&w[0], &w[1]) == Some(Ordering::Greater)) {
             if !ok {
-                return Err(Error::Type("Rangefilter passt nicht zu gemischten Indextypen".into()));
+                return Err(Error::Type("Range filter does not match mixed index types".into()));
             }
             keys.sort_by(|a, b| crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal));
         }
@@ -328,7 +328,7 @@ impl Db {
         Ok(arc)
     }
 
-    /// Öffentliche Sicht auf das (lazy geladene) Verzeichnis.
+    /// Public view of the (lazily loaded) directory.
     pub fn secondary_directory(&self, index_id: u64, lane: Lane) -> Result<Arc<SecondaryDir>> {
         self.secondary_dir(index_id, lane)
     }
@@ -337,7 +337,7 @@ impl Db {
         self.secondary_source_block.get(&(index_id, lane)).copied()
     }
 
-    /// Anzahl der Verzeichniseinträge des aktuellen SECONDARY-Blocks.
+    /// Number of directory entries of the current SECONDARY block.
     pub(crate) fn secondary_entry_count(&self, index_id: u64, lane: Lane) -> usize {
         self.secondary_blocks.get(&(index_id, lane)).map(|m| m.entry_count as usize).unwrap_or(0)
     }
@@ -347,7 +347,7 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Aufbau (`_build_maps_fast`, `_persist_secondary`, `build_indexes`)
+    // Build (`_build_maps_fast`, `_persist_secondary`, `build_indexes`)
     // ------------------------------------------------------------------
 
     fn append_index_document(map: &mut ValueMap, idef: &IndexDef, kg: &KeyGen, u: &Nat, value: &Val) -> Result<()> {
@@ -401,8 +401,8 @@ impl Db {
         Ok(())
     }
 
-    /// Wertlisten aller ausgewählten Indizes (`_build_maps_fast` der v0.27):
-    /// BASE-Felder über den Dense-Pfad, Extensions direkt aus Sparse-Blöcken.
+    /// Value lists of all selected indexes (`_build_maps_fast`):
+    /// BASE fields via the dense path, extensions directly from sparse blocks.
     fn build_maps(&self, selected: &[IndexDef]) -> Result<(IndexMaps, u64, u64)> {
         let mut maps: HashMap<(u64, Lane), ValueMap> = HashMap::new();
         let mut kgs: HashMap<u64, KeyGen> = HashMap::new();
@@ -427,10 +427,10 @@ impl Db {
             let ext_idxs: Vec<&IndexDef> = idxs.iter().copied().filter(|i| !base_vs.contains(i.field_v())).collect();
             for lane in [0u8, 1] {
                 let key = (realm.clone(), lane);
-                // Fix S8: Sparse-Zustände indizierter BASE-Felder überlagern den
-                // Dense-Wert wie beim Lesen (`_sparse_updates_for_u`: alle
-                // Sparse-Blöcke in Blockreihenfolge). Python v0.27 indizierte nur
-                // den Dense-Wert und keine reinen Sparse-Records.
+                // Sparse states of indexed BASE fields overlay the
+                // dense value as when reading (`_sparse_updates_for_u`: all
+                // sparse blocks in block order). Pure sparse records are indexed
+                // as well.
                 let base_vs_wanted: HashSet<&Nat> = base_idxs.iter().map(|i| i.field_v()).collect();
                 let mut overlay: HashMap<(Nat, Nat), SVal> = HashMap::new();
                 if !base_idxs.is_empty() {
@@ -503,7 +503,7 @@ impl Db {
                                 let s = u32::from_le_bytes(payload[toff + i * 4..toff + i * 4 + 4].try_into().unwrap()) as usize;
                                 let e = u32::from_le_bytes(payload[toff + i * 4 + 4..toff + i * 4 + 8].try_into().unwrap()) as usize;
                                 if e < s || rbase + e > payload.len() {
-                                    return Err(Error::Corruption("DATA Recordoffset ungueltig".into()));
+                                    return Err(Error::Corruption("DATA record offset invalid".into()));
                                 }
                                 let rec = &payload[rbase + s..rbase + e];
                                 let mut p = 0usize;
@@ -534,7 +534,7 @@ impl Db {
                     }
                 }
                 if !overlay.is_empty() {
-                    // reine Sparse-Records (kein lebender Dense-Record an u)
+                    // pure sparse records (no live dense record at u)
                     let mut extra: Vec<(&(Nat, Nat), &Val)> = overlay
                         .iter()
                         .filter_map(|(k, st)| st.val().map(|v| (k, v)))
@@ -583,7 +583,7 @@ impl Db {
                 }
             }
         }
-        // Persistierte Postings müssen nach Dokument-u sortiert sein.
+        // Persisted postings must be sorted by document u.
         for vm in maps.values_mut() {
             for (_, b) in vm.items.iter_mut() {
                 match b {
@@ -644,12 +644,11 @@ impl Db {
         Ok((off, bid, plen))
     }
 
-    /// Baut Indizes neu auf (`build_indexes`).
+    /// Rebuilds indexes (`build_indexes`).
     ///
-    /// Fix S1: Eine Spur mit beliebigen Datenblöcken (auch nur Sparse oder
-    /// Deletes) erhält immer einen SECONDARY-Block; Python v0.27 übersprang
-    /// Spuren ohne Dense-Segmente, wodurch Indizes reiner Sparse-Realms nie
-    /// frisch wurden.
+    /// A lane with any data blocks (even only sparse or
+    /// deletes) always receives a SECONDARY block, so that indexes of
+    /// pure sparse realms also become fresh.
     pub fn build_indexes(&mut self, index_ids: Option<&[u64]>, commit: bool) -> Result<Val> {
         let selected: Vec<IndexDef> = match index_ids {
             None => self.index_defs.values().cloned().collect(),
@@ -737,12 +736,12 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Lesen
+    // Reading
     // ------------------------------------------------------------------
 
     fn read_payload(&self, r: &PostingRef) -> Result<Vec<u8>> {
         let comp = self.store.read_vec(r.abs_offset, r.compressed_len as usize)?;
-        crate::zlib::decompress(&comp).map_err(|e| Error::Corruption(format!("Indexpayload zlib-defekt: {e}")))
+        crate::zlib::decompress(&comp).map_err(|e| Error::Corruption(format!("Index payload zlib-corrupt: {e}")))
     }
 
     pub(crate) fn load_posting(&self, index_id: u64, value: &Val, lane: Lane) -> Result<Arc<Vec<Nat>>> {
@@ -756,7 +755,7 @@ impl Db {
         };
         let r = &dir.entries[i];
         if r.width == PAYLOAD_FULLTEXT_POSITIONS || r.width == PAYLOAD_FULLTEXT_DOCLENS {
-            return Err(Error::Schema("typed FULLTEXT payload ist keine einfache Dokument-ID-Postingliste".into()));
+            return Err(Error::Schema("typed FULLTEXT payload is not a plain document ID posting list".into()));
         }
         let raw = self.read_payload(r)?;
         let list: Vec<Nat> = match r.width {
@@ -765,7 +764,7 @@ impl Db {
             _ => raw.as_chunks::<8>().0.iter().map(|c| Nat::S(u64::from_le_bytes(*c))).collect(),
         };
         if list.len() as u64 != r.raw_count {
-            return Err(Error::Corruption("Postinganzahl stimmt nicht".into()));
+            return Err(Error::Corruption("Posting count mismatch".into()));
         }
         let arc = Arc::new(list);
         self.cache().postings.insert(ck, arc.clone());
@@ -775,7 +774,7 @@ impl Db {
     fn require_fulltext(&self, index_id: u64) -> Result<&IndexDef> {
         match self.index_defs.get(&index_id) {
             Some(i) if i.kind == IndexKind::Fulltext => Ok(i),
-            _ => Err(Error::Schema(format!("Index {index_id} ist kein FULLTEXT-Index"))),
+            _ => Err(Error::Schema(format!("Index {index_id} is not a FULLTEXT index"))),
         }
     }
 
@@ -792,11 +791,11 @@ impl Db {
             Some(&i) => {
                 let r = &dir.entries[i];
                 if r.width != PAYLOAD_FULLTEXT_POSITIONS {
-                    return Err(Error::Corruption("FULLTEXT Term hat falschen Payload-Codec".into()));
+                    return Err(Error::Corruption("FULLTEXT term has wrong payload codec".into()));
                 }
                 let raw = self.read_payload(r)?;
                 textindex::decode_fulltext_posting(&raw, Some(r.raw_count))
-                    .map_err(|e| Error::Corruption(format!("FULLTEXT Termpayload defekt: {e}")))?
+                    .map_err(|e| Error::Corruption(format!("FULLTEXT term payload corrupt: {e}")))?
             }
         };
         let arc = Arc::new(out);
@@ -816,11 +815,11 @@ impl Db {
             Some(&i) => {
                 let r = &dir.entries[i];
                 if r.width != PAYLOAD_FULLTEXT_DOCLENS {
-                    return Err(Error::Corruption("FULLTEXT Dokumentlaengen haben falschen Payload-Codec".into()));
+                    return Err(Error::Corruption("FULLTEXT document lengths have wrong payload codec".into()));
                 }
                 let raw = self.read_payload(r)?;
                 textindex::decode_fulltext_doc_lengths(&raw, Some(r.raw_count))
-                    .map_err(|e| Error::Corruption(format!("FULLTEXT Dokumentlaengen defekt: {e}")))?
+                    .map_err(|e| Error::Corruption(format!("FULLTEXT document lengths corrupt: {e}")))?
             }
         };
         let arc = Arc::new(corpus);
@@ -828,7 +827,7 @@ impl Db {
         Ok(arc)
     }
 
-    /// `fulltext_payloads(index_id, terms)`: Terme eindeutig in Reihenfolge.
+    /// `fulltext_payloads(index_id, terms)`: unique terms in order.
     pub fn fulltext_payloads(&self, index_id: u64, terms: &[String], lane: Lane) -> Result<(TermPostingsOwned, Arc<FtCorpus>)> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -842,7 +841,7 @@ impl Db {
 
     fn range_keys(&self, index_id: u64, lane: Lane, lo: &Val, hi: &Val) -> Result<Vec<Val>> {
         let keys = self.secondary_keys_sorted(index_id, lane)?;
-        let cmp = |a: &Val, b: &Val| crate::val::py_cmp(a, b).ok_or_else(|| Error::Type("Rangefilter passt nicht zum Indextyp".into()));
+        let cmp = |a: &Val, b: &Val| crate::val::py_cmp(a, b).ok_or_else(|| Error::Type("Range filter does not match the index type".into()));
         // bisect_left(keys, lo), bisect_right(keys, hi)
         let mut a = 0usize;
         let mut b = keys.len();
@@ -859,7 +858,7 @@ impl Db {
         Ok(if a > start { keys[start..a].to_vec() } else { Vec::new() })
     }
 
-    /// `posting_count`: exakte Kardinalität aus Verzeichnis-Metadaten.
+    /// `posting_count`: exact cardinality from directory metadata.
     pub fn posting_count(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<u64> {
         let dir = self.secondary_dir(index_id, lane)?;
         Ok(match cond {
@@ -911,7 +910,7 @@ impl Db {
 
     /// `index_candidate_estimate`
     pub fn index_candidate_estimate(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Val> {
-        let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} fehlt")))?;
+        let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
         let dir = self.secondary_dir(index_id, lane)?;
         let op = crate::unicode::lower(op);
         let count_of = |k: &str| dir.by_key.get(&ValKey(Val::str(k))).map(|&i| dir.entries[i].raw_count).unwrap_or(0);
@@ -973,11 +972,11 @@ impl Db {
         })
     }
 
-    /// `index_candidates`: sortierte Record-u für ein Indexprädikat.
+    /// `index_candidates`: sorted record u for an index predicate.
     pub fn index_candidates(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Vec<Nat>> {
-        let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} fehlt")))?;
+        let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
         if !self.index_is_fresh(index_id, lane) {
-            return Err(Error::StaleIndex(format!("Index {}/{} ist nicht frisch", Val::str(idx.name.as_str()).py_repr(), lane_name(lane))));
+            return Err(Error::StaleIndex(format!("Index {}/{} is not fresh", Val::str(idx.name.as_str()).py_repr(), lane_name(lane))));
         }
         let op = crate::unicode::lower(op);
         let intersect_all = |mut postings: Vec<Arc<Vec<Nat>>>| -> Vec<Nat> {
@@ -995,11 +994,11 @@ impl Db {
             IndexKind::Value => match op.as_str() {
                 "eq" => Ok(self.load_posting(index_id, value, lane)?.to_vec()),
                 "between" => Ok(self.posting_for_condition(index_id, &Cond::Range(value.clone(), value2.clone()), lane)?.to_vec()),
-                _ => Err(Error::Schema(format!("VALUE Index unterstuetzt Operator {} nicht", Val::str(op.as_str()).py_repr()))),
+                _ => Err(Error::Schema(format!("VALUE index does not support operator {}", Val::str(op.as_str()).py_repr()))),
             },
             IndexKind::Token => {
                 if !matches!(op.as_str(), "token" | "tokens_all" | "tokens_any") {
-                    return Err(Error::Schema(format!("TOKEN Index unterstuetzt Operator {} nicht", Val::str(op.as_str()).py_repr())));
+                    return Err(Error::Schema(format!("TOKEN index does not support operator {}", Val::str(op.as_str()).py_repr())));
                 }
                 let keys = self.token_query_keys(&op, value, &idx.options)?;
                 if (op == "token" && keys.len() != 1) || keys.is_empty() {
@@ -1052,11 +1051,11 @@ impl Db {
                 }
                 textindex::fulltext_candidate_docs(&postings, &mode)
             }
-            k => Err(Error::Schema(format!("Indexfamilie {} unterstuetzt Operator {} nicht", k.name(), Val::str(op.as_str()).py_repr()))),
+            k => Err(Error::Schema(format!("Index family {} does not support operator {}", k.name(), Val::str(op.as_str()).py_repr()))),
         }
     }
 
-    /// u-Werte, die alle Filter erfüllen (`find_u`, nur VALUE-Indizes).
+    /// u values satisfying all filters (`find_u`, VALUE indexes only).
     pub fn find_u(&self, realm: &Nat, filters: &[(String, Cond)], lane: Lane, u_from: Option<&Nat>, u_to: Option<&Nat>) -> Result<Vec<Nat>> {
         let key = (realm.clone(), lane);
         let mut postings: Vec<Arc<Vec<Nat>>> = Vec::new();
@@ -1064,18 +1063,18 @@ impl Db {
             let iid = *self
                 .index_name_map
                 .get(&(realm.clone(), name.clone()))
-                .ok_or_else(|| Error::Schema(format!("kein Inhaltsindex '{name}'")))?;
+                .ok_or_else(|| Error::Schema(format!("no content index '{name}'")))?;
             let idef = &self.index_defs[&iid];
             if idef.kind != IndexKind::Value {
                 return Err(Error::Schema(format!(
-                    "find_u() akzeptiert nur VALUE-Indizes; {} ist {}",
+                    "find_u() accepts only VALUE indexes; {} is {}",
                     Val::str(name.as_str()).py_repr(),
                     idef.kind.name()
                 )));
             }
             if !self.index_is_fresh(iid, lane) {
                 return Err(Error::StaleIndex(format!(
-                    "Index '{name}'/{} fehlt oder ist aelter als die Daten. build_indexes() ausfuehren.",
+                    "Index '{name}'/{} is missing or older than the data. Run build_indexes().",
                     lane_name(lane)
                 )));
             }
@@ -1134,7 +1133,7 @@ impl Db {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)] // bildet die Python-Signatur (Keyword-Argumente) nach
+    #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     pub fn find(
         &self,
         realm: &Nat,

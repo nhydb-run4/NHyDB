@@ -1,12 +1,12 @@
-//! Systemadressraum R0,u1 und externer, verschlüsselter Layoutplan (v0.27).
+//! System address space R0,u1 and external, encrypted layout plan.
 //!
-//! Pro Datenbank drei Dateien: `X.nhydb`, `X.nhydb.layout.enc` (AES-256-GCM-
-//! versiegelte Schema-Snapshots, höchstens zwei Generationen, HMAC über den
-//! Umschlag) und `X.nhydb.layout.key` (32-Byte-Schlüssel, Rechte 0600).
-//! R0,u1 ist ein DB-interner `SYSTEM`-Block je Schema-Generation; er bindet
-//! Generation und SHA-256 des aktiven Snapshots. Ohne passenden Schlüssel,
-//! Plan, Authentifizierung oder Generation wird das Öffnen verweigert
-//! (fail closed). JSON-Verträge und Bytes entsprechen Python-v0.27.
+//! Three files per database: `X.nhydb`, `X.nhydb.layout.enc` (AES-256-GCM-
+//! sealed schema snapshots, at most two generations, HMAC over the
+//! envelope) and `X.nhydb.layout.key` (32-byte key, permissions 0600).
+//! R0,u1 is a DB-internal `SYSTEM` block per schema generation; it binds
+//! the generation and SHA-256 of the active snapshot. Without a matching key,
+//! plan, authentication or generation, opening is refused
+//! (fail closed). The JSON contracts and bytes are fixed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,31 +25,31 @@ pub const PLAN_CONTRACT: &str = "NHYDB027_EXTERNAL_LAYOUT_V1";
 pub const SCHEMA_CONTRACT: &str = "NHYDB027_SCHEMA_V1";
 pub const R0_CONTRACT: &str = "NHYDB027_R0U1_V1";
 pub const CRYPTO_CONTRACT: &str = "AES-256-GCM + HMAC-SHA256";
-/// Unveränderliche R0-Zellen (Python prüft 1, 2, 3, 4, 7, 8).
+/// Immutable R0 cells (checked: 1, 2, 3, 4, 7, 8).
 pub const IMMUTABLE_CELLS: [&str; 6] = ["1", "2", "3", "4", "7", "8"];
-/// R0,u1,v9: feste mathematische Systemvorgaben dieser Datenbank.
+/// R0,u1,v9: fixed mathematical system constants of this database.
 pub const MATH_CONSTANTS_CELL: &str = "9";
 
-/// Wert der Zelle v9 (`{"lane_NL":0,"lane_NR":1,"realm_span":10**100}`).
+/// Value of cell v9 (`{"lane_NL":0,"lane_NR":1,"realm_span":10**100}`).
 pub fn math_constants_cell() -> Val {
     vmap! {"lane_NL" => 0i64, "lane_NR" => 1i64, "realm_span" => realm_span()}
 }
 
-/// Laufzeitzustand des Systemadressraums einer geöffneten Datenbank.
+/// Runtime state of the system address space of an open database.
 #[derive(Debug, Clone)]
 pub struct SystemState {
-    /// Aktueller R0-Datensatz `{"contract":…, "cells":{…}}`.
+    /// Current R0 record `{"contract":…, "cells":{…}}`.
     pub record: Val,
     pub key: Vec<u8>,
     pub layout_path: PathBuf,
     pub key_path: PathBuf,
     pub entries: Vec<Val>,
     pub active_entry: Val,
-    /// Schema seit dem letzten Commit geändert.
+    /// Schema changed since the last commit.
     pub layout_dirty: bool,
-    /// Fehler während eines Schema-Commits: weitere Schreibzugriffe gesperrt.
+    /// Error during a schema commit: further writes are blocked.
     pub poisoned: bool,
-    /// Ein SYSTEM-Block der Kette enthält v9 (feste Systemvorgaben, Rust).
+    /// A SYSTEM block of the chain contains v9 (fixed system constants).
     pub math_constants_stored: bool,
 }
 
@@ -68,7 +68,7 @@ impl SystemState {
             .and_then(|v| v.as_i64())
             .filter(|g| *g >= 0)
             .map(|g| g as u64)
-            .ok_or_else(|| Error::Corruption("R0,u1 Layoutgeneration ungueltig".into()))
+            .ok_or_else(|| Error::Corruption("R0,u1 layout generation invalid".into()))
     }
 }
 
@@ -92,12 +92,12 @@ fn read_json(path: &Path) -> Result<Val> {
             Error::Io(e)
         }
     })?;
-    let s = std::str::from_utf8(&raw).map_err(|_| Error::Corruption(format!("{}: kein UTF-8", path.display())))?;
-    Val::from_json(s).map_err(|e| Error::Corruption(format!("{}: JSON ungueltig ({e})", path.display())))
+    let s = std::str::from_utf8(&raw).map_err(|_| Error::Corruption(format!("{}: not UTF-8", path.display())))?;
+    Val::from_json(s).map_err(|e| Error::Corruption(format!("{}: invalid JSON ({e})", path.display())))
 }
 
 // ----------------------------------------------------------------------
-// Schlüsseldatei
+// Key file
 // ----------------------------------------------------------------------
 
 pub fn key_create(path: &Path, db_id: &str, db_name: &str, mode: Durability) -> Result<Vec<u8>> {
@@ -124,25 +124,25 @@ pub fn key_load(path: &Path, db_id: &str, db_name: &str) -> Result<Vec<u8>> {
         && obj.get("db_id").and_then(|v| v.as_str()) == Some(db_id)
         && obj.get("db_name").and_then(|v| v.as_str()) == Some(db_name);
     if !ok {
-        return Err(Error::Corruption("Falsche Layout-Key-Datei (Datenbank-ID oder Name stimmt nicht)".into()));
+        return Err(Error::Corruption("Wrong layout key file (database ID or name does not match)".into()));
     }
-    let b64 = obj.get("key_b64").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layout-Key fehlt".into()))?;
+    let b64 = obj.get("key_b64").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layout key missing".into()))?;
     let key = crypto::b64decode(b64)?;
     if key.len() != crypto::KEY_LEN {
-        return Err(Error::Corruption("Layout-Key-Laenge ungueltig".into()));
+        return Err(Error::Corruption("Layout key length invalid".into()));
     }
     Ok(key)
 }
 
 // ----------------------------------------------------------------------
-// Plan-Datei (Umschlag mit 1–2 versiegelten Generationen)
+// Plan file (envelope with 1–2 sealed generations)
 // ----------------------------------------------------------------------
 
 fn entry_aad(db_id: &str, generation: u64, digest: &str) -> Vec<u8> {
     format!("NHYDB027:{db_id}:{generation}:{digest}").into_bytes()
 }
 
-/// `_layout_seal_entry`: Klartext = kanonisches JSON des Snapshots.
+/// `_layout_seal_entry`: plaintext = canonical JSON of the snapshot.
 pub fn seal_entry(db_id: &str, generation: u64, snapshot_json: &[u8], key: &[u8]) -> Result<Val> {
     let digest = crypto::sha256_hex(snapshot_json);
     let (nonce, ct) = crypto::layout_seal(key, snapshot_json, &entry_aad(db_id, generation, &digest))?;
@@ -161,21 +161,21 @@ pub fn envelope_bytes(db_id: &str, entries: &[Val], key: &[u8]) -> Result<Vec<u8
     Ok(content.to_json()?.into_bytes())
 }
 
-/// `_layout_read_envelope`: Integrität (HMAC) und Zugehörigkeit prüfen.
+/// `_layout_read_envelope`: check integrity (HMAC) and ownership.
 pub fn read_envelope(path: &Path, db_id: &str, key: &[u8]) -> Result<Vec<Val>> {
     let mut env = read_json(path)?;
     let mac = env.remove("mac");
     if env.get("contract").and_then(|v| v.as_str()) != Some(PLAN_CONTRACT) || env.get("db_id").and_then(|v| v.as_str()) != Some(db_id) {
-        return Err(Error::Corruption("Externer Layoutplan gehoert nicht zur Datenbank".into()));
+        return Err(Error::Corruption("External layout plan does not belong to the database".into()));
     }
     let expected = crypto::layout_mac(key, env.to_json()?.as_bytes());
     match mac.as_ref().and_then(|m| m.as_str()) {
         Some(m) if crypto::ct_eq(m.as_bytes(), expected.as_bytes()) => {}
-        _ => return Err(Error::Corruption("Layoutplan: Integritaetspruefung fehlgeschlagen".into())),
+        _ => return Err(Error::Corruption("Layout plan: integrity check failed".into())),
     }
     match env.get("entries").and_then(|e| e.as_list()) {
         Some(l) if (1..=2).contains(&l.len()) => Ok(l.clone()),
-        _ => Err(Error::Corruption("Layoutplan: ungueltige Generationsliste".into())),
+        _ => Err(Error::Corruption("Layout plan: invalid generation list".into())),
     }
 }
 
@@ -184,33 +184,33 @@ pub fn entry_generation(e: &Val) -> Result<u64> {
         .and_then(|g| g.as_i64())
         .filter(|g| *g >= 0)
         .map(|g| g as u64)
-        .ok_or_else(|| Error::Corruption("Layoutplan: Generation ungueltig".into()))
+        .ok_or_else(|| Error::Corruption("Layout plan: generation invalid".into()))
 }
 
 pub fn entry_digest(e: &Val) -> Result<&str> {
-    e.get("sha256").and_then(|g| g.as_str()).ok_or_else(|| Error::Corruption("Layoutplan: Hash fehlt".into()))
+    e.get("sha256").and_then(|g| g.as_str()).ok_or_else(|| Error::Corruption("Layout plan: hash missing".into()))
 }
 
-/// `_layout_open_entry`: entschlüsseln, Hash und Vertrag prüfen.
+/// `_layout_open_entry`: decrypt, check hash and contract.
 pub fn open_entry(db_id: &str, entry: &Val, key: &[u8]) -> Result<Val> {
     let generation = entry_generation(entry)?;
     let digest = entry_digest(entry)?;
-    let nonce = entry.get("nonce").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layoutplan: Nonce fehlt".into()))?;
-    let ct = entry.get("ciphertext").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layoutplan: Ciphertext fehlt".into()))?;
+    let nonce = entry.get("nonce").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layout plan: nonce missing".into()))?;
+    let ct = entry.get("ciphertext").and_then(|v| v.as_str()).ok_or_else(|| Error::Corruption("Layout plan: ciphertext missing".into()))?;
     let raw = crypto::layout_open(key, nonce, ct, &entry_aad(db_id, generation, digest))?;
     if crypto::sha256_hex(&raw) != digest {
-        return Err(Error::Corruption("Layoutplan-Snapshot-Hash falsch".into()));
+        return Err(Error::Corruption("Layout plan snapshot hash mismatch".into()));
     }
-    let text = std::str::from_utf8(&raw).map_err(|_| Error::Corruption("Layoutplan-Snapshot kein UTF-8".into()))?;
+    let text = std::str::from_utf8(&raw).map_err(|_| Error::Corruption("Layout plan snapshot is not UTF-8".into()))?;
     let snap = Val::from_json(text)?;
     if snap.get("contract").and_then(|v| v.as_str()) != Some(SCHEMA_CONTRACT) {
-        return Err(Error::Corruption("Layoutplan-Snapshot-Contract falsch".into()));
+        return Err(Error::Corruption("Layout plan snapshot contract mismatch".into()));
     }
     Ok(snap)
 }
 
-/// `_atomic_layout_replace`: temporäre Datei im Zielordner (0600), schreiben,
-/// synchronisieren, atomar austauschen, Verzeichnis synchronisieren.
+/// `_atomic_layout_replace`: temporary file in the target directory (0600), write,
+/// sync, swap atomically, sync the directory.
 pub fn atomic_write(path: &Path, data: &[u8], mode: Durability) -> Result<()> {
     let dir = platform::parent_dir(path);
     std::fs::create_dir_all(&dir)?;
@@ -243,7 +243,7 @@ pub fn empty_schema() -> Val {
     }
 }
 
-/// `_system_bootstrap_payload` plus Zelle v9 (feste Mathematik).
+/// `_system_bootstrap_payload` plus cell v9 (fixed mathematics).
 #[allow(clippy::too_many_arguments)]
 pub fn bootstrap_record(db_id: &str, db_name: &str, plan_name: &str, key_name: &str, generation: u64, digest: &str, created_ns: u64) -> Val {
     vmap! {
@@ -256,9 +256,9 @@ pub fn bootstrap_record(db_id: &str, db_name: &str, plan_name: &str, key_name: &
     }
 }
 
-/// Nächster R0-Datensatz für eine neue Generation (unveränderliche Zellen
-/// werden übernommen). v9 steht nur im ersten SYSTEM-Block der Datei; die
-/// Folgegenerationen sind damit bytegleich zu Python-v0.27 aufgebaut.
+/// Next R0 record for a new generation (immutable cells
+/// are carried over). v9 is stored only in the first SYSTEM block of the file;
+/// subsequent generations contain only cells 1–8.
 pub fn next_record(cur: &Val, generation: u64, digest: &str) -> Val {
     let c = |k: &str| cur.get("cells").and_then(|x| x.get(k)).cloned().unwrap_or(Val::None);
     let mut rec = vmap! {"contract" => R0_CONTRACT, "cells" => Val::map()};
@@ -273,41 +273,41 @@ pub fn next_record(cur: &Val, generation: u64, digest: &str) -> Val {
     rec
 }
 
-/// Prüft einen SYSTEM-Datensatz und seine Verkettung mit dem Vorgänger.
+/// Checks a SYSTEM record and its chaining with the predecessor.
 pub fn check_record(item: &Val, prev: Option<&Val>) -> Result<()> {
     if item.get("contract").and_then(|v| v.as_str()) != Some(R0_CONTRACT) {
-        return Err(Error::Corruption("R0,u1 Bootstrap-Contract ungueltig".into()));
+        return Err(Error::Corruption("R0,u1 bootstrap contract invalid".into()));
     }
-    let cells = item.get("cells").filter(|c| c.as_map().is_some()).ok_or_else(|| Error::Corruption("R0,u1 Zellen fehlen".into()))?;
+    let cells = item.get("cells").filter(|c| c.as_map().is_some()).ok_or_else(|| Error::Corruption("R0,u1 cells missing".into()))?;
     if let Some(v9) = cells.get(MATH_CONSTANTS_CELL) {
         if *v9 != math_constants_cell() || v9.get("realm_span").and_then(|r| r.as_nat()).as_ref() != Some(realm_span()) {
             return Err(Error::Corruption(
-                "R0,u1,v9: feste Systemvorgaben verletzt (REALM_SPAN=10**100, NL=0, NR=1)".into(),
+                "R0,u1,v9: fixed system constants violated (REALM_SPAN=10**100, NL=0, NR=1)".into(),
             ));
         }
     }
     for k in ["1", "2", "3", "4", "5", "6", "7", "8"] {
         if cells.get(k).is_none() {
-            return Err(Error::Corruption(format!("R0,u1,v{k} fehlt")));
+            return Err(Error::Corruption(format!("R0,u1,v{k} missing")));
         }
     }
     if let Some(prev) = prev {
         let pc = prev.get("cells").unwrap();
         if IMMUTABLE_CELLS.iter().any(|k| cells.get(k) != pc.get(k)) {
-            return Err(Error::Corruption("R0,u1 unveraenderliche Systemzellen verletzt".into()));
+            return Err(Error::Corruption("R0,u1 immutable system cells violated".into()));
         }
         let g = cells.get("5").and_then(|v| v.as_i64());
         let pg = pc.get("5").and_then(|v| v.as_i64());
         match (g, pg) {
             (Some(g), Some(pg)) if g == pg + 1 => {}
-            _ => return Err(Error::Corruption("R0,u1 Layoutgeneration uebersprungen".into())),
+            _ => return Err(Error::Corruption("R0,u1 layout generation skipped".into())),
         }
     }
     Ok(())
 }
 
-/// `_write_initial_system_db`: neue DB-Datei mit Superblöcken und dem ersten
-/// SYSTEM-Block (Block-ID 1).
+/// `_write_initial_system_db`: new DB file with superblocks and the first
+/// SYSTEM block (block ID 1).
 pub fn write_initial_db(path: &Path, record: &Val, mode: Durability) -> Result<()> {
     let payload = record.to_json()?.into_bytes();
     let end = align8(DATA_START + BLOCK_HEADER_SIZE as u64 + payload.len() as u64);
@@ -327,8 +327,8 @@ pub fn write_initial_db(path: &Path, record: &Val, mode: Durability) -> Result<(
     platform::sync_dir(&platform::parent_dir(path), mode)
 }
 
-/// Erster SYSTEM-Datensatz einer neuen Datei (Kompaktierung): v9 wird
-/// übernommen, falls die Quelle sie gespeichert hatte.
+/// First SYSTEM record of a new file (compaction): v9 is
+/// carried over if the source had stored it.
 pub fn initial_record_from(cur: &Val, with_constants: bool) -> Val {
     let mut rec = cur.clone();
     if let Some(cells) = rec.get_mut("cells") {
@@ -389,7 +389,7 @@ mod tests {
         assert!(initial_record_from(&r1, true).get("cells").unwrap().get("9").is_some());
         v9.get_mut("cells").unwrap().set("9", vmap! {"lane_NL" => 0i64, "lane_NR" => 1i64, "realm_span" => 10i64});
         assert!(check_record(&v9, Some(&r0)).is_err());
-        // Python-v0.27-Datensatz ohne v9 ist gültig
+        // a record without v9 is valid
         let mut py = r1.clone();
         py.get_mut("cells").unwrap().remove("9");
         check_record(&py, Some(&r0)).unwrap();

@@ -1,17 +1,17 @@
-//! Fehlertypen der nativen NHyDB.
+//! Error types of the native NHyDB.
 //!
-//! Die Varianten bilden die Ausnahmehierarchie der Python-v0.14 ab
+//! The variants mirror the Python exception hierarchy
 //! (`NHyDBError`, `CorruptionError`, `SchemaError`, `StaleIndexError`,
-//! `RealmLimitError`, `AddressError`) sowie die dort verwendeten
-//! Python-Builtins (`ValueError`, `KeyError`, ...). Die PyO3-Schicht bildet
-//! jede Variante auf die entsprechende Python-Ausnahme ab.
+//! `RealmLimitError`, `AddressError`) plus the Python builtins used alongside
+//! it (`ValueError`, `KeyError`, ...). The PyO3 layer maps each variant to the
+//! corresponding Python exception.
 
 use std::any::Any;
 use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
-    /// Allgemeiner `NHyDBError` (z. B. geschlossene Datenbank).
+    /// General `NHyDBError` (e.g. database closed).
     NHyDB(String),
     Corruption(String),
     Schema(String),
@@ -30,42 +30,42 @@ pub enum Error {
     NotFound(String),
     /// Python `FileExistsError`.
     Exists(String),
-    /// Schreibsperre der Datenbank nicht erhalten (`DatabaseLockedError`).
+    /// Database write lock could not be acquired (`DatabaseLockedError`).
     Locked(String),
-    /// DB-Größengrenze überschritten (`DatabaseSizeLimitError`).
+    /// Database size limit exceeded (`DatabaseSizeLimitError`).
     SizeLimit(String),
-    /// MATH-Ausdruck syntaktisch unzulässig (`MathSyntaxError`).
+    /// MATH expression is syntactically invalid (`MathSyntaxError`).
     MathSyntax(String),
-    /// MATH-Ausdruck liefert ungültigen Wert (`MathDomainError`).
+    /// MATH expression yields an invalid value (`MathDomainError`).
     MathDomain(String),
-    /// Realmplaner: inkonsistenter Zustand (`LayoutStateError`).
+    /// Realm planner: inconsistent state (`LayoutStateError`).
     LayoutState(String),
-    /// Realmplaner: Budget überschritten (`RealmBudgetExceeded`).
+    /// Realm planner: budget exceeded (`RealmBudgetExceeded`).
     RealmBudget(String),
-    /// Realmplaner: veralteter Plan (`StalePlanError`).
+    /// Realm planner: stale plan (`StalePlanError`).
     StalePlan(String),
-    /// Realmplaner: Realm nicht mehr frei (`AllocationConflictError`).
+    /// Realm planner: realm no longer free (`AllocationConflictError`).
     AllocationConflict(String),
-    /// MATH-Definition nach erstem Schreiben eingefroren (`MappingFrozenError`).
+    /// MATH definition frozen after the first write (`MappingFrozenError`).
     MappingFrozen(String),
-    /// MATH-Zielzelle belegt/doppelt (`MathCellConflictError`).
+    /// MATH target cell occupied/duplicated (`MathCellConflictError`).
     MathCellConflict(String),
-    /// MATH-Layout existiert nicht (`MathLayoutNotFound`).
+    /// MATH layout does not exist (`MathLayoutNotFound`).
     MathLayoutNotFound(String),
-    /// Ungültige Index-Konfiguration (`IndexConfigError`, Unterklasse von `ValueError`).
+    /// Invalid index configuration (`IndexConfigError`, subclass of `ValueError`).
     IndexConfig(String),
-    /// Abfrage: allgemeiner Fehler (`QueryError`).
+    /// Query: general error (`QueryError`).
     Query(String),
-    /// Abfrage: Plan/Operator ungültig (`QueryPlanError`).
+    /// Query: invalid plan/operator (`QueryPlanError`).
     QueryPlan(String),
-    /// Abfrage: Domänenfehler record/cell (`QueryDomainError`).
+    /// Query: record/cell domain error (`QueryDomainError`).
     QueryDomain(String),
-    /// NHySQL: Syntax-/Semantikfehler (`SQLSyntaxError`).
+    /// NHySQL: syntax/semantic error (`SQLSyntaxError`).
     SqlSyntax(String),
     Io(std::io::Error),
-    /// Fehler aus einem Laufzeit-Plugin (z. B. Python-Ausnahme aus einem
-    /// CUSTOM-Layout-Plugin). Die Bindungsschicht kann das Objekt wieder
-    /// auspacken und unverändert weiterreichen.
+    /// Error raised by a runtime plugin (e.g. a Python exception from a
+    /// CUSTOM layout plugin). The binding layer can unwrap the object and
+    /// re-raise it unchanged.
     Foreign(Box<dyn Any + Send + Sync>, String),
 }
 

@@ -4,7 +4,7 @@ Some tests compare the engine against an external Python reference
 implementation (differential/oracle tests). That reference is not part of
 this repository; the fixtures ``ref`` and ``ref14`` therefore skip the
 dependent tests unless the reference is available next to the repository
-root (``reference/`` and ``reference_v0_27/``).
+root (see ``REFERENCE`` and ``REFERENCE_V027`` below).
 """
 import importlib
 import importlib.util
@@ -37,7 +37,7 @@ def _load_reference_v014():
 def _load_reference_v027():
     if not (REFERENCE_V027 / "nhydb_v027.py").exists():
         pytest.skip("reference implementation not included")
-    pytest.importorskip("cryptography", reason="Referenz v0.27 braucht echte AES-256-GCM")
+    pytest.importorskip("cryptography", reason="the external reference implementation needs real AES-256-GCM")
     sys.dont_write_bytecode = True
     if str(REFERENCE_V027) not in sys.path:
         sys.path.insert(0, str(REFERENCE_V027))
@@ -51,7 +51,7 @@ def ref14():
 
 @pytest.fixture(scope="session")
 def ref():
-    """Python-Referenz v0.27 (Kern-Modul ``nhydb_v027``)."""
+    """External reference implementation, not included (core module ``nhydb_v027``)."""
     return _load_reference_v027()
 
 
@@ -61,10 +61,10 @@ def tmpdb(tmp_path):
 
 
 def blocks(path):
-    """Blockfolge ``(typ, block_id, flags, payload)`` ab DATA_START.
+    """Block sequence ``(type, block_id, flags, payload)`` from DATA_START.
 
-    SYSTEM-Blöcke (R0,u1) enthalten zufällige/zeitabhängige Werte (UUID,
-    Snapshot-Hash, Erstellungszeit) und werden nur mit Typ/ID verglichen.
+    SYSTEM blocks (R0,u1) contain random/time-dependent values (UUID,
+    snapshot hash, creation time) and are only compared by type/ID.
     """
     raw = Path(path).read_bytes()
     out = []
@@ -80,5 +80,5 @@ def blocks(path):
 
 
 def data_region(path):
-    """Kompatibilitätsname: vergleichbare Blockfolge (ohne R0-Zufallswerte)."""
+    """Compatibility alias: comparable block sequence (without R0 random values)."""
     return blocks(path)

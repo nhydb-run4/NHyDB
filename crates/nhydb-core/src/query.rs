@@ -1,15 +1,14 @@
-//! Layoutunabhängige Abfrageschicht (Python `nhydb_query_v027`, QueryEngine).
+//! Layout-independent query layer (QueryEngine).
 //!
-//! Regel wie in der Referenz: Benutzerprädikat → Provider → kanonische
-//! Kandidatenidentitäten (N bzw. record_N) → Ergebnis. Planer
-//! (`cardinality-cost-v1`), Auswertung, Domänenwechsel, Provider, Aggregation,
-//! ORDER/LIMIT und BM25-Suche folgen der Referenzsemantik; Vergleiche,
-//! Gleichheit, Gruppenschlüssel und Arithmetik nach Python-Regeln.
+//! Rule: user predicate → provider → canonical candidate identities
+//! (N or record_N) → result. Planner (`cardinality-cost-v1`), evaluation,
+//! domain conversion, providers, aggregation, ORDER/LIMIT and BM25 search;
+//! comparisons, equality, group keys and arithmetic follow Python rules.
 //!
-//! Leistungsabweichungen ohne Semantikänderung (REVIEW_V027 §10.5):
-//! ohne ORDER BY werden Ergebniszeilen erst nach LIMIT/OFFSET erzeugt (P3),
-//! der Materialisierungsscan hält keine Menge aller Dense-Records (P4) und
-//! berechnet record_N bei CLASSIC einmal je u-Gruppe.
+//! Performance optimizations without semantic change: without ORDER BY,
+//! result rows are only built after LIMIT/OFFSET, the materialization scan
+//! keeps no set of all dense records and computes record_N for CLASSIC
+//! once per u group.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -37,7 +36,7 @@ use crate::vmap;
 pub const QUERY_VERSION: &str = "0.27";
 pub const OPTIMIZER: &str = "cardinality-cost-v1";
 
-/// Bis zu dieser Bereichsbreite besucht STRUCT_RANGE jedes u direkt.
+/// Up to this range width, STRUCT_RANGE visits every u directly.
 const STRUCT_RANGE_DIRECT_MAX: u64 = 4096;
 
 fn plan_err(m: impl Into<String>) -> Error {
@@ -53,10 +52,10 @@ fn repr(s: &str) -> String {
 }
 
 // ----------------------------------------------------------------------
-// Python-Hilfen
+// Python helpers
 // ----------------------------------------------------------------------
 
-/// Python-Typname für Fehlermeldungen.
+/// Python type name for error messages.
 pub fn py_type_name(v: &Val) -> &'static str {
     match v {
         Val::None => "NoneType",
@@ -129,7 +128,7 @@ pub fn py_float(v: &Val) -> Result<f64> {
     }
 }
 
-/// Python `round(x, 3)` (korrekt gerundet über die Dezimaldarstellung).
+/// Python `round(x, 3)` (correctly rounded via the decimal representation).
 pub fn round3(x: f64) -> f64 {
     if !x.is_finite() {
         return x;
@@ -137,7 +136,7 @@ pub fn round3(x: f64) -> f64 {
     format!("{x:.3}").parse().unwrap_or(x)
 }
 
-/// Python `int / int` (korrekt gerundete echte Division, `b > 0`).
+/// Python `int / int` (correctly rounded true division, `b > 0`).
 pub fn int_true_div(a: &BigInt, b: &BigInt) -> f64 {
     let lim = BigInt::from(1u64 << 53);
     if a.abs() <= lim && b.abs() <= lim {
@@ -183,7 +182,7 @@ pub fn int_true_div(a: &BigInt, b: &BigInt) -> f64 {
     }
 }
 
-/// Python `a < b`; `Err(TypeError)` bei nicht vergleichbaren Typen.
+/// Python `a < b`; `Err(TypeError)` for incomparable types.
 pub fn py_lt(a: &Val, b: &Val, sym: &str) -> Result<bool> {
     match (a, b) {
         (Val::Str(x), Val::Str(y)) => Ok(x < y),
@@ -207,8 +206,8 @@ pub fn py_lt(a: &Val, b: &Val, sym: &str) -> Result<bool> {
     }
 }
 
-/// Stabile Sortierung nur über `lt` (wie `list.sort`); `reverse` wie Python
-/// (gleiche Elemente behalten ihre ursprüngliche Reihenfolge).
+/// Stable sort using only `lt` (like `list.sort`); `reverse` as in Python
+/// (equal elements keep their original order).
 pub fn py_sort<T>(mut items: Vec<T>, reverse: bool, lt: &mut dyn FnMut(&T, &T) -> Result<bool>) -> Result<Vec<T>> {
     if reverse {
         items.reverse();
@@ -247,7 +246,7 @@ fn merge_sort<T>(mut items: Vec<T>, lt: &mut dyn FnMut(&T, &T) -> Result<bool>) 
     Ok(out)
 }
 
-/// Python `value in actual` für `_match_raw(..., "contains")`.
+/// Python `value in actual` for `_match_raw(..., "contains")`.
 fn py_contains(actual: &Val, value: &Val) -> Result<bool> {
     Ok(match (actual, value) {
         (Val::Str(a), Val::Str(v)) => a.contains(v.as_str()),
@@ -291,7 +290,7 @@ pub fn match_raw(actual: &Val, op: &str, value: &Val, value2: &Val) -> Result<bo
     if op == "contains" {
         return py_contains(actual, value);
     }
-    Err(plan_err(format!("Operator {} unbekannt", repr(op))))
+    Err(plan_err(format!("operator {} unknown", repr(op))))
 }
 
 /// Python `a <= b`.
@@ -311,7 +310,7 @@ fn le(a: &Val, b: &Val) -> Result<bool> {
     }
 }
 
-/// `parse_n_reference` für beliebige Werte.
+/// `parse_n_reference` for arbitrary values.
 pub fn parse_n_val(v: &Val) -> Result<Nat> {
     match v {
         Val::Str(s) => {
@@ -321,9 +320,9 @@ pub fn parse_n_val(v: &Val) -> Result<Nat> {
                 _ => raw,
             };
             if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
-                return Err(Error::Address(format!("ungueltige N-Referenz {}", v.py_repr())));
+                return Err(Error::Address(format!("invalid N reference {}", v.py_repr())));
             }
-            let n = Nat::parse_decimal(raw).ok_or_else(|| Error::Address(format!("ungueltige N-Referenz {}", v.py_repr())))?;
+            let n = Nat::parse_decimal(raw).ok_or_else(|| Error::Address(format!("invalid N reference {}", v.py_repr())))?;
             address::require_positive("N", &n)?;
             Ok(n)
         }
@@ -331,7 +330,7 @@ pub fn parse_n_val(v: &Val) -> Result<Nat> {
             let b = py_int(other)?;
             match Nat::from_bigint(&b) {
                 Some(n) if !n.is_zero() => Ok(n),
-                _ => Err(Error::Value("N muss > 0 sein".into())),
+                _ => Err(Error::Value("N must be > 0".into())),
             }
         }
     }
@@ -353,7 +352,7 @@ fn side_lane(side: i64) -> Lane {
     }
 }
 
-/// `str()`-Liste einer Python-Sequenz (str wird zeichenweise iteriert).
+/// `str()` list of a Python sequence (str is iterated per character).
 pub fn str_list(v: &Val) -> Vec<String> {
     match v {
         Val::None => Vec::new(),
@@ -373,7 +372,7 @@ fn n_ref(n: &Nat) -> String {
 }
 
 // ----------------------------------------------------------------------
-// Ausdrucksbaum
+// Expression tree
 // ----------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,10 +398,10 @@ impl Domain {
 }
 
 fn candidate_domain(s: &str) -> Result<Domain> {
-    Domain::parse(s).ok_or_else(|| dom_err(format!("ungueltige Candidate-Domain {}", repr(s))))
+    Domain::parse(s).ok_or_else(|| dom_err(format!("invalid candidate domain {}", repr(s))))
 }
 
-/// Abfrageknoten (`BoolExpr`, `FieldPredicate`, `StructPredicate`,
+/// Query node (`BoolExpr`, `FieldPredicate`, `StructPredicate`,
 /// `MathPredicate`, `DirectNPredicate`, `AllPredicate`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -448,10 +447,10 @@ fn dict_or_empty(v: Option<&Val>) -> Result<Val> {
     }
 }
 
-/// `expr_from_spec` (JSON-Spezifikation).
+/// `expr_from_spec` (JSON specification).
 pub fn expr_from_spec(raw: &Val) -> Result<Expr> {
     if !matches!(raw, Val::Map(_)) {
-        return Err(plan_err("Query-Ausdruck muss ein Objekt sein"));
+        return Err(plan_err("query expression must be an object"));
     }
     if matches!(raw.get("all"), Some(Val::Bool(true))) {
         return Ok(Expr::All);
@@ -461,7 +460,7 @@ pub fn expr_from_spec(raw: &Val) -> Result<Expr> {
             let xs: Vec<Expr> = iter_items(items)?.iter().map(expr_from_spec).collect::<Result<_>>()?;
             let mut it = xs.into_iter();
             let Some(mut out) = it.next() else {
-                return Err(plan_err(format!("{op} darf nicht leer sein")));
+                return Err(plan_err(format!("{op} must not be empty")));
             };
             for x in it {
                 out = if op == "and" { Expr::and(out, x) } else { Expr::or(out, x) };
@@ -501,11 +500,11 @@ pub fn expr_from_spec(raw: &Val) -> Result<Expr> {
         let domain = raw.get("domain").map(|d| unicode::lower(&d.py_str())).unwrap_or_else(|| "cell".into());
         return Ok(Expr::DirectN { values, domain });
     }
-    Err(plan_err(format!("Query-Spec-Knoten unbekannt: {}", raw.py_repr())))
+    Err(plan_err(format!("query spec node unknown: {}", raw.py_repr())))
 }
 
 // ----------------------------------------------------------------------
-// Kontext, Kandidaten, Provider
+// Context, candidates, providers
 // ----------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
@@ -515,7 +514,7 @@ pub struct QueryContext {
 }
 
 impl QueryContext {
-    /// Realm als Filter; negative Werte treffen keinen Realm (Realm 0).
+    /// Realm as filter; negative values match no realm (realm 0).
     pub fn realm_nat(&self) -> Option<Nat> {
         self.realm.as_ref().map(nat_or_zero)
     }
@@ -534,9 +533,9 @@ impl CandidateSet {
     }
 }
 
-/// Laufzeit-Provider (z. B. Python-Callable).
+/// Runtime provider (e.g. a Python callable).
 pub trait ExternalProvider: Send + Sync {
-    /// Liefert Kandidaten (int/str-N, Mapping, Tupel).
+    /// Returns candidates (int/str N, mapping, tuple).
     fn call(&self, engine: &QueryEngine<'_>, ctx: &QueryContext, params: &Val) -> Result<Vec<Val>>;
     fn has_estimator(&self) -> bool;
     fn estimate(&self, engine: &QueryEngine<'_>, ctx: &QueryContext, params: &Val) -> Result<Val>;
@@ -558,7 +557,7 @@ pub struct ProviderEntry {
     pub kind: ProviderKind,
 }
 
-/// Provider-Registry einer Engine (eingebaut: formula, n_sequence,
+/// Provider registry of an engine (built-in: formula, n_sequence,
 /// math_layout_inputs).
 #[derive(Clone)]
 pub struct Providers {
@@ -599,15 +598,15 @@ impl Providers {
         let key = unicode::strip(name).to_string();
         let d = unicode::lower(domain);
         if key.is_empty() {
-            return Err(Error::Value("Providername darf nicht leer sein".into()));
+            return Err(Error::Value("provider name must not be empty".into()));
         }
-        let dom = Domain::parse(&d).ok_or_else(|| dom_err(format!("Provider-Domain {} ungueltig", repr(&d))))?;
+        let dom = Domain::parse(&d).ok_or_else(|| dom_err(format!("provider domain {} invalid", repr(&d))))?;
         self.insert(&key, dom, description, ProviderKind::External(provider));
         Ok(())
     }
 }
 
-/// Ausführungsoptionen von `execute`.
+/// Execution options of `execute`.
 #[derive(Clone, Debug)]
 pub struct ExecOptions {
     pub realm: Option<BigInt>,
@@ -713,7 +712,7 @@ fn group_key(vals: &[Val]) -> Result<Vec<ValKey>> {
         .collect()
 }
 
-/// Gruppierte Aggregation in Einfügereihenfolge (`_aggregate_records`).
+/// Grouped aggregation in insertion order (`_aggregate_records`).
 struct Aggregator<'s> {
     specs: &'s [AggSpec],
     groups: &'s [String],
@@ -751,7 +750,7 @@ impl<'s> Aggregator<'s> {
                         continue;
                     }
                     if !is_numeric(&value) {
-                        return Err(plan_err(format!("SUM({}) braucht numerische Werte", spec.field)));
+                        return Err(plan_err(format!("SUM({}) requires numeric values", spec.field)));
                     }
                     acc.add(&value);
                 }
@@ -760,7 +759,7 @@ impl<'s> Aggregator<'s> {
                         continue;
                     }
                     if !is_numeric(&value) {
-                        return Err(plan_err(format!("AVG({}) braucht numerische Werte", spec.field)));
+                        return Err(plan_err(format!("AVG({}) requires numeric values", spec.field)));
                     }
                     acc.add(&value);
                     *cnt += 1;
@@ -834,10 +833,10 @@ fn normalize_aggregates(aggregate: Option<&Val>) -> Result<Vec<AggSpec>> {
             other => (unicode::lower(alias), other.py_str()),
         };
         if !matches!(op.as_str(), "count" | "sum" | "min" | "max" | "avg") {
-            return Err(plan_err(format!("Aggregat {} unbekannt", repr(&op))));
+            return Err(plan_err(format!("aggregate {} unknown", repr(&op))));
         }
         if op != "count" && field == "*" {
-            return Err(plan_err(format!("{} braucht ein Feld", op.to_uppercase())));
+            return Err(plan_err(format!("{} requires a field", op.to_uppercase())));
         }
         out.push(AggSpec { alias: alias.clone(), op, field });
     }
@@ -864,7 +863,7 @@ fn normalize_order_by(order_by: Option<&Val>) -> Result<Vec<(String, bool)>> {
                 out.push((name, unicode::lower(&dir) == "desc"));
             }
             Val::List(l) if l.len() == 2 => out.push((l[0].py_str(), unicode::lower(&l[1].py_str()) == "desc")),
-            other => return Err(plan_err(format!("ORDER BY Eintrag ungueltig: {}", other.py_repr()))),
+            other => return Err(plan_err(format!("ORDER BY entry invalid: {}", other.py_repr()))),
         }
     }
     Ok(out)
@@ -935,7 +934,7 @@ fn apply_order_limit(rows: Vec<Val>, order_by: Option<&Val>, limit: &Val, offset
         };
         out = match py_sort(keyed, *desc, &mut lt) {
             Ok(v) => v.into_iter().map(|(_, r)| r).collect(),
-            Err(Error::Type(_)) => return Err(plan_err(format!("ORDER BY {} vergleicht inkompatible Werte", repr(name)))),
+            Err(Error::Type(_)) => return Err(plan_err(format!("ORDER BY {} compares incompatible values", repr(name)))),
             Err(e) => return Err(e),
         };
     }
@@ -982,12 +981,12 @@ fn cost_of(v: Option<&Val>) -> f64 {
 // QueryEngine
 // ----------------------------------------------------------------------
 
-/// Ausführungskontext einer Abfrage über einer geöffneten Datenbank.
+/// Execution context of a query over an open database.
 pub struct QueryEngine<'a> {
     pub db: &'a Db,
     pub providers: &'a Providers,
-    /// Gastgeberobjekt der Bindungsschicht (z. B. Python-QueryEngine), das an
-    /// Laufzeit-Provider durchgereicht wird.
+    /// Host object of the binding layer (e.g. the Python QueryEngine) that is
+    /// passed through to runtime providers.
     pub host: Option<&'a (dyn Any + Send + Sync)>,
 }
 
@@ -1037,7 +1036,7 @@ impl<'a> QueryEngine<'a> {
         })
     }
 
-    /// `_fast_classic_index_us`: indizierte FIELD/AND-Ausdrücke im CLASSIC-u-Raum.
+    /// `_fast_classic_index_us`: indexed FIELD/AND expressions in CLASSIC u space.
     fn fast_classic_index_us(&self, expr: &Expr, ctx: &QueryContext) -> Result<Option<Vec<Nat>>> {
         if self.plain_classic_layout(ctx).is_none() {
             return Ok(None);
@@ -1104,7 +1103,7 @@ impl<'a> QueryEngine<'a> {
         Ok(self.db.logical_address_in(lay, u, &Val::None, lane)?.n_ref())
     }
 
-    // ------------------------- öffentliche Schnittstelle -------------------------
+    // ------------------------- public interface -------------------------
 
     /// `explain`
     pub fn explain(&self, expr: &Expr, realm: Option<BigInt>, lane: Lane, return_mode: &str) -> Result<Val> {
@@ -1136,7 +1135,7 @@ impl<'a> QueryEngine<'a> {
         let ctx = QueryContext { realm: o.realm.clone(), lane: o.lane };
         let plan = self.plan_expr(expr, &ctx, domain)?;
 
-        // POSTING_COUNT: exakte Postingmetadaten beantworten COUNT direkt.
+        // POSTING_COUNT: exact posting metadata answers COUNT directly.
         if rm == "count" {
             if let Expr::Field { name, op, value, value2, options } = expr {
                 if let Some(idx) = self.find_usable_index(name, &ctx, op, options, value) {
@@ -1160,7 +1159,7 @@ impl<'a> QueryEngine<'a> {
             }
         }
 
-        // CLASSIC_U: indizierte Prädikate bleiben im kompakten u-Raum.
+        // CLASSIC_U: indexed predicates stay in compact u space.
         let fast = if domain == Domain::Record { self.fast_classic_index_us(expr, &ctx)? } else { None };
         if let Some(us) = fast {
             let lay = self.plain_classic_layout(&ctx).unwrap();
@@ -1174,7 +1173,7 @@ impl<'a> QueryEngine<'a> {
                     let specs = normalize_aggregates(o.aggregate.as_ref())?;
                     let groups = o.group_by.as_ref().map(str_list).unwrap_or_default();
                     if specs.is_empty() {
-                        return Err(plan_err("Aggregation braucht mindestens eine Aggregate-Definition"));
+                        return Err(plan_err("aggregation requires at least one aggregate definition"));
                     }
                     let mut needed: Vec<String> = Vec::new();
                     for n in groups.iter().cloned().chain(specs.iter().filter(|s| s.field != "*").map(|s| s.field.clone())) {
@@ -1192,13 +1191,13 @@ impl<'a> QueryEngine<'a> {
                     r.set("group_by", Val::List(groups.iter().map(|g| Val::str(g.as_str())).collect()));
                     r.set("returned", Val::Int(rows.len() as i64));
                     r.set("rows", Val::List(rows));
-                    // Schlüsselreihenfolge wie Python: rows vor returned
+                    // Key order: rows before returned
                     move_last(&mut r, "returned");
                 }
                 "fields" => {
                     let fields = o.select.as_ref().map(str_list).unwrap_or_default();
                     if fields.is_empty() {
-                        return Err(plan_err("return_mode='fields' braucht mindestens ein select-Feld"));
+                        return Err(plan_err("return_mode='fields' requires at least one select field"));
                     }
                     let cols: Vec<Val> = fields.iter().map(|n| Val::str(n.as_str())).collect();
                     let rows = if ordered {
@@ -1244,7 +1243,7 @@ impl<'a> QueryEngine<'a> {
                     r.set("refs", Val::List(refs));
                     move_last(&mut r, "returned");
                 }
-                _ => return Err(plan_err(format!("unbekannter return_mode {}", repr(&rm)))),
+                _ => return Err(plan_err(format!("unknown return_mode {}", repr(&rm)))),
             }
             if o.explain {
                 r.set("plan", plan);
@@ -1260,7 +1259,7 @@ impl<'a> QueryEngine<'a> {
                 let specs = normalize_aggregates(o.aggregate.as_ref())?;
                 let groups = o.group_by.as_ref().map(str_list).unwrap_or_default();
                 if specs.is_empty() {
-                    return Err(plan_err("Aggregation braucht mindestens eine Aggregate-Definition"));
+                    return Err(plan_err("aggregation requires at least one aggregate definition"));
                 }
                 let mut agg = Aggregator::new(&specs, &groups);
                 for n in &c.ns {
@@ -1293,7 +1292,7 @@ impl<'a> QueryEngine<'a> {
             "fields" => {
                 let fields = o.select.as_ref().map(str_list).unwrap_or_default();
                 if fields.is_empty() {
-                    return Err(plan_err("return_mode='fields' braucht mindestens ein select-Feld"));
+                    return Err(plan_err("return_mode='fields' requires at least one select field"));
                 }
                 let build = |n: &Nat| -> Result<Val> {
                     let rec = self.record_envelope_light(n)?;
@@ -1313,7 +1312,7 @@ impl<'a> QueryEngine<'a> {
                 r.set("rows", Val::List(rows.clone()));
                 r.set("returned", Val::Int(rows.len() as i64));
             }
-            _ => return Err(plan_err(format!("unbekannter return_mode {}", repr(&rm)))),
+            _ => return Err(plan_err(format!("unknown return_mode {}", repr(&rm)))),
         }
         if o.explain {
             r.set("plan", plan);
@@ -1321,9 +1320,9 @@ impl<'a> QueryEngine<'a> {
         Ok(r)
     }
 
-    /// Zeilen nur für das LIMIT/OFFSET-Fenster erzeugen (P3). Kandidaten
-    /// außerhalb des Fensters werden in Python-Reihenfolge vorab geprüft, damit
-    /// genau derselbe erste Fehler entsteht wie beim vollständigen Aufbau.
+    /// Build rows only for the LIMIT/OFFSET window. Candidates outside the
+    /// window are pre-checked in the original order, so that exactly the
+    /// same first error arises as with a full build.
     fn sliced_rows(&self, ns: &[Nat], limit: &Val, offset: &Val, mode: GetMode, build: &dyn Fn(&Nat) -> Result<Val>) -> Result<Vec<Val>> {
         let idx: Vec<usize> = slice_simple((0..ns.len()).collect(), limit, offset)?;
         let (lo, hi) = match (idx.first(), idx.last()) {
@@ -1341,7 +1340,7 @@ impl<'a> QueryEngine<'a> {
         Ok(out)
     }
 
-    /// Fehlerprüfung von `get_n(n, mode)` ohne Nutzdaten zu lesen.
+    /// Error check of `get_n(n, mode)` without reading payload data.
     fn row_precheck(&self, n: &Nat, mode: GetMode) -> Result<()> {
         let a = n_to_address(n)?;
         if !self.db.realms.contains_key(a.realm()) {
@@ -1349,7 +1348,7 @@ impl<'a> QueryEngine<'a> {
         }
         let Some(lay) = self.db.layout_at(a.realm(), a.u()) else {
             return if mode == GetMode::Record {
-                Err(Error::Schema("Adresse gehoert zu keinem aufloesbaren logischen Datensatz".into()))
+                Err(Error::Schema("address does not belong to a resolvable logical record".into()))
             } else {
                 Ok(())
             };
@@ -1361,7 +1360,7 @@ impl<'a> QueryEngine<'a> {
         let interp = self.db.interpret_layout_address(lay, &a)?;
         if mode == GetMode::Record {
             let Some(rec) = Db::interp_record(&interp) else {
-                return Err(Error::Schema("Adresse gehoert zu keinem aufloesbaren logischen Datensatz".into()));
+                return Err(Error::Schema("address does not belong to a resolvable logical record".into()));
             };
             self.db.logical_address_in(lay, &rec, &Val::None, a.lane)?;
         }
@@ -1390,7 +1389,7 @@ impl<'a> QueryEngine<'a> {
             .map(|(i, _)| i)
             .collect();
         if ft.len() != 1 {
-            return Err(plan_err("ranked FULLTEXT search braucht genau ein fulltext/phrase-Praedikat"));
+            return Err(plan_err("ranked FULLTEXT search requires exactly one fulltext/phrase predicate"));
         }
         let pred = leaves[ft[0]];
         let mut others = leaves.iter().enumerate().filter(|(i, _)| *i != ft[0]).map(|(_, x)| (*x).clone());
@@ -1403,21 +1402,21 @@ impl<'a> QueryEngine<'a> {
         Ok((pred, Some(out)))
     }
 
-    /// `search`: BM25 über genau ein FULLTEXT/PHRASE-Prädikat plus AND-Filter.
+    /// `search`: BM25 over exactly one FULLTEXT/PHRASE predicate plus AND filters.
     #[allow(clippy::too_many_arguments)]
     pub fn search(&self, expr: &Expr, realm: Option<BigInt>, lane: Lane, select: Option<&Val>, limit: &Val, offset: &Val, explain: bool, k1: f64, b: f64) -> Result<Val> {
         let ctx = QueryContext { realm, lane };
         if ctx.realm.is_none() {
-            return Err(plan_err("FULLTEXT search braucht einen Realm"));
+            return Err(plan_err("FULLTEXT search requires a realm"));
         }
         let Some(lay) = self.plain_classic_layout(&ctx) else {
-            return Err(plan_err("V0.27 ranked FULLTEXT search ist fuer CLASSIC record-u implementiert"));
+            return Err(plan_err("ranked FULLTEXT search is implemented for CLASSIC record u only"));
         };
         let (pred, filter_expr) = self.extract_fulltext_conjunction(expr)?;
         let Expr::Field { name, op, value, options, .. } = pred else { unreachable!() };
         let idx = match self.find_usable_index(name, &ctx, op, options, value) {
             Some(i) if i.kind == IndexKind::Fulltext => i,
-            _ => return Err(plan_err(format!("kein frischer FULLTEXT-Index fuer Feld {}", repr(name)))),
+            _ => return Err(plan_err(format!("no fresh FULLTEXT index for field {}", repr(name)))),
         };
         let sequence = textindex::query_fulltext_sequence(value, &idx.options)?;
         let mut terms: Vec<String> = Vec::new();
@@ -1495,7 +1494,7 @@ impl<'a> QueryEngine<'a> {
         Ok(r)
     }
 
-    /// `_record_envelope_light`: günstige Projektion bei bekanntem CLASSIC-Anker.
+    /// `_record_envelope_light`: cheap projection for a known CLASSIC anchor.
     fn record_envelope_light(&self, n: &Nat) -> Result<Val> {
         let light = (|| -> Result<Option<Val>> {
             let a = n_to_address(n)?;
@@ -1523,7 +1522,7 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
-    // ------------------------- Planung -------------------------
+    // ------------------------- planning -------------------------
 
     fn estimate_universe_rows(&self, ctx: &QueryContext, domain: Domain) -> Option<BigInt> {
         let rn = ctx.realm_nat()?;
@@ -1543,7 +1542,7 @@ impl<'a> QueryEngine<'a> {
         Some(BigInt::from(dense) * width + cells)
     }
 
-    #[allow(clippy::too_many_arguments)] // bildet die Python-Signatur (Keyword-Argumente) nach
+    #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     fn choose_field_access(&self, name: &str, op: &str, value: &Val, value2: &Val, options: &Val, ctx: &QueryContext, domain: Domain) -> (&'static str, Option<&'a IndexDef>, Val, f64) {
         let idx = self.find_usable_index(name, ctx, op, options, value);
         let universe = self.estimate_universe_rows(ctx, domain);
@@ -1747,7 +1746,7 @@ impl<'a> QueryEngine<'a> {
         }
     }
 
-    // ------------------------- Auswertung -------------------------
+    // ------------------------- evaluation -------------------------
 
     /// `_eval`
     pub fn eval(&self, expr: &Expr, ctx: &QueryContext, domain: Domain) -> Result<CandidateSet> {
@@ -1786,7 +1785,7 @@ impl<'a> QueryEngine<'a> {
                     acc = match op.as_str() {
                         "and" => CandidateSet::new(domain, setops::intersect_sorted(&acc.ns, &child.ns), "AND"),
                         "or" => CandidateSet::new(domain, setops::union_sorted(&acc.ns, &child.ns), "OR"),
-                        other => return Err(plan_err(format!("Bool-Operator {} unbekannt", repr(other)))),
+                        other => return Err(plan_err(format!("bool operator {} unknown", repr(other)))),
                     };
                 }
                 Ok(acc)
@@ -1911,9 +1910,9 @@ impl<'a> QueryEngine<'a> {
             let mut refs = Vec::new();
             let lo_n = Nat::from_bigint(&lo).unwrap();
             let hi_n = Nat::from_bigint(&hi).unwrap();
-            // Große Bereiche: nur materialisierte u besuchen (Python läuft über
-            // jedes u des Bereichs; Ergebnis identisch, da nur vorhandene
-            // Records beitragen und das CLASSIC-Layout den Bereich besitzt).
+            // Large ranges: visit only materialized u (equivalent to iterating
+            // every u of the range, since only existing records contribute
+            // and the CLASSIC layout owns the range).
             let span = &hi - &lo + BigInt::from(1);
             let us: Vec<Nat> = if span > BigInt::from(STRUCT_RANGE_DIRECT_MAX) {
                 let realm = ctx.realm_nat().unwrap();
@@ -1974,7 +1973,7 @@ impl<'a> QueryEngine<'a> {
 
     fn eval_math(&self, provider: &str, params: &Val, ctx: &QueryContext, domain: Domain) -> Result<CandidateSet> {
         let Some(p) = self.providers.map.get(provider) else {
-            return Err(plan_err(format!("MATH Provider {} ist nicht registriert", repr(provider))));
+            return Err(plan_err(format!("MATH provider {} is not registered", repr(provider))));
         };
         let ns: Vec<Nat> = match &p.kind {
             ProviderKind::Formula => self.provider_formula(ctx, params)?,
@@ -1997,7 +1996,7 @@ impl<'a> QueryEngine<'a> {
         let mut refs = Vec::new();
         if c.domain == Domain::Cell {
             for n in &c.ns {
-                let msg = || dom_err(format!("CELL N{n} besitzt keine aufloesbare RECORD-Identitaet"));
+                let msg = || dom_err(format!("CELL N{n} has no resolvable RECORD identity"));
                 match self.db.record_n_from_n_nat(n) {
                     Ok(Some(r)) => refs.push(r),
                     _ => return Err(msg()),
@@ -2039,13 +2038,13 @@ impl<'a> QueryEngine<'a> {
     }
 
 
-    // ------------------------- Materialisierungsscans (P1) -------------------------
+    // ------------------------- materialization scans -------------------------
 
-    /// Record-Scan in Python-Reihenfolge (`iter_materialized_record_ns` +
-    /// `get_n_record`). CLASSIC-Records werden direkt aus den Zellen ihrer
-    /// u-Gruppe gebildet (gleiche Labels wie `get_record_view`), ohne
-    /// erneutes Lesen und ohne N-Berechnung je Zelle; andere Layouts nutzen
-    /// die vollständige Record-Ansicht.
+    /// Record scan in canonical order (`iter_materialized_record_ns` +
+    /// `get_n_record`). CLASSIC records are built directly from the cells of
+    /// their u group (same labels as `get_record_view`), without re-reading
+    /// and without computing N per cell; other layouts use the full record
+    /// view.
     fn scan_records(&self, ctx: &QueryContext, f: &mut dyn FnMut(&Nat, &RecView<'_>) -> Result<()>) -> Result<()> {
         let realm_f = ctx.realm_nat();
         let mut seen: HashSet<Nat> = HashSet::new();
@@ -2065,7 +2064,7 @@ impl<'a> QueryEngine<'a> {
                     }
                     Err(e) => return Err(e),
                 };
-                // CLASSIC-u-Gruppen sind im Scan eindeutig (keine Mengenhaltung, P4)
+                // CLASSIC u groups are unique within the scan (no set kept)
                 {
                     let resolver = self.db.field_resolver(&realm, &u);
                     let mut data: Vec<(String, Val)> = Vec::with_capacity(group.len());
@@ -2104,8 +2103,8 @@ impl<'a> QueryEngine<'a> {
         flush(&mut group, &mut seen)
     }
 
-    /// Zellen-Scan mit Label je Zelle; CLASSIC über den Feld-Resolver der
-    /// u-Gruppe, sonst über den vollständigen Umschlag.
+    /// Cell scan with a label per cell; CLASSIC via the field resolver of the
+    /// u group, otherwise via the full envelope.
     fn scan_cell_labels(&self, ctx: &QueryContext, f: &mut CellLabelFn<'_>) -> Result<()> {
         let realm_f = ctx.realm_nat();
         let mut cur_key: Option<(Nat, Nat)> = None;
@@ -2137,7 +2136,7 @@ impl<'a> QueryEngine<'a> {
         })
     }
 
-    // ------------------------- eingebaute Provider -------------------------
+    // ------------------------- built-in providers -------------------------
 
     fn provider_formula(&self, ctx: &QueryContext, params: &Val) -> Result<Vec<Nat>> {
         let parameter = params.get("parameter").map(|p| p.py_str()).unwrap_or_else(|| "k".into());
@@ -2145,18 +2144,18 @@ impl<'a> QueryEngine<'a> {
         let stop = py_int(params.get("stop").ok_or_else(|| Error::Key("'stop'".into()))?)?;
         let step = py_int(params.get("step").unwrap_or(&Val::Int(1)))?;
         if step.is_zero() {
-            return Err(plan_err("formula step darf nicht 0 sein"));
+            return Err(plan_err("formula step must not be 0"));
         }
         let u_expr = params.get("u").ok_or_else(|| Error::Key("'u'".into()))?.py_str();
         let v_expr = if let Some(v) = params.get("V") {
             v.py_str()
         } else if let Some(v) = params.get("v") {
             let Some(r) = &ctx.realm else {
-                return Err(plan_err("formula mit lokalem v braucht Query-Kontext realm"));
+                return Err(plan_err("formula with local v requires query context realm"));
             };
             format!("({r}-1)*{}+({})", address::realm_span(), v.py_str())
         } else {
-            return Err(plan_err("formula braucht V=... oder v=..."));
+            return Err(plan_err("formula requires V=... or v=..."));
         };
         let side = params.get("side").cloned().unwrap_or_else(|| Val::str("NL"));
         let mapping = MathMap::compile("query_formula", &[parameter], &u_expr, &v_expr, &side, &address::realm_span().to_bigint())?;
@@ -2181,7 +2180,7 @@ impl<'a> QueryEngine<'a> {
         let stop = py_int(params.get("stop").ok_or_else(|| Error::Key("'stop'".into()))?)?;
         let step = py_int(params.get("step").unwrap_or(&Val::Int(1)))?;
         if step.is_zero() {
-            return Err(plan_err("n_sequence step darf nicht 0 sein"));
+            return Err(plan_err("n_sequence step must not be 0"));
         }
         let strict = params.get("strict").is_some_and(|s| s.is_truthy());
         let realm = ctx.realm_nat();
@@ -2192,7 +2191,7 @@ impl<'a> QueryEngine<'a> {
             let cur = n.clone();
             n += &step;
             let Some(nn) = Nat::from_bigint(&cur).filter(|x| !x.is_zero()) else {
-                return Err(Error::Value("N muss > 0 sein".into()));
+                return Err(Error::Value("N must be > 0".into()));
             };
             let a = match n_to_address(&nn) {
                 Ok(a) => a,
@@ -2217,12 +2216,12 @@ impl<'a> QueryEngine<'a> {
     fn provider_math_layout_inputs(&self, params: &Val) -> Result<Vec<Nat>> {
         let lid = py_int(params.get("layout_id").ok_or_else(|| Error::Key("'layout_id'".into()))?)?;
         let rows = match params.get("inputs") {
-            None | Some(Val::None) => return Err(plan_err("math_layout_inputs braucht inputs=[...]")),
+            None | Some(Val::None) => return Err(plan_err("math_layout_inputs requires inputs=[...]")),
             Some(r) => r,
         };
         let rec = match lid.to_u64() {
             Some(l) => self.db.math_record(l)?,
-            None => return Err(Error::MathLayoutNotFound(format!("MATH Layout {lid} existiert nicht"))),
+            None => return Err(Error::MathLayoutNotFound(format!("MATH layout {lid} does not exist"))),
         };
         let mut out = Vec::new();
         for row in iter_items(rows)? {
@@ -2238,10 +2237,10 @@ impl<'a> QueryEngine<'a> {
     }
 }
 
-/// Rückruf des Zellen-Scans: Rohzelle, Label, ggf. vollständiger Umschlag.
+/// Callback of the cell scan: raw cell, label, full envelope if available.
 type CellLabelFn<'f> = dyn FnMut(&RawCell, &str, Option<&Val>) -> Result<()> + 'f;
 
-/// Record-Sicht des Scans: CLASSIC kompakt, sonst vollständige Ansicht.
+/// Record view of the scan: CLASSIC compact, otherwise full view.
 enum RecView<'x> {
     Classic { data: Vec<(String, Val)>, realm: &'x Nat, lane: Lane, u: &'x Nat, lay: &'x LayoutDef },
     Full(Val),
@@ -2269,7 +2268,7 @@ impl RecView<'_> {
                 "layout_id" => Val::Int(lay.layout_id as i64),
                 "layout_kind" => Val::str(lay.kind.name()),
                 "layout_name" => Val::str(lay.name.as_str()),
-                other => return Err(plan_err(format!("Strukturbegriff {} unbekannt", repr(other)))),
+                other => return Err(plan_err(format!("structural term {} unknown", repr(other)))),
             }),
         }
     }
@@ -2286,7 +2285,7 @@ fn sequence_count(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
         return BigInt::zero();
     }
     let d = stop - start;
-    // Python-Floor-Division
+    // Python floor division
     let (q, r) = (&d / step, &d % step);
     let q = if !r.is_zero() && (r.is_negative() != step.is_negative()) { q - 1 } else { q };
     q + 1
@@ -2296,7 +2295,7 @@ fn domain_for_return(mode: &str, shown: &str) -> Result<Domain> {
     match mode {
         "cell" => Ok(Domain::Cell),
         "record" | "fields" | "count" | "n" | "aggregate" | "ranked" => Ok(Domain::Record),
-        _ => Err(plan_err(format!("return_mode {} unbekannt", repr(shown)))),
+        _ => Err(plan_err(format!("return_mode {} unknown", repr(shown)))),
     }
 }
 
@@ -2308,7 +2307,7 @@ fn struct_value_cell(name: &str, cell: &Val) -> Result<Val> {
             Some(r) => n_val(&parse_n_val(r)?),
         },
         "realm" | "u" | "v" | "lane" | "layout_id" | "layout_kind" | "layout_name" | "object" => cell.get(name).cloned().unwrap_or(Val::None),
-        other => return Err(plan_err(format!("Strukturbegriff {} unbekannt", repr(other)))),
+        other => return Err(plan_err(format!("structural term {} unknown", repr(other)))),
     })
 }
 
@@ -2319,7 +2318,7 @@ fn struct_value_record(name: &str, rec: &Val) -> Result<Val> {
         "u" => anchor("u"),
         "v" => anchor("v"),
         "realm" | "lane" | "layout_id" | "layout_kind" | "layout_name" | "object" => rec.get(name).cloned().unwrap_or(Val::None),
-        other => return Err(plan_err(format!("Strukturbegriff {} unbekannt", repr(other)))),
+        other => return Err(plan_err(format!("structural term {} unknown", repr(other)))),
     })
 }
 
@@ -2343,10 +2342,10 @@ pub fn normalize_provider_item(item: &Val, domain: Domain) -> Result<Nat> {
         }
         _ => {}
     }
-    Err(dom_err(format!("Provider lieferte ungueltigen Kandidaten: {}", item.py_repr())))
+    Err(dom_err(format!("provider returned invalid candidate: {}", item.py_repr())))
 }
 
-/// Optionen aus einer JSON-Spezifikation (`execute_spec`).
+/// Options from a JSON specification (`execute_spec`).
 pub fn exec_options_from_spec(spec: &Val) -> Result<ExecOptions> {
     let realm = match spec.get("realm") {
         None | Some(Val::None) => None,

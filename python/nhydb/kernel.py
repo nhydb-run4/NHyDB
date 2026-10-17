@@ -1,9 +1,9 @@
-"""Zustandsloser NHyDB-Kernel (Python-Gegenstück zu ``nhydb_math_v027``).
+"""Stateless NHyDB kernel.
 
-Adressmathematik, Binär-Codecs, Mengenkerne, Superblock/Blockheader und die
-Krypto-Grundfunktionen des externen Layoutplans. Alle Berechnungen laufen im
-nativen Modul (Rust); hier stehen nur dünne Hüllen für Python-spezifische
-Typen (``array.array``, Base64).
+Address mathematics, binary codecs, set kernels, superblock/block header and
+the crypto primitives of the external layout plan. All computations run in
+the native module (Rust); this module only provides thin wrappers for
+Python-specific types (``array.array``, Base64).
 """
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ BLOCK_NAMES = {
 def require_positive(name: str, value: int) -> int:
     value = int(value)
     if value <= 0:
-        raise ValueError(f"{name} muss > 0 sein")
+        raise ValueError(f"{name} must be > 0")
     return value
 
 
@@ -153,7 +153,7 @@ def array_le_bytes(a: _array) -> bytes:
 def array_from_le(raw: bytes, width: int) -> _array:
     width = int(width)
     if width not in (4, 8):
-        raise ValueError("nur 4/8 Byte Arrays")
+        raise ValueError("only 4/8-byte arrays are supported")
     a = _array("I" if width == 4 else "Q")
     a.frombytes(raw)
     if _sys.byteorder != "little":
@@ -169,7 +169,7 @@ def enum_to_raw(field: Any, value: Any) -> Any:
         try:
             return enum[value]
         except KeyError as e:
-            raise ValueError(f"unbekannter Enumwert {value!r}") from e
+            raise ValueError(f"unknown enum value {value!r}") from e
     return int(value)
 
 
@@ -182,9 +182,9 @@ def enum_from_raw(field: Any, value: Any) -> Any:
 
 
 def layout_seal(key: bytes, plaintext: bytes, aad: bytes) -> dict:
-    """AES-256-GCM mit zufälligem 12-Byte-Nonce (nativ)."""
+    """AES-256-GCM with a random 12-byte nonce (native)."""
     if len(key) != 32:
-        raise ValueError("Layout-Key muss 32 Byte haben")
+        raise ValueError("layout key must be 32 bytes")
     nonce = _os.urandom(12)
     ct = _n._aes_gcm_seal(key, nonce, plaintext, aad)
     return {"nonce": _b64.b64encode(nonce).decode("ascii"), "ciphertext": _b64.b64encode(ct).decode("ascii")}
@@ -192,7 +192,7 @@ def layout_seal(key: bytes, plaintext: bytes, aad: bytes) -> dict:
 
 def layout_open(key: bytes, sealed: dict, aad: bytes) -> bytes:
     if len(key) != 32:
-        raise ValueError("Layout-Key muss 32 Byte haben")
+        raise ValueError("layout key must be 32 bytes")
     return _n._aes_gcm_open(key, _b64.b64decode(sealed["nonce"], validate=True),
                             _b64.b64decode(sealed["ciphertext"], validate=True), aad)
 

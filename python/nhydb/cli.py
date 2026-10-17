@@ -1,7 +1,7 @@
-"""Kommandozeile der nativen NHyDB (``python -m nhydb``).
+"""Command line of the native NHyDB (``python -m nhydb``).
 
-Reine Schnittstellenschicht: Argumente parsen und Ergebnisse formatieren.
-Alle Datenbankoperationen laufen im nativen Kern.
+Pure interface layer: parses arguments and formats results.
+All database operations run in the native core.
 """
 from __future__ import annotations
 
@@ -270,14 +270,14 @@ def _parse_structural_get_target(text: str, *, default_realm: Optional[int] = No
     parts = raw.split(",")
     if parts and parts[0].lower().startswith("r"):
         if len(parts) not in {3, 4} or not parts[1].lower().startswith("u") or not parts[2].lower().startswith("v"):
-            raise ValueError("Strukturadresse erwartet R<realm>,u<u>,v<v>[,NL|NR|0|1]")
+            raise ValueError("structural address expects R<realm>,u<u>,v<v>[,NL|NR|0|1]")
         realm = int(parts[0][1:]); u = int(parts[1][1:]); v = int(parts[2][1:])
         lane_raw = "NL" if len(parts) == 3 else parts[3]
     else:
         if default_realm is None:
-            raise ValueError("u,v-Kurzform braucht --realm")
+            raise ValueError("u,v short form needs --realm")
         if len(parts) not in {2, 3} or not parts[0].lower().startswith("u") or not parts[1].lower().startswith("v"):
-            raise ValueError("Kurzadresse erwartet u<u>,v<v>[,NL|NR|0|1] plus --realm")
+            raise ValueError("short address expects u<u>,v<v>[,NL|NR|0|1] plus --realm")
         realm = int(default_realm); u = int(parts[0][1:]); v = int(parts[1][1:])
         lane_raw = "NL" if len(parts) == 2 else parts[2]
     if str(lane_raw).lower().startswith("s"):
@@ -311,7 +311,7 @@ def _parse_json_fields(items: Optional[Sequence[str]]) -> Optional[List[Dict[str
     for raw in items:
         obj = json.loads(raw)
         if not isinstance(obj, dict):
-            raise ValueError("--add-field erwartet ein JSON-Objekt")
+            raise ValueError("--add-field expects a JSON object")
         out.append(obj)
     return out
 def _evolution_kwargs(args) -> Dict[str, Any]:
@@ -421,7 +421,7 @@ def main():
     x = sub.add_parser("find")
     x.add_argument("file")
     x.add_argument("--realm", type=int, required=True)
-    x.add_argument("--lane", default="NL", help="0/NL oder 1/NR")
+    x.add_argument("--lane", default="NL", help="0/NL or 1/NR")
     x.add_argument("--eq", action="append")
     x.add_argument("--between", action="append")
     x.add_argument("--show", type=int, default=0)
@@ -522,7 +522,7 @@ def main():
                 _pjson(db.get(args.realm, args.u, lane=args.lane,
                               dyn_address=args.dyn_address, dyn_v=args.dyn_v))
             else:
-                raise SystemExit("GET braucht N..., R,u,v[,lane] oder --realm/--u/--v")
+                raise SystemExit("GET needs N..., R,u,v[,lane] or --realm/--u/--v")
         elif args.cmd == "address":
             _pjson(db.dyn_address(args.realm, args.u, args.v))
         elif args.cmd == "cell":

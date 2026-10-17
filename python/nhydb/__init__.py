@@ -1,16 +1,14 @@
-"""NHyDB – native Rust-Engine mit Python-Anbindung.
+"""NHyDB – native Rust engine with Python bindings.
 
-Die Klasse :class:`NHyDB` bietet die vollständige Datenbank-API
-(Dateikennung NHYDB016 mit Systemraum R0,u1 und verschlüsseltem externem
-Layoutplan) sowie
+The class :class:`NHyDB` provides the complete database API (file magic
+NHYDB016 with system space R0,u1 and an encrypted external layout plan) plus
 
-* eine einfache Einzel-API (``put_cell``, ``put_record``, ``get_value``,
-  ``get_record``, ``delete_cell``, ``delete_record``; jeweils ``commit=``) und
-* eine NumPy-Batch-API (``put_numpy_batch``, ``put_cells_numpy``,
-  ``put_objects_numpy``, ``read_numpy``), deren Schleifen vollständig in Rust
-  laufen.
+* a simple single-item API (``put_cell``, ``put_record``, ``get_value``,
+  ``get_record``, ``delete_cell``, ``delete_record``; each with ``commit=``) and
+* a NumPy batch API (``put_numpy_batch``, ``put_cells_numpy``,
+  ``put_objects_numpy``, ``read_numpy``) whose loops run entirely in Rust.
 
-Die gesamte Datenbanklogik liegt im nativen Modul ``nhydb._native``.
+All database logic lives in the native module ``nhydb._native``.
 """
 from ._native import (  # noqa: F401
     NHyDB,
@@ -65,13 +63,13 @@ from ._native import (  # noqa: F401
 )
 
 
-def open(path, **kwargs):  # noqa: A001 - bewusst wie sqlite3.connect
-    """Öffnet eine bestehende Datenbank (Kurzform für ``NHyDB(path)``)."""
+def open(path, **kwargs):  # noqa: A001 - intentionally like sqlite3.connect
+    """Open an existing database (shorthand for ``NHyDB(path)``)."""
     return NHyDB(path, **kwargs)
 
 
 def create(path, **kwargs):
-    """Legt eine neue Datenbank an (Kurzform für ``NHyDB.create(path)``)."""
+    """Create a new database (shorthand for ``NHyDB.create(path)``)."""
     return NHyDB.create(path, **kwargs)
 
 

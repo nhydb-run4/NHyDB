@@ -1,5 +1,5 @@
-//! MATH-Benchmark im Kern: Zielberechnung und `put_math_batch` ohne Python.
-//! Aufruf: cargo run --release --example bench_math -- [rows] [dir]
+//! MATH benchmark in the core: target computation and `put_math_batch` without Python.
+//! Usage: cargo run --release --example bench_math -- [rows] [dir]
 use std::time::Instant;
 
 use nhydb_core::db::{Db, OpenOptions};

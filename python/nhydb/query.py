@@ -1,9 +1,9 @@
-"""Layoutunabhängige Abfrageschicht (Gegenstück zu ``nhydb_query_v027``).
+"""Layout-independent query layer.
 
-Die Ausdrucksobjekte (``Q``, ``FieldPredicate`` …) sind schlanke, unveränderliche
-Dataclasses mit der Operator-Überladung der Referenz (``&``, ``|``, ``~``,
-``==``, ``<`` …). Planung (``cardinality-cost-v1``), Auswertung, Provider,
-Aggregation, Sortierung und BM25-Ranking laufen in der nativen ``QueryEngine``.
+The expression objects (``Q``, ``FieldPredicate`` …) are lightweight, immutable
+dataclasses with operator overloading (``&``, ``|``, ``~``, ``==``, ``<`` …).
+Planning (``cardinality-cost-v1``), evaluation, providers, aggregation,
+sorting and BM25 ranking run in the native ``QueryEngine``.
 
     user predicate -> provider(s) -> canonical candidate identities -> result
 """
@@ -31,7 +31,7 @@ _VALID_DOMAINS = {DOMAIN_RECORD, DOMAIN_CELL}
 
 
 # ---------------------------------------------------------------------------
-# Ausdrucksbaum
+# Expression tree
 # ---------------------------------------------------------------------------
 
 class Expr:
@@ -82,7 +82,7 @@ class DirectNPredicate(Expr):
 
 @dataclass(frozen=True)
 class AllPredicate(Expr):
-    """Das vollständige materialisierte Universum der Zieldomäne."""
+    """The complete materialized universe of the target domain."""
 
 
 class _Ref:
@@ -137,7 +137,7 @@ class _Ref:
                  tokenizer: str = "simple") -> Expr:
         mode = str(mode).lower()
         if mode not in {"all", "any"}:
-            raise ValueError("FULLTEXT mode muss 'all' oder 'any' sein")
+            raise ValueError("FULLTEXT mode must be 'all' or 'any'")
         return self._p("fulltext", value, options={
             "mode": mode, "casefold": bool(casefold), "tokenizer": tokenizer, "positions": True
         })
@@ -213,7 +213,7 @@ class QueryBuilder:
     def n(self, *values: Any, domain: str = DOMAIN_CELL) -> DirectNPredicate:
         domain = str(domain).lower()
         if domain not in _VALID_DOMAINS:
-            raise QueryDomainError(f"domain muss record oder cell sein, erhalten: {domain!r}")
+            raise QueryDomainError(f"domain must be record or cell, got: {domain!r}")
         return DirectNPredicate(tuple(values), domain)
 
     def math(self, provider: str, **params: Any) -> MathPredicate:
@@ -236,12 +236,12 @@ Q = QueryBuilder()
 
 def ensure_expr(value: Any) -> Expr:
     if not isinstance(value, Expr):
-        raise TypeError(f"Query-Ausdruck erwartet, erhalten: {type(value).__name__}")
+        raise TypeError(f"query expression expected, got: {type(value).__name__}")
     return value
 
 
 # ---------------------------------------------------------------------------
-# Kontext- und Ergebnisobjekte (für Laufzeit-Provider)
+# Context and result objects (for runtime providers)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -252,7 +252,7 @@ class CandidateSet:
 
     def __post_init__(self) -> None:
         if self.domain not in _VALID_DOMAINS:
-            raise QueryDomainError(f"ungueltige Candidate-Domain {self.domain!r}")
+            raise QueryDomainError(f"invalid candidate domain {self.domain!r}")
 
     @property
     def count(self) -> int:
@@ -265,7 +265,7 @@ class CandidateSet:
 
 @dataclass(frozen=True)
 class QueryContext:
-    """Kontext, den Laufzeit-Provider erhalten: ``realm`` (oder None), ``lane``."""
+    """Context passed to runtime providers: ``realm`` (or None), ``lane``."""
     realm: Optional[int] = None
     lane: int = 0
 
@@ -280,7 +280,7 @@ class MathProvider:
 
 
 # ---------------------------------------------------------------------------
-# NHySQL-0.24 (Lexer/Parser/Compiler/Ausführung nativ; hier nur die Ergebnisobjekte)
+# NHySQL (lexer/parser/compiler/execution are native; only the result objects live here)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -356,7 +356,7 @@ def _compiled_from_raw(raw: Mapping[str, Any]) -> SQLCompiledQuery:
 
 
 # ---------------------------------------------------------------------------
-# Kleine CLI (wie nhydb_query_v027): Filter-Flags, JSON-Spezifikation oder NHySQL.
+# Small CLI: filter flags, JSON specification or NHySQL.
 # ---------------------------------------------------------------------------
 
 def _scalar(text: str) -> Any:
@@ -469,7 +469,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     selected_inputs = sum(bool(x) for x in (args.spec, args.spec_file, args.sql, args.sql_file))
     if selected_inputs > 1:
-        raise SystemExit("nur eine Eingabeart verwenden: --sql/--sql-file/--spec/--spec-file")
+        raise SystemExit("use only one input kind: --sql/--sql-file/--spec/--spec-file")
     spec = None
     sql_text = None
     if args.spec_file:
@@ -506,7 +506,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
                 if aggregate:
                     expr = Q.all()
                 else:
-                    raise SystemExit("Query braucht --sql/--sql-file/--spec/--spec-file oder mindestens einen Filter")
+                    raise SystemExit("query needs --sql/--sql-file/--spec/--spec-file or at least one filter")
             result = engine.execute(expr, realm=args.realm, lane=args.lane,
                                     return_mode=args.return_mode, select=args.select,
                                     aggregate=aggregate, group_by=args.group_by,

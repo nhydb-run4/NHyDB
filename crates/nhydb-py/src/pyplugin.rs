@@ -1,4 +1,4 @@
-//! Brücke: Python-Objekte als CUSTOM-Layout-Plugins (isolierter Sonderweg).
+//! Bridge: Python objects as CUSTOM layout plugins (isolated special path).
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyWeakrefMethods, PyWeakrefReference};
@@ -10,7 +10,7 @@ use nhydb_core::{Db, Lane, Nat, Result, Val};
 
 use crate::conv::{from_pyerr, from_val, nat_py, to_val};
 
-/// Python-Sicht auf ein Layout (`LayoutDef` der v0.14, nur lesend).
+/// Python view of a layout (`LayoutDef`, read-only).
 #[pyclass(name = "LayoutDef", module = "nhydb", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyLayoutDef {
@@ -96,7 +96,7 @@ impl PyLayoutDef {
 
 pub struct PyPlugin {
     pub obj: Py<PyAny>,
-    /// Schwache Referenz auf das Python-`NHyDB`-Objekt (für `occupied_addresses`).
+    /// Weak reference to the Python `NHyDB` object (for `occupied_addresses`).
     pub db: Option<Py<PyWeakrefReference>>,
 }
 
@@ -162,7 +162,7 @@ impl LayoutPlugin for PyPlugin {
             if r.is_instance_of::<PyDict>() {
                 to_val(&r)
             } else {
-                // kein dict → Engine meldet SchemaError
+                // not a dict → the engine reports SchemaError
                 Ok(Val::List(vec![]))
             }
         })

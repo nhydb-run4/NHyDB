@@ -1,9 +1,8 @@
-//! Python-API der MATH_MAP-Sprache und des Realmplaners
-//! (`nhydb_math_v027` MATH-Teil, `nhydb_layout_v027`).
+//! Python API of the MATH_MAP language and the realm planner
+//! (`nhydb.math`, `nhydb.mathlayout`).
 //!
-//! Die Klassen bilden die (frozen) Dataclasses der Referenz nach:
-//! Konstruktoren, Attribute, Gleichheit/Ordnung/Hash, `repr`,
-//! `to_dict`/`from_dict`.
+//! The classes behave like frozen dataclasses: constructors,
+//! attributes, equality/ordering/hash, `repr`, `to_dict`/`from_dict`.
 
 use std::collections::HashMap;
 
@@ -84,10 +83,10 @@ impl PyMathExpression {
             for (k, v) in d.iter() {
                 let name = k.str()?.to_string();
                 if v.is_instance_of::<pyo3::types::PyBool>() || !v.is_instance_of::<pyo3::types::PyInt>() {
-                    // Python prüft Variablen erst beim Zugriff; nicht genutzte Variablen
-                    // sind ohnehin ein Fehler (unbekannt) oder ganzzahlig.
+                    // Variables are only checked on access; unused variables
+                    // are an error anyway (unknown) or integral.
                     if self.inner.parameters.contains(&name) {
-                        return Err(crate::exceptions::MathDomainError::new_err(format!("Variable {} muss ganzzahlig sein", Val::str(name.as_str()).py_repr())));
+                        return Err(crate::exceptions::MathDomainError::new_err(format!("variable {} must be an integer", Val::str(name.as_str()).py_repr())));
                     }
                 }
                 let b: BigInt = v.extract().unwrap_or_default();
@@ -490,7 +489,7 @@ fn dry_run(
 
 fn check_int(name: &str, v: &Bound<'_, PyAny>) -> PyResult<BigInt> {
     if v.is_instance_of::<pyo3::types::PyBool>() || !v.is_instance_of::<pyo3::types::PyInt>() {
-        return Err(crate::exceptions::MathDomainError::new_err(format!("{name} muss ein Integer sein")));
+        return Err(crate::exceptions::MathDomainError::new_err(format!("{name} must be an integer")));
     }
     v.extract()
 }
@@ -500,12 +499,12 @@ fn check_int(name: &str, v: &Bound<'_, PyAny>) -> PyResult<BigInt> {
 #[allow(non_snake_case)]
 fn split_global_v(V_global: &Bound<'_, PyAny>, realm_span: Option<&Bound<'_, PyAny>>) -> PyResult<(BigInt, BigInt)> {
     if V_global.is_instance_of::<pyo3::types::PyBool>() || !V_global.is_instance_of::<pyo3::types::PyInt>() {
-        return Err(crate::exceptions::MathDomainError::new_err("V muss ein Integer sein"));
+        return Err(crate::exceptions::MathDomainError::new_err("V must be an integer"));
     }
     let span = match realm_span {
         Some(s) => {
             if s.is_instance_of::<pyo3::types::PyBool>() || !s.is_instance_of::<pyo3::types::PyInt>() {
-                return Err(crate::exceptions::MathDomainError::new_err("realm_span muss ein positiver Integer sein"));
+                return Err(crate::exceptions::MathDomainError::new_err("realm_span must be a positive integer"));
             }
             s.extract()?
         }
@@ -517,8 +516,8 @@ fn split_global_v(V_global: &Bound<'_, PyAny>, realm_span: Option<&Bound<'_, PyA
 #[pyfunction]
 #[pyo3(signature = (logical_realm, v_local, *, realm_span=None))]
 fn join_global_v(logical_realm: &Bound<'_, PyAny>, v_local: &Bound<'_, PyAny>, realm_span: Option<BigInt>) -> PyResult<BigInt> {
-    let r = check_int("logical_realm", logical_realm).map_err(|_| crate::exceptions::MathDomainError::new_err("logical_realm muss >= 1 sein"))?;
-    let v = check_int("v_local", v_local).map_err(|_| crate::exceptions::MathDomainError::new_err("v_local liegt ausserhalb des Realms"))?;
+    let r = check_int("logical_realm", logical_realm).map_err(|_| crate::exceptions::MathDomainError::new_err("logical_realm must be >= 1"))?;
+    let v = check_int("v_local", v_local).map_err(|_| crate::exceptions::MathDomainError::new_err("v_local lies outside the realm"))?;
     mx::join_global_v(&r, &v, &realm_span.unwrap_or_else(span_default)).py()
 }
 
@@ -527,7 +526,7 @@ fn normalize_side(value: &Bound<'_, PyAny>) -> PyResult<i64> {
     mx::normalize_side(&to_val(value)?).py()
 }
 
-/// Prozessweite Schutzgrenze der MATH-Ausdruckssprache (Bit).
+/// Process-wide safety limit of the MATH expression language (bits).
 #[pyfunction]
 fn set_math_max_intermediate_bits(bits: u64) {
     mx::set_default_max_bits(bits)
@@ -539,7 +538,7 @@ fn get_math_max_intermediate_bits() -> u64 {
 }
 
 // ----------------------------------------------------------------------
-// Realmplaner
+// Realm planner
 // ----------------------------------------------------------------------
 
 #[pyclass(name = "OwnedRealmExtent", module = "nhydb", frozen, skip_from_py_object)]

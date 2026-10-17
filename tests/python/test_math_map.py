@@ -1,4 +1,4 @@
-"""Differenztests MATH_MAP und Realmplaner gegen Python-v0.27."""
+"""Differential tests of MATH_MAP and the realm planner against an external reference implementation (not included)."""
 import importlib
 import random
 
@@ -49,7 +49,7 @@ def test_expression_compile_and_evaluate(pm, src):
     assert a[0] == b[0] and repr(a[1]) == repr(b[1]), (src, a, b)
     if a[0] == "exc":
         if a[2].endswith("(<unknown>, line 1)"):
-            # Text des CPython-Parsers (F5: abweichende interne Fehlertexte zulässig)
+            # CPython parser message (differing internal error texts are allowed)
             assert a[1] == b[1] == "MathSyntaxError"
         else:
             assert a == b
@@ -57,7 +57,7 @@ def test_expression_compile_and_evaluate(pm, src):
     pe, re_ = a[1], b[1]
     assert pe.to_dict() == re_.to_dict()
     rnd = random.Random(src)
-    # Python-v0.27 hat keine Rechengrenze (S6): unbeschränkte Fälle nur in Rust prüfen
+    # the reference has no computation limit: check unbounded cases in Rust only
     xs = [0, 1, -1, 5, -3] if "1000" in src else [0, 1, -1, 5, 2**70, -3]
     for _ in range(40):
         x, y = rnd.choice(xs), rnd.choice([0, 2, 7, -9, 3**50])
@@ -171,7 +171,7 @@ def test_planner_errors_identical(pl):
 SCENARIO = r'''
 from nhydb_v027 import NHyDB, MathMap, MathMapLayoutSpec
 M = 10**100
-def _name(r):  # Python: RealmDef, Rust: dict
+def _name(r):  # reference: RealmDef, Rust: dict
     return r["name"] if isinstance(r, dict) else r.name
 db = NHyDB.create("m.nhydb")
 db.create_realm(1, "core")
@@ -222,7 +222,7 @@ def test_math_db_scenario_identical(tmp_path):
     assert len(py) == len(rs)
     for a, b in zip(py, rs):
         assert a == b, (a, b)
-    # physische Blockfolge identisch (SYSTEM-Blöcke nur Typ/ID)
+    # identical physical block sequence (SYSTEM blocks by type/ID only)
     assert blocks(tmp_path / "rs" / "m.nhydb") == blocks(tmp_path / "py" / "m.nhydb")
 
 
@@ -275,7 +275,7 @@ def _rand_expr(rnd, d):
 
 @pytest.mark.parametrize("seed", range(4))
 def test_fast_path_targets_identical(pm, seed):
-    """Schnellpfad (i64 mit BigInt-Hochstufung, Konstantenfaltung) gegen Python."""
+    """Fast path (i64 with BigInt promotion, constant folding) against the reference."""
     rnd = random.Random(1000 + seed)
     edge = [0, 1, -1, 2, -2, 99, 2**31, -(2**31), 2**62, -(2**62), 9223372036854775807, -9223372036854775808,
             9223372036854775806, 3037000499, 3037000500, -3037000500, 10**17]

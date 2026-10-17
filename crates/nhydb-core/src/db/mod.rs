@@ -1,7 +1,7 @@
-//! Die native NHyDB-Engine (`NHyDB`-Klasse der v0.14).
+//! The native NHyDB engine (the `NHyDB` class).
 //!
-//! Die Implementierung ist auf mehrere Dateien verteilt:
-//! `mod.rs` (Zustand, Öffnen, Commit, Low-Level-I/O), `schema_ops.rs`,
+//! The implementation is split across several files:
+//! `mod.rs` (state, open, commit, low-level I/O), `schema_ops.rs`,
 //! `layout.rs`, `sparse.rs`, `dense.rs`, `read.rs`, `index.rs`,
 //! `maint.rs`.
 
@@ -41,7 +41,7 @@ use crate::vmap;
 
 use interval::IntervalIndex;
 
-/// Schlüssel `(realm, lane)`.
+/// Key `(realm, lane)`.
 pub type RL = (Nat, Lane);
 
 pub fn now_ns() -> u64 {
@@ -81,13 +81,13 @@ pub struct SparseSegment {
 
 #[derive(Default)]
 pub struct DenseKeyIndex {
-    /// Segmente in Registrierungsreihenfolge (stabile Indizes).
+    /// Segments in registration order (stable indices).
     pub segs: Vec<DenseSegment>,
     pub iv: IntervalIndex,
 }
 
 impl DenseKeyIndex {
-    /// Segmente sortiert nach `(u_start, block_id)` (v0.14-Listenordnung).
+    /// Segments sorted by `(u_start, block_id)` (canonical list order).
     pub fn sorted(&self) -> Vec<&DenseSegment> {
         self.iv.ids_by_start().iter().map(|&i| &self.segs[i]).collect()
     }
@@ -95,12 +95,12 @@ impl DenseKeyIndex {
 
 #[derive(Default)]
 pub struct SparseKeyIndex {
-    /// Segmente in Blockreihenfolge.
+    /// Segments in block order.
     pub segs: Vec<SparseSegment>,
     pub iv: IntervalIndex,
 }
 
-/// Zustand einer Sparse-Zelle.
+/// State of a sparse cell.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SVal {
     Tomb,
@@ -119,10 +119,10 @@ impl SVal {
     }
 }
 
-/// Zusammengeführter Sparse-Zustand einer u-Gruppe: v → Zustand.
+/// Merged sparse state of a u group: v → state.
 pub type SparseMap = BTreeMap<Nat, SVal>;
 
-/// Dekodierte Sparse-Zelle mit Typinformation.
+/// Decoded sparse cell with type information.
 #[derive(Clone, Debug)]
 pub struct SparseCellMeta {
     pub value: SVal,
@@ -130,7 +130,7 @@ pub struct SparseCellMeta {
     pub selftyped: bool,
 }
 
-/// Ein Eintrag des persistierten Sekundärindex-Verzeichnisses.
+/// An entry of the persisted secondary index directory.
 #[derive(Clone, Debug)]
 pub struct PostingRef {
     pub value: Val,
@@ -146,9 +146,9 @@ pub struct SecondaryDir {
     pub by_key: HashMap<ValKey, usize>,
 }
 
-/// Gruppenverzeichnis eines Sparse-Blocks: `(u, absoluter Offset, Länge)`.
+/// Group directory of a sparse block: `(u, absolute offset, length)`.
 pub type SparseBlockIndex = Vec<(Nat, u64, u32)>;
-/// Zustände `(v, Wert/Tombstone)` einer u-Gruppe in einem Sparse-Block.
+/// States `(v, value/tombstone)` of a u group in a sparse block.
 pub type SparseStates = Vec<(Nat, SVal)>;
 
 #[derive(Default)]
@@ -156,18 +156,18 @@ pub(crate) struct Caches {
     pub sparse_block_index: HashMap<u64, Arc<SparseBlockIndex>>,
     pub sparse_record: HashMap<(u64, Nat), Arc<SparseStates>>,
     pub sparse_merged: HashMap<(Nat, Lane, Nat), Arc<SparseMap>>,
-    /// v-Indizes je `(realm, lane, u)` (siehe `vindex.rs`)
+    /// v indexes per `(realm, lane, u)` (see `vindex.rs`)
     pub sparse_uindex: HashMap<(Nat, Lane, Nat), Arc<vindex::UIndex>>,
-    /// Anzahl der Sprungmarken in `sparse_uindex`
+    /// Number of jump marks in `sparse_uindex`
     pub uindex_ck: usize,
     pub field_meta: HashMap<(Nat, Nat, Nat), Option<FieldDef>>,
     pub blocks: HashMap<u64, Arc<Vec<u8>>>,
     pub block_bytes: usize,
     pub postings: HashMap<(u64, Lane, ValKey), Arc<Vec<Nat>>>,
-    /// Lazy geladene SECONDARY-Verzeichnisse und sortierte Schlüssel.
+    /// Lazily loaded SECONDARY directories and sorted keys.
     pub sec_dirs: HashMap<(u64, Lane), Arc<SecondaryDir>>,
     pub sec_sorted: HashMap<(u64, Lane), Arc<Vec<Val>>>,
-    /// FULLTEXT-Payloads (Positionen je Term, Korpus).
+    /// FULLTEXT payloads (positions per term, corpus).
     pub ft_postings: HashMap<(u64, Lane, String), Arc<Vec<crate::textindex::FtPosting>>>,
     pub ft_corpus: HashMap<(u64, Lane), Arc<crate::textindex::FtCorpus>>,
 }
@@ -188,27 +188,27 @@ impl DynMode {
             "off" => Ok(DynMode::Off),
             "once" => Ok(DynMode::Once),
             "auto" => Ok(DynMode::Auto),
-            _ => Err(Error::Value("dyn-address mode muss off, once oder auto sein".into())),
+            _ => Err(Error::Value("dyn-address mode must be off, once or auto".into())),
         }
     }
 }
 
-/// Öffnungsoptionen.
+/// Open options.
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
     pub strict: bool,
-    /// Expliziter Durability-Modus (Vorrang vor der Konfiguration).
+    /// Explicit durability mode (takes precedence over the configuration).
     pub sync_mode: Option<SyncMode>,
-    /// Explizite Pfade der Sidecar-Dateien (Vorrang vor der Konfiguration).
+    /// Explicit paths of the sidecar files (take precedence over the configuration).
     pub layout_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
-    /// Bereits geladene Konfiguration; sonst Suchreihenfolge (`config_path`,
-    /// `NHYDB_CONFIG`, Datei neben der DB, Standardwerte).
+    /// Already loaded configuration; otherwise the search order applies
+    /// (`config_path`, `NHYDB_CONFIG`, file next to the DB, defaults).
     pub config: Option<Config>,
     pub config_path: Option<PathBuf>,
-    /// Sperrverhalten (Vorrang vor `[lock]` der Konfiguration).
+    /// Locking behaviour (takes precedence over `[lock]` of the configuration).
     pub lock: Option<LockConfig>,
-    /// Interne Staging-Datei der Kompaktierung (Dateinamenprüfung entfällt).
+    /// Internal compaction staging file (file name check is skipped).
     pub internal_compaction: bool,
 }
 
@@ -247,7 +247,7 @@ impl OpenOptions {
         Ok(cfg)
     }
 
-    /// Pfade von Layoutplan und Schlüssel: explizit > Konfiguration > Standard.
+    /// Paths of layout plan and key: explicit > configuration > default.
     pub(crate) fn sidecars(&self, db_path: &Path, cfg: &Config) -> (PathBuf, PathBuf) {
         let (dl, dk) = system::default_sidecars(db_path);
         let lp = self
@@ -294,30 +294,30 @@ pub struct Db {
     pub data_max_block_id: u64,
     pub(crate) data_max_block_id_by_lane: HashMap<RL, u64>,
     pub(crate) overlay_keys: HashSet<RL>,
-    /// Schlüssel mit tatsächlich überlappenden Dense-Segmenten.
+    /// Keys with actually overlapping dense segments.
     pub(crate) dense_overlap_keys: HashSet<RL>,
     pub has_overlays: bool,
-    /// Nicht-strikter Open-Scan endete vor dem Dateiende → keine Schreibzugriffe.
+    /// Non-strict open scan ended before end of file → no writes allowed.
     pub scan_incomplete: bool,
     pub last_checkpoint_obj: Val,
     pub(crate) dyn_mode: DynMode,
     pub(crate) dyn_v: Option<Nat>,
     pub(crate) caches: Mutex<Caches>,
-    /// Wirksame Betriebskonfiguration.
+    /// Effective runtime configuration.
     pub config: Config,
-    /// Prozess-Schreibsperre (`<db>.lock`).
+    /// Process write lock (`<db>.lock`).
     pub(crate) lock: DbLock,
-    /// R0,u1 und externer Layoutplan.
+    /// R0,u1 and external layout plan.
     pub(crate) sys: SystemState,
-    /// Physische Größengrenze (persistiert im `DB_CONFIG`-Block).
+    /// Physical size limit (persisted in the `DB_CONFIG` block).
     pub max_db_size_bytes: u64,
-    /// MATH-Layoutzustände (aus dem Layoutplan).
+    /// MATH layout states (from the layout plan).
     pub math_layouts: BTreeMap<u64, math::MathLayoutState>,
-    /// Interne Kopie (Kompaktierung) darf in exklusive MATH-Realms schreiben.
+    /// Internal copy (compaction) may write into exclusive MATH realms.
     pub(crate) internal_math_writes: bool,
 }
 
-/// Low-Level-Blockinformation (`BlockInfo`).
+/// Low-level block information (`BlockInfo`).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo {
     pub offset: u64,
@@ -331,10 +331,10 @@ pub struct BlockInfo {
 
 impl Db {
     // ------------------------------------------------------------------
-    // Lebenszyklus
+    // Lifecycle
     // ------------------------------------------------------------------
 
-    /// Legt eine neue Datenbank mit Layoutplan und Schlüssel an
+    /// Creates a new database with layout plan and key
     /// (`NHyDB.create`).
     pub fn create(path: impl AsRef<Path>, overwrite: bool, opts: OpenOptions) -> Result<Db> {
         let p = path.as_ref();
@@ -345,7 +345,7 @@ impl Db {
         std::fs::create_dir_all(&dir)?;
         let lock = DbLock::acquire(p, cfg.lock)?;
         if !overwrite && (p.exists() || lp.exists() || kp.exists()) {
-            return Err(Error::Exists("DB oder zugehoerige externe Datei existiert bereits".into()));
+            return Err(Error::Exists("DB or associated external file already exists".into()));
         }
         if overwrite {
             for x in [p, lp.as_path(), kp.as_path()] {
@@ -389,7 +389,7 @@ impl Db {
         Db::open_with(path, OpenOptions::default())
     }
 
-    /// Öffnet eine bestehende Datenbank (`NHyDB.__init__`).
+    /// Opens an existing database (`NHyDB.__init__`).
     pub fn open_with(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Db> {
         let p = path.as_ref();
         if !p.exists() {
@@ -401,8 +401,8 @@ impl Db {
         Db::open_locked(p, &opts, cfg, lock)
     }
 
-    /// Öffnen mit bereits gehaltener Sperre. Fail closed: Bevor R0, Schlüssel
-    /// und Plan geprüft sind, wird nichts an der Datei verändert.
+    /// Opens with the lock already held. Fail closed: nothing in the file is
+    /// modified before R0, key and plan have been verified.
     pub(crate) fn open_locked(p: &Path, opts: &OpenOptions, cfg: Config, lock: DbLock) -> Result<Db> {
         let (lp, kp) = opts.sidecars(p, &cfg);
         let store = Storage::open(p, cfg.durability)?;
@@ -410,7 +410,7 @@ impl Db {
         let physical = store.len();
         let committed = sup.last_valid_end;
         if committed < DATA_START || committed > physical {
-            return Err(Error::Corruption("Commit-Grenze ungueltig".into()));
+            return Err(Error::Corruption("invalid commit boundary".into()));
         }
         let mut db = Db {
             path: p.to_path_buf(),
@@ -465,14 +465,14 @@ impl Db {
             math_layouts: BTreeMap::new(),
             internal_math_writes: false,
         };
-        // 1) Ein Scan über den committeten Bereich: Datenblöcke registrieren,
-        //    R0-Kette prüfen, Layoutmetadaten in der DB ablehnen.
+        // 1) One scan over the committed range: register data blocks,
+        //    verify the R0 chain, reject layout metadata inside the DB.
         let record = db.open_scan(committed)?;
-        // 2) Identität, Schlüssel, Plan, Generation (fail closed).
+        // 2) Identity, key, plan, generation (fail closed).
         let cells_name = record.get("cells").and_then(|c| c.get("2")).map(|v| v.py_str()).unwrap_or_default();
         let fname = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if !opts.internal_compaction && fname != cells_name {
-            return Err(Error::Corruption("DB-Dateiname stimmt nicht mit R0,u1 ueberein".into()));
+            return Err(Error::Corruption("DB file name does not match R0,u1".into()));
         }
         db.sys.record = record;
         let db_id = db.sys.db_id();
@@ -487,11 +487,11 @@ impl Db {
             .filter(|e| system::entry_generation(e).ok() == Some(generation) && system::entry_digest(e).ok() == Some(digest.as_str()))
             .collect();
         if matches.len() != 1 {
-            return Err(Error::Corruption("Kein Layoutplan passend zu R0,u1-Generation und Hash".into()));
+            return Err(Error::Corruption("no layout plan matching R0,u1 generation and hash".into()));
         }
         db.sys.active_entry = matches[0].clone();
         let snapshot = system::open_entry(&db_id, &db.sys.active_entry, &db.sys.key)?;
-        // 3) Erst jetzt: unkommittierten Tail verwerfen.
+        // 3) Only now: discard the uncommitted tail.
         if physical > committed {
             db.recovered_tail_bytes = physical - committed;
             db.store.truncate(committed)?;
@@ -501,8 +501,8 @@ impl Db {
         Ok(db)
     }
 
-    /// Setzt den gesamten aus Datei und Schema abgeleiteten Zustand zurück
-    /// (Rollback eines fehlgeschlagenen MATH-Batches).
+    /// Resets all state derived from the file and schema
+    /// (rollback of a failed MATH batch).
     pub(crate) fn reset_in_memory_state(&mut self) {
         self.realms.clear();
         self.shapes.clear();
@@ -541,7 +541,7 @@ impl Db {
 
     pub(crate) fn check_open(&self) -> Result<()> {
         if self.closed {
-            return Err(Error::NHyDB("Datenbank ist geschlossen".into()));
+            return Err(Error::NHyDB("database is closed".into()));
         }
         Ok(())
     }
@@ -561,7 +561,7 @@ impl Db {
         Ok(())
     }
 
-    /// `sync(hard=False)`: Puffer schreiben, optional fsync.
+    /// `sync(hard=False)`: write buffers, optionally fsync.
     pub fn sync(&mut self, hard: bool) -> Result<()> {
         self.check_open()?;
         self.store.flush()?;
@@ -571,14 +571,14 @@ impl Db {
         Ok(())
     }
 
-    /// Dauerhafter Commit. Ohne Schemaänderung: Daten schreiben + Sync,
-    /// danach alternierender Superblock + Sync. Mit Schemaänderung zuerst
-    /// die neue verschlüsselte Generation atomar im Layoutplan veröffentlichen
-    /// (aktive + neue Generation), dann den R0-Datensatz anhängen und den
-    /// Superblock schreiben. Rückgabe: Commit-Grenze.
+    /// Durable commit. Without a schema change: write data + sync, then the
+    /// alternating superblock + sync. With a schema change, first publish the
+    /// new encrypted generation atomically in the layout plan (active + new
+    /// generation), then append the R0 record and write the superblock.
+    /// Returns the commit boundary.
     pub fn commit(&mut self) -> Result<u64> {
         if self.closed || self.sys.poisoned {
-            return Err(Error::NHyDB("Datenbank geschlossen oder Sicherheitsstatus unklar".into()));
+            return Err(Error::NHyDB("database closed or security state unclear".into()));
         }
         if self.sys.layout_dirty {
             let new_gen = self.sys.generation()? + 1;
@@ -631,10 +631,10 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Systemadressraum, DB-Konfiguration
+    // System address space, DB configuration
     // ------------------------------------------------------------------
 
-    /// `get_system_metadata()`: nur lesbare Kopie von R0,u1.
+    /// `get_system_metadata()`: read-only copy of R0,u1.
     pub fn get_system_metadata(&self) -> Val {
         let mut cells = self.sys.record.get("cells").cloned().unwrap_or(Val::map());
         if self.sys.math_constants_stored {
@@ -643,10 +643,10 @@ impl Db {
         vmap! {"realm" => 0i64, "u" => 1i64, "cells" => cells}
     }
 
-    /// `get_system_cell(v)`; unbelegte Zellen liefern `None`.
+    /// `get_system_cell(v)`; unoccupied cells return `None`.
     pub fn get_system_cell(&self, v: &Nat) -> Result<Val> {
         if v.is_zero() || v > crate::address::realm_span() {
-            return Err(Error::Address("System-v ausserhalb R0,u1".into()));
+            return Err(Error::Address("system v outside R0,u1".into()));
         }
         let key = v.to_string();
         if key == system::MATH_CONSTANTS_CELL && self.sys.math_constants_stored {
@@ -674,12 +674,12 @@ impl Db {
     /// `set_max_db_size(size_bytes, commit=False)`
     pub fn set_max_db_size(&mut self, size_bytes: u64, commit: bool) -> Result<u64> {
         if size_bytes == 0 {
-            return Err(Error::Value("size_bytes muss ein positiver Integer sein".into()));
+            return Err(Error::Value("size_bytes must be a positive integer".into()));
         }
         let current = self.store.len();
         if size_bytes < current {
             return Err(Error::SizeLimit(format!(
-                "neues DB-Maximum {size_bytes} liegt unter aktueller Dateigroesse {current}"
+                "new DB maximum {size_bytes} is below the current file size {current}"
             )));
         }
         let payload = vmap! {"contract" => "NHYDB_DB_CONFIG_V015", "max_db_size_bytes" => Val::int(size_bytes as i128)}.to_json()?;
@@ -691,7 +691,7 @@ impl Db {
         Ok(self.max_db_size_bytes)
     }
 
-    /// Schema-Snapshot für den externen Layoutplan (`_export_external_schema`).
+    /// Schema snapshot for the external layout plan (`_export_external_schema`).
     pub fn export_schema(&self) -> Result<Val> {
         let list = |it: Vec<Val>| Val::List(it);
         Ok(vmap! {
@@ -708,13 +708,13 @@ impl Db {
     /// `_import_external_schema`
     pub(crate) fn import_schema(&mut self, snap: &Val) -> Result<()> {
         if snap.get("contract").and_then(|v| v.as_str()) != Some(system::SCHEMA_CONTRACT) {
-            return Err(Error::Corruption("Layoutplan ungueltig".into()));
+            return Err(Error::Corruption("invalid layout plan".into()));
         }
         let rows = |k: &str| -> Result<Vec<Val>> {
             snap.get(k)
                 .and_then(|v| v.as_list())
                 .cloned()
-                .ok_or_else(|| Error::Corruption(format!("Layoutplan: '{k}' fehlt")))
+                .ok_or_else(|| Error::Corruption(format!("layout plan: '{k}' missing")))
         };
         for row in rows("realms")? {
             let r = RealmDef::from_val(&row)?;
@@ -755,32 +755,32 @@ impl Db {
         self.active_slot
     }
 
-    /// Aktuelle (logische) Dateigröße inkl. nicht geschriebener Bytes.
+    /// Current (logical) file size including unwritten bytes.
     pub fn file_len(&self) -> u64 {
         self.store.len()
     }
 
     // ------------------------------------------------------------------
-    // Blöcke
+    // Blocks
     // ------------------------------------------------------------------
 
-    /// Hängt einen Block an (`_append`). Rückgabe: (Offset, Block-ID).
+    /// Appends a block (`_append`). Returns (offset, block ID).
     pub(crate) fn append_block(&mut self, bt: u8, payload: &[u8], flags: u16) -> Result<(u64, u64)> {
         self.append_block_parts(bt, &[payload], flags)
     }
 
-    /// Wie `append_block`, Payload aus mehreren Teilen (vermeidet Kopien).
+    /// Like `append_block`, with a payload made of several parts (avoids copies).
     pub(crate) fn append_block_parts(&mut self, bt: u8, parts: &[&[u8]], flags: u16) -> Result<(u64, u64)> {
         self.append_block_limit(bt, parts, flags, None)
     }
 
-    /// `_append(..., _size_limit_override=…)`. Layoutmetadaten werden nicht
-    /// in die DB geschrieben, sondern markieren das Schema für den nächsten
-    /// Commit als geändert (externer Layoutplan).
+    /// `_append(..., _size_limit_override=…)`. Layout metadata is not written
+    /// to the DB; instead it marks the schema as changed for the next commit
+    /// (external layout plan).
     pub(crate) fn append_block_limit(&mut self, bt: u8, parts: &[&[u8]], flags: u16, limit: Option<u64>) -> Result<(u64, u64)> {
         self.check_open()?;
         if self.sys.poisoned {
-            return Err(Error::NHyDB("Sicherheitsstatus unklar; Datenbank neu oeffnen".into()));
+            return Err(Error::NHyDB("security state unclear; reopen the database".into()));
         }
         if is_layout_meta(bt) {
             self.sys.layout_dirty = true;
@@ -788,7 +788,7 @@ impl Db {
         }
         if self.scan_incomplete {
             return Err(Error::NHyDB(format!(
-                "Datei wurde nicht-strikt geoeffnet und ist ab Byte {} beschaedigt; zuerst repair_file() ausfuehren",
+                "file was opened non-strictly and is damaged from byte {}; run repair_file() first",
                 self.last_valid_end
             )));
         }
@@ -797,13 +797,13 @@ impl Db {
         let nxt = align8(off + BLOCK_HEADER_SIZE as u64 + plen);
         let lim = limit.unwrap_or(self.max_db_size_bytes);
         if nxt > lim {
-            return Err(Error::SizeLimit(format!("DB-Maximum ueberschritten: current={off}, next={nxt}, limit={lim} bytes")));
+            return Err(Error::SizeLimit(format!("DB maximum exceeded: current={off}, next={nxt}, limit={lim} bytes")));
         }
         match self.append_raw(bt, parts, flags, off) {
             Ok(r) => Ok(r),
             Err(e) => {
-                // Teilweise geschriebene Bytes verwerfen, damit kein halber
-                // Block hinter die nächste Commit-Grenze gelangt.
+                // Discard partially written bytes so that no half-written
+                // block ends up behind the next commit boundary.
                 let _ = self.store.rollback_to(off);
                 Err(e)
             }
@@ -836,7 +836,7 @@ impl Db {
     pub(crate) fn read_header_at(&self, off: u64) -> Result<BlockInfo> {
         let size = self.store.len();
         if off < DATA_START || off + BLOCK_HEADER_SIZE as u64 > size {
-            return Err(Error::Corruption(format!("ungueltiger Blockoffset {off}")));
+            return Err(Error::Corruption(format!("invalid block offset {off}")));
         }
         let mut raw = [0u8; BLOCK_HEADER_SIZE];
         self.store.read_exact_at(off, &mut raw)?;
@@ -847,7 +847,7 @@ impl Db {
             .map(|e| e & !7)
             .unwrap_or(u64::MAX);
         if nxt > size {
-            return Err(Error::Corruption(format!("Block {}: Ende unvollstaendig", h.block_id)));
+            return Err(Error::Corruption(format!("block {}: end incomplete", h.block_id)));
         }
         Ok(BlockInfo {
             offset: off,
@@ -860,17 +860,17 @@ impl Db {
         })
     }
 
-    /// Liest Header und Payload inkl. CRC-Prüfung (`_read_block`).
+    /// Reads header and payload including CRC check (`_read_block`).
     pub(crate) fn read_block(&self, off: u64) -> Result<(BlockInfo, Vec<u8>)> {
         let info = self.read_header_at(off)?;
         let payload = self.store.read_vec(off + BLOCK_HEADER_SIZE as u64, info.payload_len as usize)?;
         if crc32(&payload) != info.payload_crc {
-            return Err(Error::Corruption(format!("Block {}: Payload CRC falsch", info.block_id)));
+            return Err(Error::Corruption(format!("block {}: payload CRC mismatch", info.block_id)));
         }
         Ok((info, payload))
     }
 
-    /// Block-Payload über den Block-Cache (CRC-geprüft beim Laden).
+    /// Block payload via the block cache (CRC-checked on load).
     pub(crate) fn block_payload(&self, block_offset: u64) -> Result<Arc<Vec<u8>>> {
         if let Some(b) = self.cache().blocks.get(&block_offset) {
             return Ok(b.clone());
@@ -911,7 +911,7 @@ impl Db {
         let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
         let raw = self.store.read_upto(payload_off, 96.min(info.payload_len as usize).max(4))?;
         if !raw.starts_with(DATA_TAG) {
-            return Err(Error::Corruption(format!("DATA Block {}: Tag falsch", info.block_id)));
+            return Err(Error::Corruption(format!("DATA block {}: wrong tag", info.block_id)));
         }
         let mut p = 4;
         let realm = get_vu(&raw, &mut p)?;
@@ -925,7 +925,7 @@ impl Db {
             .and_then(|t| t.checked_add(offsets_off))
             .unwrap_or(u64::MAX);
         if records_off > payload_off + info.payload_len {
-            return Err(Error::Corruption(format!("DATA Block {}: Offsettabelle zu gross", info.block_id)));
+            return Err(Error::Corruption(format!("DATA block {}: offset table too large", info.block_id)));
         }
         let u_end = if count == 0 { u_start.clone() } else { u_start.add_u64(count - 1) };
         Ok(DenseSegment {
@@ -948,9 +948,9 @@ impl Db {
         let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
         let raw = self.store.read_upto(payload_off, 96.min(info.payload_len as usize).max(4))?;
         if !raw.starts_with(SPARSE_TAG) {
-            return Err(Error::Corruption(format!("SPARSE Block {}: Tag falsch", info.block_id)));
+            return Err(Error::Corruption(format!("SPARSE block {}: wrong tag", info.block_id)));
         }
-        // Präfix kann bei riesigen u länger als 96 Bytes sein.
+        // The prefix can exceed 96 bytes for huge u.
         let raw = if raw.len() < info.payload_len as usize && raw.len() == 96 {
             self.store.read_upto(payload_off, (info.payload_len as usize).min(16 << 10))?
         } else {
@@ -963,11 +963,11 @@ impl Db {
         let group_count = get_vu_u64(&raw, &mut p, "SPARSE groups")?;
         let cell_count = get_vu_u64(&raw, &mut p, "SPARSE cells")?;
         if group_count == 0 || cell_count == 0 || u_end < u_start {
-            return Err(Error::Corruption(format!("SPARSE Block {}: Bereich/Gruppe ungueltig", info.block_id)));
+            return Err(Error::Corruption(format!("SPARSE block {}: invalid range/group", info.block_id)));
         }
         let entries_off = payload_off + p as u64;
         if entries_off > payload_off + info.payload_len {
-            return Err(Error::Corruption(format!("SPARSE Block {}: Prefix zu gross", info.block_id)));
+            return Err(Error::Corruption(format!("SPARSE block {}: prefix too large", info.block_id)));
         }
         Ok(SparseSegment {
             realm_id: realm,
@@ -1021,9 +1021,9 @@ impl Db {
         self.overlay_keys.insert(key);
     }
 
-    /// Ein Scan über den committeten Bereich `[DATA_START, end)`: registriert
-    /// Datenblöcke, prüft die R0,u1-Kette und lehnt Layoutmetadaten in der DB
-    /// ab. Rückgabe: aktueller R0-Datensatz.
+    /// One scan over the committed range `[DATA_START, end)`: registers data
+    /// blocks, verifies the R0,u1 chain and rejects layout metadata inside the
+    /// DB. Returns the current R0 record.
     fn open_scan(&mut self, end: u64) -> Result<Val> {
         let mut off = DATA_START;
         let mut maxid = 0u64;
@@ -1031,7 +1031,7 @@ impl Db {
         while off < end {
             let info = self.read_header_at(off)?;
             if info.next_offset > end {
-                return Err(Error::Corruption("Systembootstrap: unvollstaendiger Commit-Block".into()));
+                return Err(Error::Corruption("system bootstrap: incomplete commit block".into()));
             }
             match info.block_type {
                 BT_SYSTEM => {
@@ -1044,7 +1044,7 @@ impl Db {
                     record = Some(item);
                 }
                 bt if is_layout_meta(bt) => {
-                    return Err(Error::Corruption("v0.27: Layoutmetadaten duerfen nicht intern liegen".into()));
+                    return Err(Error::Corruption("layout metadata must not be stored inside the DB".into()));
                 }
                 BT_DELETE | BT_CHECKPOINT | BT_DB_CONFIG => {
                     let (_i, payload) = self.read_block(off)?;
@@ -1067,9 +1067,9 @@ impl Db {
             off = info.next_offset;
         }
         if off != end {
-            return Err(Error::Corruption("R0,u1 Bootstrap fehlt oder Dateiende ungueltig".into()));
+            return Err(Error::Corruption("R0,u1 bootstrap missing or invalid end of file".into()));
         }
-        let record = record.ok_or_else(|| Error::Corruption("R0,u1 Bootstrap fehlt oder Dateiende ungueltig".into()))?;
+        let record = record.ok_or_else(|| Error::Corruption("R0,u1 bootstrap missing or invalid end of file".into()))?;
         self.last_valid_end = end;
         self.scan_incomplete = false;
         self.next_block_id = self.next_block_id.max(maxid + 1);
@@ -1077,7 +1077,7 @@ impl Db {
     }
 
     fn json_payload(payload: &[u8]) -> Result<Val> {
-        let s = std::str::from_utf8(payload).map_err(|e| Error::Corruption(format!("Metadaten UTF-8: {e}")))?;
+        let s = std::str::from_utf8(payload).map_err(|e| Error::Corruption(format!("metadata UTF-8: {e}")))?;
         Val::from_json(s)
     }
 
@@ -1086,14 +1086,14 @@ impl Db {
             BT_DB_CONFIG => {
                 let cfg = Self::json_payload(payload)?;
                 if cfg.get("contract").and_then(|v| v.as_str()) != Some("NHYDB_DB_CONFIG_V015") {
-                    return Err(Error::Corruption("unbekannter DB_CONFIG Contract".into()));
+                    return Err(Error::Corruption("unknown DB_CONFIG contract".into()));
                 }
                 let limit = match cfg.get("max_db_size_bytes") {
                     None => crate::config::DEFAULT_DB_MAX_SIZE_BYTES as i128,
                     Some(v) => v.as_bigint().and_then(|b| num_traits::ToPrimitive::to_i128(&b)).unwrap_or(0),
                 };
                 if limit <= 0 {
-                    return Err(Error::Corruption("DB_CONFIG max_db_size_bytes muss >0 sein".into()));
+                    return Err(Error::Corruption("DB_CONFIG max_db_size_bytes must be >0".into()));
                 }
                 self.max_db_size_bytes = limit.min(u64::MAX as i128) as u64;
             }
@@ -1103,7 +1103,7 @@ impl Db {
                 let r = get_vu(payload, &mut p)?;
                 let u = get_vu(payload, &mut p)?;
                 if p != payload.len() {
-                    return Err(Error::Corruption("DELETE Restbytes".into()));
+                    return Err(Error::Corruption("DELETE trailing bytes".into()));
                 }
                 let key: RL = (r.clone(), lane);
                 self.deletes.insert((r, lane, u), info.block_id);
@@ -1135,18 +1135,18 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Hilfen
+    // Helpers
     // ------------------------------------------------------------------
 
     pub(crate) fn require_realm(&self, realm: &Nat) -> Result<&RealmDef> {
-        self.realms.get(realm).ok_or_else(|| Error::Schema("Realm fehlt".into()))
+        self.realms.get(realm).ok_or_else(|| Error::Schema("realm missing".into()))
     }
 
-    /// Shape eines gespeicherten Segments (fehlend → CorruptionError).
+    /// Shape of a stored segment (missing → CorruptionError).
     pub(crate) fn shape_of(&self, shape_id: u64) -> Result<&ShapeDef> {
         self.shapes
             .get(&shape_id)
-            .ok_or_else(|| Error::Corruption(format!("Shape {shape_id} des DATA-Segments fehlt")))
+            .ok_or_else(|| Error::Corruption(format!("shape {shape_id} of the DATA segment missing")))
     }
 
     pub fn has_realm(&self, realm: &Nat) -> bool {
@@ -1160,8 +1160,8 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        // Wie ein Python-Dateiobjekt bei der Freigabe: Puffer schreiben,
-        // aber KEIN Commit (Commit-Grenze bleibt unverändert).
+        // Like a Python file object on release: write buffers,
+        // but NO commit (the commit boundary stays unchanged).
         if !self.closed {
             let _ = self.store.flush();
         }
@@ -1179,7 +1179,7 @@ pub(crate) fn best_super(store: &Storage) -> Result<(usize, SuperState)> {
             }
         }
     }
-    best.ok_or_else(|| Error::Corruption("beide Superbloecke beschaedigt".into()))
+    best.ok_or_else(|| Error::Corruption("both superblocks damaged".into()))
 }
 
 fn pack_header_with_crc(bt: u8, bid: u64, plen: u64, pcrc: u32, flags: u16) -> [u8; BLOCK_HEADER_SIZE] {

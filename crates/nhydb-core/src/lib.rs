@@ -1,13 +1,12 @@
-//! NHyDB – native Rust-Engine.
+//! NHyDB – native Rust engine.
 //!
-//! Funktionale Referenz ist die Python-v0.27 (`reference_v0_27/`; Basis war
-//! v0.14). Die mathematische Zellidentität ist `(R, u, v_local, lane)`; `N`
-//! wird ausschließlich arithmetisch abgeleitet (siehe [`address`]).
-//! Abfrageschicht: [`query`] (QueryEngine), [`sql`] (NHySQL-0.24);
+//! The mathematical cell identity is `(R, u, v_local, lane)`; `N` is derived
+//! purely arithmetically (see [`address`]).
+//! Query layer: [`query`] (QueryEngine), [`sql`] (NHySQL);
 //! MATH_MAP: [`mathexpr`], [`mathlayout`], `db::math`.
 
-// Verschachtelte Bedingungen bleiben bewusst erhalten: Sie folgen der Struktur
-// der Python-Referenz und erleichtern den zeilenweisen Abgleich.
+// Nested conditions are kept deliberately: they mirror the structure of the
+// original algorithm description and keep the control flow easy to follow.
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 
 pub mod address;

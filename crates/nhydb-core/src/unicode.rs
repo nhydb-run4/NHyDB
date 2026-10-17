@@ -1,12 +1,12 @@
-//! Unicode-Zeicheneigenschaften exakt wie CPython (Referenz-Interpreter).
+//! Unicode character properties exactly matching CPython.
 //!
-//! Die Tabellen in `unicode_tables.rs` werden mit `tools/gen_unicode_tables.py`
-//! aus CPython erzeugt; `tests/python/test_unicode_tables.py` vergleicht alle
-//! 0x110000 Code Points gegen den laufenden Interpreter.
+//! The tables in `unicode_tables.rs` are generated from CPython; all
+//! 0x110000 code points can be checked against a running interpreter via
+//! `prop_bits`.
 //!
-//! Bewusste Vereinfachung: `lower()` arbeitet zeichenweise ohne die
-//! Final-Sigma-Regel von `str.lower()`; die Engine nutzt `lower()` nur für
-//! Vergleiche mit ASCII-Schlüsselwörtern, wofür das Ergebnis identisch ist.
+//! Deliberate simplification: `lower()` works per character without the
+//! final-sigma rule of `str.lower()`; the engine only uses `lower()` for
+//! comparisons with ASCII keywords, where the result is identical.
 
 use crate::unicode_tables as t;
 
@@ -31,7 +31,7 @@ fn lookup(m: &[(u32, &'static str)], cp: u32) -> Option<&'static str> {
     m.binary_search_by_key(&cp, |&(c, _)| c).ok().map(|i| m[i].1)
 }
 
-/// `re`-Muster `\w` (str, Unicode): `isalnum() or '_'`.
+/// `re` pattern `\w` (str, Unicode): `isalnum() or '_'`.
 #[inline]
 pub fn is_word(c: char) -> bool {
     if c.is_ascii() {
@@ -54,7 +54,7 @@ pub fn is_alnum(c: char) -> bool {
     in_ranges(t::ALNUM, c as u32)
 }
 
-/// `str.isdigit()` (umfasst z. B. hochgestellte Ziffern).
+/// `str.isdigit()` (includes e.g. superscript digits).
 pub fn is_digit(c: char) -> bool {
     if c.is_ascii() {
         return c.is_ascii_digit();
@@ -70,7 +70,7 @@ pub fn is_space(c: char) -> bool {
     in_ranges(t::SPACE, c as u32)
 }
 
-/// `str.isprintable()` (für `repr`).
+/// `str.isprintable()` (for `repr`).
 pub fn is_printable(c: char) -> bool {
     if c.is_ascii() {
         return (' '..='~').contains(&c);
@@ -78,7 +78,7 @@ pub fn is_printable(c: char) -> bool {
     in_ranges(t::PRINTABLE, c as u32)
 }
 
-/// Dezimalwert (`unicodedata.decimal`), wie ihn `int()`/`float()` akzeptieren.
+/// Decimal value (`unicodedata.decimal`) as accepted by `int()`/`float()`.
 pub fn decimal_value(c: char) -> Option<u8> {
     if c.is_ascii_digit() {
         return Some(c as u8 - b'0');
@@ -100,7 +100,7 @@ fn map_str(s: &str, m: &'static [(u32, &'static str)], ascii: fn(char) -> char) 
     out
 }
 
-/// `str.casefold()` (volles Unicode-Case-Folding, z. B. `ß` → `ss`).
+/// `str.casefold()` (full Unicode case folding, e.g. `ß` → `ss`).
 pub fn casefold(s: &str) -> String {
     map_str(s, t::CASEFOLD, |c| c.to_ascii_lowercase())
 }
@@ -110,12 +110,12 @@ pub fn upper(s: &str) -> String {
     map_str(s, t::UPPER, |c| c.to_ascii_uppercase())
 }
 
-/// `str.lower()` zeichenweise (siehe Moduldokumentation).
+/// `str.lower()` per character (see module documentation).
 pub fn lower(s: &str) -> String {
     map_str(s, t::LOWER, |c| c.to_ascii_lowercase())
 }
 
-/// `str.strip()` ohne Argument.
+/// `str.strip()` without argument.
 pub fn strip(s: &str) -> &str {
     s.trim_matches(is_space)
 }
@@ -132,13 +132,13 @@ pub fn is_identifier(s: &str) -> bool {
     }
 }
 
-/// Ob ein Bezeichner durch die NFKC-Normalisierung des Python-Parsers
-/// verändert würde (Zeichen mit Kompatibilitätszerlegung).
+/// Whether an identifier would be changed by the Python parser's NFKC
+/// normalization (characters with a compatibility decomposition).
 pub fn identifier_needs_nfkc(s: &str) -> bool {
     s.chars().any(|c| !c.is_ascii() && in_ranges(t::NFKC_CHANGES, c as u32))
 }
 
-/// Eigenschaftsbits eines Code Points (für den erschöpfenden Python-Test).
+/// Property bits of a code point (for exhaustive comparison against Python).
 /// Bit 0 word, 1 alpha, 2 alnum, 3 digit, 4 space, 5 printable, 6 id_start,
 /// 7 id_continue.
 pub fn prop_bits(cp: u32) -> u8 {

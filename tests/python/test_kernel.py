@@ -1,9 +1,9 @@
-"""Konformität der zustandslosen v0.27-Kernelbausteine gegen CPython.
+"""Conformance of the stateless kernel building blocks against CPython.
 
-* Unicode-Eigenschaften und -Abbildungen: alle 0x110000 Code Points.
-* AES-256-GCM gegen die echte `cryptography`-Bibliothek, HMAC/SHA-256
-  gegen `hmac`/`hashlib`, `layout_mac` gegen die Referenzfunktion.
-* JSON (`ensure_ascii` True/False) gegen `json.dumps`.
+* Unicode properties and mappings: all 0x110000 code points.
+* AES-256-GCM against the real `cryptography` library, HMAC/SHA-256
+  against `hmac`/`hashlib`, `layout_mac` against its defining formula.
+* JSON (`ensure_ascii` True/False) against `json.dumps`.
 """
 import hashlib
 import hmac
@@ -30,7 +30,7 @@ def _chars():
 
 def test_unicode_tables_match_running_python():
     py_ver, uni_ver = n._unicode_versions()
-    assert uni_ver == unicodedata.unidata_version, "Tabellen neu erzeugen: tools/gen_unicode_tables.py"
+    assert uni_ver == unicodedata.unidata_version, "Unicode version mismatch: regenerate crates/nhydb-core/src/unicode_tables.rs from the running CPython"
     table = n._unicode_prop_table()
     assert len(table) == MAXCP
     bad = []
@@ -59,7 +59,7 @@ def test_unicode_decimal_and_maps():
         assert dec[cp] == (255 if d is None else d), hex(cp)
     chunk = "".join(c for _cp, c in _chars())
     for kind in ("casefold", "lower", "upper"):
-        # zeichenweise Abbildung (lower: ohne Final-Sigma-Kontext)
+        # per-character mapping (lower: without final-sigma context)
         exp = "".join(getattr(c, kind)() for c in chunk)
         assert n._unicode_map(kind, chunk) == exp, kind
     assert n._unicode_map("strip", "　 a\x1f ") == "　 a\x1f ".strip()

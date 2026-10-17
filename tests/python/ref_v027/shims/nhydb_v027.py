@@ -1,7 +1,8 @@
-"""Kompatibilitätsmodul: ``nhydb_v027`` → native Rust-Engine.
+"""Compatibility shim: ``nhydb_v027`` → native Rust engine.
 
-Nur für die unveränderten Referenz-Testskripte. Stellt neben der öffentlichen
-API die von den Tests genutzten privaten Helfer bereit.
+Only for the unmodified test scripts of the external reference implementation
+(not included). Besides the public API it provides the private helpers those
+tests use.
 """
 from pathlib import Path as _Path
 
@@ -9,7 +10,7 @@ from nhydb import *  # noqa: F401,F403
 from nhydb import NHyDB, NHyDBError, ENGINE_VERSION, FILE_FORMAT_VERSION  # noqa: F401
 from nhydb import _native as _n
 from nhydb.cli import _parse_structural_get_target, main  # noqa: F401
-from nhydb_math_v027 import *  # noqa: F401,F403  (identische Kernel-Objekte)
+from nhydb_math_v027 import *  # noqa: F401,F403  (identical kernel objects)
 
 StaleIndexError = _n.StaleIndexError
 from nhydb.math import MathMap, MathMapLayoutSpec  # noqa: F401,E402

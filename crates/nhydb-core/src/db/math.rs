@@ -1,10 +1,10 @@
-//! MATH_MAP-Layouts im Core (Python `NHyDB.create_math_layout`,
+//! MATH_MAP layouts in the core (Python API `NHyDB.create_math_layout`,
 //! `put_math_batch`, `get_math_cell`, …).
 //!
-//! Ein MATH-Layout besitzt exklusive physische Realms. Zustand
-//! (Definition, Fingerprint, eingefroren, RealmMap) liegt im externen
-//! Layoutplan (`math_layouts`), die Nutzdaten als selbsttypisierte
-//! Sparse-Zellen im gewöhnlichen Punktspeicher.
+//! A MATH layout owns exclusive physical realms. Its state
+//! (definition, fingerprint, frozen flag, RealmMap) lives in the external
+//! layout plan (`math_layouts`), the payload data as self-typed
+//! sparse cells in the ordinary point store.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -26,10 +26,10 @@ use super::sparse::CellInput;
 use super::Db;
 
 pub const STATE_CONTRACT: &str = "NHYDB_MATH_LAYOUT_STATE_V015";
-/// u-Fenster der Sparse-Blöcke für MATH-Payloads (`MATH_SPARSE_U_WINDOW`).
+/// u window of the sparse blocks for MATH payloads (`MATH_SPARSE_U_WINDOW`).
 pub const MATH_SPARSE_U_WINDOW: u64 = 100_000_000;
 
-/// Persistierter Zustand eines MATH-Layouts (`MathLayoutState`).
+/// Persisted state of a MATH layout (`MathLayoutState`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct MathLayoutState {
     pub layout_id: u64,
@@ -56,27 +56,27 @@ impl MathLayoutState {
         first_write_block_id: Option<u64>,
     ) -> Result<Self> {
         if layout_id == 0 {
-            return Err(Error::Value("layout_id muss > 0 sein".into()));
+            return Err(Error::Value("layout_id must be > 0".into()));
         }
         let pt = TypeCode::from_name(payload_type)
-            .ok_or_else(|| schema(format!("unbekannter MATH Payload-Typ {}", Val::str(payload_type).py_repr())))?;
+            .ok_or_else(|| schema(format!("unknown MATH payload type {}", Val::str(payload_type).py_repr())))?;
         if realm_map.layout_id != BigInt::from(layout_id) {
-            return Err(schema("MATH RealmMap layout_id passt nicht"));
+            return Err(schema("MATH RealmMap layout_id does not match"));
         }
         if realm_map.mapping_fingerprint != spec.fingerprint() {
-            return Err(schema("MATH RealmMap-Fingerprint passt nicht zur Mappingdefinition"));
+            return Err(schema("MATH RealmMap fingerprint does not match the mapping definition"));
         }
         if realm_map.realm_auto_limit != spec.realm_auto_limit {
-            return Err(schema("MATH RealmMap-Limit passt nicht zur Mappingdefinition"));
+            return Err(schema("MATH RealmMap limit does not match the mapping definition"));
         }
         if spec.mapping.realm_span != crate::address::realm_span().to_bigint() {
-            return Err(schema("MATH realm_span muss dem NHyDB REALM_SPAN entsprechen"));
+            return Err(schema("MATH realm_span must equal the NHyDB REALM_SPAN"));
         }
         if !realm_map.mapped_count().is_zero() && !frozen {
-            return Err(schema("MATH mit persistierter RealmMap muss eingefroren sein"));
+            return Err(schema("MATH with a persisted RealmMap must be frozen"));
         }
         if first_write_block_id.is_some() && !frozen {
-            return Err(schema("first_write_block_id setzt frozen voraus"));
+            return Err(schema("first_write_block_id requires frozen"));
         }
         Ok(MathLayoutState { layout_id, spec, realm_map, payload_type: pt, frozen, created_block_id, first_write_block_id })
     }
@@ -97,7 +97,7 @@ impl MathLayoutState {
 
     pub fn from_val(d: &Val) -> Result<Self> {
         if d.get("contract").map(|v| v.py_str()).as_deref() != Some(STATE_CONTRACT) {
-            return Err(schema("unbekannter MATH Layout-State Contract"));
+            return Err(schema("unknown MATH layout state contract"));
         }
         let lid = d.get("layout_id").and_then(|v| v.as_i64()).ok_or_else(|| Error::Key("'layout_id'".into()))?;
         let spec = MathMapLayoutSpec::from_val(d.get("spec").ok_or_else(|| Error::Key("'spec'".into()))?)?;
@@ -110,7 +110,7 @@ impl MathLayoutState {
     }
 }
 
-/// Physische Extents `(start, end)` eines MATH-Zustands.
+/// Physical extents `(start, end)` of a MATH state.
 pub(crate) fn physical_extents(rec: &MathLayoutState) -> Vec<(Nat, Nat)> {
     rec.realm_map
         .extents
@@ -119,7 +119,7 @@ pub(crate) fn physical_extents(rec: &MathLayoutState) -> Vec<(Nat, Nat)> {
         .collect()
 }
 
-/// Python `int(x)` für MATH-Eingaben.
+/// Python `int(x)` semantics for MATH inputs.
 fn py_int(v: &Val) -> Result<Val> {
     Ok(match v {
         Val::Bool(b) => Val::Int(*b as i64),
@@ -144,10 +144,10 @@ impl Db {
     pub(crate) fn math_record(&self, layout_id: u64) -> Result<&MathLayoutState> {
         self.math_layouts
             .get(&layout_id)
-            .ok_or_else(|| Error::MathLayoutNotFound(format!("MATH Layout {layout_id} existiert nicht")))
+            .ok_or_else(|| Error::MathLayoutNotFound(format!("MATH layout {layout_id} does not exist")))
     }
 
-    /// Physischer Besitzer eines Realms durch ein MATH-Layout.
+    /// Physical owner of a realm through a MATH layout.
     pub fn math_owner_of_realm(&self, realm: &Nat) -> Option<u64> {
         for (lid, rec) in &self.math_layouts {
             for (a, b) in physical_extents(rec) {
@@ -161,13 +161,13 @@ impl Db {
 
     pub(crate) fn deny_math_realm(&self, realm: &Nat) -> Result<()> {
         if let Some(owner) = self.math_owner_of_realm(realm) {
-            return Err(Error::Schema(format!("Realm {realm} gehoert exklusiv MATH Layout {owner}")));
+            return Err(Error::Schema(format!("Realm {realm} belongs exclusively to MATH layout {owner}")));
         }
         Ok(())
     }
 
-    /// `_math_layout_snapshot`: Revision = next_block_id; jeder Nicht-MATH-
-    /// Realm gilt als `("CORE", 1)` belegt.
+    /// `_math_layout_snapshot`: revision = next_block_id; every non-MATH
+    /// realm counts as occupied by `("CORE", 1)`.
     pub fn math_layout_snapshot(&self) -> Result<CoreLayoutSnapshot> {
         let mut ownership: BTreeMap<Nat, (String, u64)> = BTreeMap::new();
         for (lid, rec) in &self.math_layouts {
@@ -175,11 +175,11 @@ impl Db {
                 let mut r = a.clone();
                 while r <= b {
                     if !self.realms.contains_key(&r) {
-                        return Err(Error::LayoutState(format!("MATH {lid}: physischer Realm {r} fehlt im Core")));
+                        return Err(Error::LayoutState(format!("MATH {lid}: physical realm {r} missing in the core")));
                     }
                     if let Some(old) = ownership.get(&r) {
                         if old != &("MATH".to_string(), *lid) {
-                            return Err(Error::LayoutState(format!("Realm {r} mehrfach belegt: ('{}', {}) / MATH:{lid}", old.0, old.1)));
+                            return Err(Error::LayoutState(format!("Realm {r} occupied multiple times: ('{}', {}) / MATH:{lid}", old.0, old.1)));
                         }
                     }
                     ownership.insert(r.clone(), ("MATH".into(), *lid));
@@ -190,7 +190,7 @@ impl Db {
         for rid in self.realms.keys() {
             ownership.entry(rid.clone()).or_insert(("CORE".into(), 1));
         }
-        // zusammenhängende Läufe gleichen Besitzers verschmelzen
+        // merge contiguous runs of the same owner
         let mut occ: Vec<OwnedRealmExtent> = Vec::new();
         for (rid, (kind, owner)) in ownership {
             let r = rid.to_bigint();
@@ -210,13 +210,13 @@ impl Db {
         let dup: Vec<u64> = self.layouts.keys().filter(|k| self.math_layouts.contains_key(k)).cloned().collect();
         if !dup.is_empty() {
             let shown: Vec<String> = dup.iter().take(8).map(|x| x.to_string()).collect();
-            return Err(Error::Corruption(format!("Layout-IDs gleichzeitig klassisch und MATH belegt: [{}]", shown.join(", "))));
+            return Err(Error::Corruption(format!("Layout IDs used by both classic and MATH layouts: [{}]", shown.join(", "))));
         }
         let snapshot = self.math_layout_snapshot().map_err(|e| Error::Corruption(e.to_string()))?;
         let mut math_realms: HashSet<Nat> = HashSet::new();
         for (lid, rec) in &self.math_layouts {
             if rec.spec.mapping.realm_span != crate::address::realm_span().to_bigint() {
-                return Err(Error::Corruption(format!("MATH {lid}: realm_span passt nicht zum Core")));
+                return Err(Error::Corruption(format!("MATH {lid}: realm_span does not match the core")));
             }
             validate_map_against_snapshot(&snapshot, &rec.realm_map).map_err(|e| Error::Corruption(format!("MATH {lid}: {e}")))?;
             for (a, b) in physical_extents(rec) {
@@ -229,22 +229,22 @@ impl Db {
         }
         for (lid, lay) in &self.layouts {
             if math_realms.contains(&lay.realm_id) {
-                return Err(Error::Corruption(format!("Layout {lid} liegt in exklusivem MATH Realm {}", lay.realm_id)));
+                return Err(Error::Corruption(format!("Layout {lid} lies in exclusive MATH realm {}", lay.realm_id)));
             }
         }
         for (sid, sh) in &self.shapes {
             if math_realms.contains(&sh.realm_id) {
-                return Err(Error::Corruption(format!("Shape {sid} liegt in exklusivem MATH Realm {}", sh.realm_id)));
+                return Err(Error::Corruption(format!("Shape {sid} lies in exclusive MATH realm {}", sh.realm_id)));
             }
         }
         for (iid, idx) in &self.index_defs {
             if math_realms.contains(&idx.realm_id) {
-                return Err(Error::Corruption(format!("Index {iid} liegt in exklusivem MATH Realm {}", idx.realm_id)));
+                return Err(Error::Corruption(format!("Index {iid} lies in exclusive MATH realm {}", idx.realm_id)));
             }
         }
         for (rid, _v) in self.extension_defs.keys() {
             if math_realms.contains(rid) {
-                return Err(Error::Corruption(format!("Extension liegt in exklusivem MATH Realm {rid}")));
+                return Err(Error::Corruption(format!("Extension lies in exclusive MATH realm {rid}")));
             }
         }
         Ok(())
@@ -261,21 +261,21 @@ impl Db {
     /// `create_math_layout(spec, layout_id=None, payload_type="bytes", commit=False)`
     pub fn create_math_layout(&mut self, spec: MathMapLayoutSpec, layout_id: Option<u64>, payload_type: &str, commit: bool) -> Result<MathLayoutState> {
         if spec.mapping.realm_span != crate::address::realm_span().to_bigint() {
-            return Err(schema("MATH realm_span muss REALM_SPAN entsprechen"));
+            return Err(schema("MATH realm_span must equal REALM_SPAN"));
         }
         if self.math_layouts.values().any(|x| x.name() == spec.layout_name) {
-            return Err(schema(format!("MATH Layoutname {} existiert bereits", Val::str(spec.layout_name.as_str()).py_repr())));
+            return Err(schema(format!("MATH layout name {} already exists", Val::str(spec.layout_name.as_str()).py_repr())));
         }
         let lid = match layout_id {
             None => self.next_free_layout_id(),
-            Some(0) => return Err(Error::Value("layout_id muss > 0 sein".into())),
+            Some(0) => return Err(Error::Value("layout_id must be > 0".into())),
             Some(l) => l,
         };
         if self.layouts.contains_key(&lid) || self.math_layouts.contains_key(&lid) {
-            return Err(schema(format!("Layout-ID {lid} existiert bereits")));
+            return Err(schema(format!("Layout ID {lid} already exists")));
         }
         if TypeCode::from_name(payload_type).is_none() {
-            return Err(schema(format!("unbekannter Payload-Typ {}", Val::str(payload_type).py_repr())));
+            return Err(schema(format!("unknown payload type {}", Val::str(payload_type).py_repr())));
         }
         let rm = MathRealmMap::new(BigInt::from(lid), &spec.fingerprint(), Vec::new(), spec.realm_auto_limit.clone())?;
         let rec = MathLayoutState::new(lid, spec, rm, payload_type, false, self.next_block_id, None)?;
@@ -288,7 +288,7 @@ impl Db {
     }
 
     /// `create_math_map_layout(name, parameters, u=, V=, side=, …)`;
-    /// `realm_auto_limit=None` ⇒ Wert aus der Konfiguration.
+    /// `realm_auto_limit=None` ⇒ value from the configuration.
     #[allow(clippy::too_many_arguments)]
     pub fn create_math_map_layout(
         &mut self,
@@ -313,19 +313,19 @@ impl Db {
     pub fn replace_math_spec(&mut self, layout_id: u64, spec: MathMapLayoutSpec, payload_type: Option<&str>, commit: bool) -> Result<MathLayoutState> {
         let old = self.math_record(layout_id)?.clone();
         if old.frozen || old.first_write_block_id.is_some() || !old.realm_map.mapped_count().is_zero() {
-            return Err(Error::MappingFrozen(format!("MATH {layout_id} ist nach erstem Write eingefroren")));
+            return Err(Error::MappingFrozen(format!("MATH {layout_id} is frozen after the first write")));
         }
         if spec.mapping.realm_span != crate::address::realm_span().to_bigint() {
-            return Err(schema("MATH realm_span muss REALM_SPAN entsprechen"));
+            return Err(schema("MATH realm_span must equal REALM_SPAN"));
         }
         for (lid, other) in &self.math_layouts {
             if *lid != old.layout_id && other.name() == spec.layout_name {
-                return Err(schema(format!("MATH Layoutname {} existiert bereits", Val::str(spec.layout_name.as_str()).py_repr())));
+                return Err(schema(format!("MATH layout name {} already exists", Val::str(spec.layout_name.as_str()).py_repr())));
             }
         }
         let typ = payload_type.map(|s| s.to_string()).unwrap_or_else(|| old.payload_type.name().to_string());
         if TypeCode::from_name(&typ).is_none() {
-            return Err(schema(format!("unbekannter Payload-Typ {}", Val::str(typ.as_str()).py_repr())));
+            return Err(schema(format!("unknown payload type {}", Val::str(typ.as_str()).py_repr())));
         }
         let rm = MathRealmMap::new(BigInt::from(old.layout_id), &spec.fingerprint(), Vec::new(), spec.realm_auto_limit.clone())?;
         let rec = MathLayoutState::new(old.layout_id, spec, rm, &typ, false, old.created_block_id, None)?;
@@ -375,7 +375,7 @@ impl Db {
             let key = t.logical_cell_key();
             if logical_seen.contains(&key) && !overwrite {
                 return Err(Error::MathCellConflict(format!(
-                    "Batch enthaelt Zielzelle mehrfach: {}",
+                    "Batch contains target cell more than once: {}",
                     tuple_repr(&[key.0.to_string(), key.1.to_string(), key.2.to_string(), key.3.to_string()])
                 )));
             }
@@ -397,9 +397,9 @@ impl Db {
         validate_plan(&snapshot, &rec.realm_map, &plan)?;
         let preview = MathRealmMap::new(rec.realm_map.layout_id.clone(), &rec.spec.fingerprint(), plan.resulting_extents.clone(), rec.realm_map.realm_auto_limit.clone())?;
         let resolved: Vec<_> = materialized.iter().map(|(t, _)| resolve_math_target(&preview, t)).collect::<Result<_>>()?;
-        // Physische Kollisionen im Batch setzen logische voraus (die RealmMap ist
-        // bijektiv) und sind oben bereits abgewiesen; zu prüfen bleibt die
-        // Belegung vorhandener Realms (Python: "Zielzelle … ist bereits belegt").
+        // Physical collisions within the batch imply logical ones (the RealmMap is
+        // bijective) and are already rejected above; what remains to check is the
+        // occupancy of existing realms ("target cell … is already occupied").
         if !overwrite {
             let mut realm_state: HashMap<&BigInt, Option<Nat>> = HashMap::new();
             for addr in &resolved {
@@ -411,12 +411,12 @@ impl Db {
                     let v = Nat::from_bigint(&addr.v_local).unwrap();
                     if self.get_cell_value(pr, &u, &v, addr.side as u8)?.is_some() {
                         let shown = tuple_repr(&[addr.physical_realm.to_string(), addr.u.to_string(), addr.v_local.to_string(), addr.side.to_string()]);
-                        return Err(Error::MathCellConflict(format!("Zielzelle {shown} ist bereits belegt")));
+                        return Err(Error::MathCellConflict(format!("Target cell {shown} is already occupied")));
                     }
                 }
             }
         }
-        // Rücksetzpunkt (`_rollback_math_tail`)
+        // rollback point (`_rollback_math_tail`)
         let start_len = self.store.len();
         let start_next = self.next_block_id;
         let start_last = self.last_valid_end;
@@ -428,7 +428,7 @@ impl Db {
                 let end = Nat::from_bigint(&ext.physical_end).unwrap();
                 while r <= end {
                     if self.realms.contains_key(&r) {
-                        return Err(Error::AllocationConflict(format!("Realm {r} ist nicht mehr frei")));
+                        return Err(Error::AllocationConflict(format!("Realm {r} is no longer free")));
                     }
                     self.create_realm(&r, &format!("Realm {r}"), "", None, &Nat::ZERO)?;
                     r = r.add_u64(1);
@@ -486,8 +486,8 @@ impl Db {
         result
     }
 
-    /// `_rollback_math_tail`: Datei auf den Stand vor dem Batch kürzen und
-    /// den Zustand aus Datei + vorigem Schema neu aufbauen.
+    /// `_rollback_math_tail`: truncate the file to its state before the batch and
+    /// rebuild the state from the file + previous schema.
     fn rollback_math_tail(&mut self, file_len: u64, next_block_id: u64, last_valid_end: u64, prior_schema: &Val, prior_dirty: bool) -> Result<()> {
         self.store.rollback_to(file_len)?;
         self.reset_in_memory_state();
@@ -512,7 +512,7 @@ impl Db {
         })
     }
 
-    /// `get_math_cell(layout_id, inputs, dyn_address=False)`: allokiert nie.
+    /// `get_math_cell(layout_id, inputs, dyn_address=False)`: never allocates.
     pub fn get_math_cell(&self, layout_id: u64, inputs: &[Val], dyn_address: bool) -> Result<Option<Val>> {
         let rec = self.math_record(layout_id)?;
         let t = self.math_target(rec, inputs)?;

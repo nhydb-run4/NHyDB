@@ -1,8 +1,8 @@
-//! Indexfamilien und Textsemantik (Python `nhydb_index_v027.py`).
+//! Index families and text semantics.
 //!
-//! Zustandslos: Normalisierung von Familie/Optionen, Textnormalisierung,
-//! Tokenizer (`\w+` wie CPython-`re`), N-Gramme, Index-/Query-Schlüssel,
-//! Prädikatverifikation, FULLTEXT-Payload-Codecs, Phrase und BM25.
+//! Stateless: normalization of family/options, text normalization,
+//! tokenizer (`\w+` as in CPython `re`), n-grams, index/query keys,
+//! predicate verification, FULLTEXT payload codecs, phrase and BM25.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -18,7 +18,7 @@ pub const KIND_TRIGRAM: &str = "TRIGRAM";
 pub const KIND_FULLTEXT: &str = "FULLTEXT";
 pub const TOKENIZER_SIMPLE: &str = "simple";
 
-/// Payload-Codes im SECONDARY-Verzeichnis (zusätzlich zu 0/4/8).
+/// Payload codes in the SECONDARY directory (in addition to 0/4/8).
 pub const PAYLOAD_FULLTEXT_POSITIONS: u8 = 1;
 pub const PAYLOAD_FULLTEXT_DOCLENS: u8 = 2;
 pub const FULLTEXT_DOCLEN_KEY: &str = "\u{0}NHYDB_FULLTEXT_DOCUMENT_LENGTHS";
@@ -59,14 +59,14 @@ pub fn normalize_kind(kind: &Val) -> Result<IndexKind> {
         KIND_FULLTEXT => IndexKind::Fulltext,
         _ => {
             return Err(cfg_err(format!(
-                "unbekannte Indexfamilie {}; erwartet VALUE/TOKEN/TRIGRAM/FULLTEXT",
+                "unknown index family {}; expected VALUE/TOKEN/TRIGRAM/FULLTEXT",
                 kind.py_repr()
             )))
         }
     })
 }
 
-/// Python `int(x)` für Optionswerte (int, bool, float abgeschnitten, str).
+/// Python `int(x)` for option values (int, bool, truncated float, str).
 fn py_int(v: &Val) -> Result<i64> {
     match v {
         Val::Bool(b) => Ok(*b as i64),
@@ -88,7 +88,7 @@ fn tokenizer_of(raw: &Val, family: &str) -> Result<String> {
     let t = opt(raw, "tokenizer").map(|v| v.py_str()).unwrap_or_else(|| TOKENIZER_SIMPLE.to_string());
     let t = unicode::lower(unicode::strip(&t));
     if t != TOKENIZER_SIMPLE {
-        return Err(cfg_err(format!("{family} tokenizer {} wird in V0.27 nicht unterstuetzt", Val::str(t.as_str()).py_repr())));
+        return Err(cfg_err(format!("{family} tokenizer {} is not supported", Val::str(t.as_str()).py_repr())));
     }
     Ok(t)
 }
@@ -113,7 +113,7 @@ pub fn normalize_options(kind: IndexKind, raw: &Val) -> Result<Val> {
                 None => 3,
             };
             if !(2..=16).contains(&n) {
-                return Err(cfg_err("TRIGRAM ngram muss zwischen 2 und 16 liegen".into()));
+                return Err(cfg_err("TRIGRAM ngram must be between 2 and 16".into()));
             }
             vmap! {"ngram" => n, "casefold" => bool_of(raw, "casefold", false)}
         }
@@ -125,10 +125,10 @@ pub fn normalize_options(kind: IndexKind, raw: &Val) -> Result<Val> {
 }
 
 // ----------------------------------------------------------------------
-// Text, Tokens, N-Gramme, Schlüssel
+// Text, tokens, n-grams, keys
 // ----------------------------------------------------------------------
 
-/// `normalize_text`: `None` → "", sonst `str(value)`, optional casefold.
+/// `normalize_text`: `None` → "", otherwise `str(value)`, optionally casefolded.
 pub fn normalize_text(value: &Val, casefold: bool) -> String {
     let t = if value.is_none() { String::new() } else { value.py_str() };
     if casefold { unicode::casefold(&t) } else { t }
@@ -157,7 +157,7 @@ fn unique_ordered(values: Vec<String>) -> Vec<String> {
     values.into_iter().filter(|v| seen.insert(v.clone())).collect()
 }
 
-/// `ngrams` über Code Points.
+/// `ngrams` over code points.
 pub fn ngrams(value: &Val, n: usize, casefold: bool) -> Vec<String> {
     let chars: Vec<char> = normalize_text(value, casefold).chars().collect();
     if chars.len() < n {
@@ -180,11 +180,11 @@ pub fn fulltext_tokens(value: &Val, options: &Val) -> Result<Vec<String>> {
     Ok(simple_tokens(value, opt_bool(&o, "casefold")))
 }
 
-/// Terme eines Dokuments mit ihren Positionen (Reihenfolge des ersten Auftretens).
+/// Terms of a document with their positions (order of first occurrence).
 pub type TermPositions = Vec<(String, Vec<u64>)>;
 
-/// `fulltext_document`: (Dokumentlänge, Term → Positionen) in
-/// Reihenfolge des ersten Auftretens.
+/// `fulltext_document`: (document length, term → positions) in
+/// order of first occurrence.
 pub fn fulltext_document(value: &Val, options: &Val) -> Result<(u64, TermPositions)> {
     let tokens = fulltext_tokens(value, options)?;
     let mut order: Vec<String> = Vec::new();
@@ -208,7 +208,7 @@ pub fn query_fulltext_terms(value: &Val, options: &Val) -> Result<Vec<String>> {
     Ok(unique_ordered(query_fulltext_sequence(value, options)?))
 }
 
-/// `index_keys` (VALUE: der Wert selbst; Textfamilien: Schlüsselstrings).
+/// `index_keys` (VALUE: the value itself; text families: key strings).
 pub fn index_keys(kind: IndexKind, value: &Val, options: &Val) -> Result<Vec<Val>> {
     let o = normalize_options(kind, options)?;
     if kind == IndexKind::Value {
@@ -277,7 +277,7 @@ fn as_values(value: &Val) -> Vec<Val> {
     }
 }
 
-/// `predicate_matches`: Verifikation/Scan-Fallback der Textprädikate.
+/// `predicate_matches`: verification/scan fallback for text predicates.
 pub fn predicate_matches(actual: &Val, op: &str, value: &Val, options: &Val) -> Result<bool> {
     let op = unicode::lower(op);
     match op.as_str() {
@@ -317,31 +317,31 @@ pub fn predicate_matches(actual: &Val, op: &str, value: &Val, options: &Val) -> 
             }
             let mode = unicode::lower(&options.get("mode").map(|m| m.py_str()).unwrap_or_else(|| "all".into()));
             if mode != "all" && mode != "any" {
-                return Err(cfg_err("FULLTEXT mode muss 'all' oder 'any' sein".into()));
+                return Err(cfg_err("FULLTEXT mode must be 'all' or 'any'".into()));
             }
             let a: HashSet<&String> = at.iter().collect();
             let w: HashSet<&String> = q.iter().collect();
             Ok(if mode == "all" { w.is_subset(&a) } else { !w.is_disjoint(&a) })
         }
-        _ => Err(cfg_err(format!("predicate_matches kennt Operator {} nicht", Val::str(op.as_str()).py_repr()))),
+        _ => Err(cfg_err(format!("predicate_matches does not know operator {}", Val::str(op.as_str()).py_repr()))),
     }
 }
 
 // ----------------------------------------------------------------------
-// FULLTEXT-Payload-Codecs
+// FULLTEXT payload codecs
 // ----------------------------------------------------------------------
 
 const FT_POST_MAGIC: &[u8; 4] = b"FTP1";
 const FT_DOC_MAGIC: &[u8; 4] = b"FTD1";
 
-/// Eintrag einer positionsbasierten Postingliste.
+/// Entry of a positional posting list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FtPosting {
     pub u: Nat,
     pub positions: Vec<u64>,
 }
 
-/// Dokumentlängen und Korpusstatistik.
+/// Document lengths and corpus statistics.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FtCorpus {
     pub lengths: BTreeMap<Nat, u64>,
@@ -361,10 +361,10 @@ pub fn encode_fulltext_posting(entries: &[(Nat, Vec<u64>)]) -> Result<Vec<u8>> {
     let mut prev = Nat::ZERO;
     for (u, pos) in entries {
         if u <= &prev {
-            return Err(cfg_err("FULLTEXT Posting-Dokumente muessen streng aufsteigend sein".into()));
+            return Err(cfg_err("FULLTEXT posting documents must be strictly ascending".into()));
         }
         if pos.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(cfg_err("FULLTEXT Positionliste muss streng aufsteigend und >=0 sein".into()));
+            return Err(cfg_err("FULLTEXT position list must be strictly ascending and >=0".into()));
         }
         u.checked_sub(&prev).unwrap().put_vu(&mut out);
         put_vu64(&mut out, pos.len() as u64);
@@ -379,17 +379,17 @@ pub fn encode_fulltext_posting(entries: &[(Nat, Vec<u64>)]) -> Result<Vec<u8>> {
 }
 
 fn take_u64(buf: &[u8], p: &mut usize) -> Result<u64> {
-    get_vu(buf, p)?.as_u64().ok_or_else(|| cfg_err("FULLTEXT Wert zu gross".into()))
+    get_vu(buf, p)?.as_u64().ok_or_else(|| cfg_err("FULLTEXT value too large".into()))
 }
 
 pub fn decode_fulltext_posting(raw: &[u8], expected_count: Option<u64>) -> Result<Vec<FtPosting>> {
     if raw.len() < 4 || &raw[..4] != FT_POST_MAGIC {
-        return Err(cfg_err("FULLTEXT Posting-Magic falsch".into()));
+        return Err(cfg_err("FULLTEXT posting magic is wrong".into()));
     }
     let mut p = 4;
     let count = take_u64(raw, &mut p)?;
     if expected_count.is_some_and(|e| e != count) {
-        return Err(cfg_err("FULLTEXT Postinganzahl stimmt nicht".into()));
+        return Err(cfg_err("FULLTEXT posting count mismatch".into()));
     }
     let mut out = Vec::with_capacity(count.min(1 << 20) as usize);
     let mut u = Nat::ZERO;
@@ -400,13 +400,13 @@ pub fn decode_fulltext_posting(raw: &[u8], expected_count: Option<u64>) -> Resul
         let mut pos = 0u64;
         for i in 0..tf {
             let d = take_u64(raw, &mut p)?;
-            pos = if i == 0 { d } else { pos.checked_add(d).ok_or_else(|| cfg_err("FULLTEXT Position zu gross".into()))? };
+            pos = if i == 0 { d } else { pos.checked_add(d).ok_or_else(|| cfg_err("FULLTEXT position too large".into()))? };
             positions.push(pos);
         }
         out.push(FtPosting { u: u.clone(), positions });
     }
     if p != raw.len() {
-        return Err(cfg_err("FULLTEXT Posting hat Restbytes".into()));
+        return Err(cfg_err("FULLTEXT posting has trailing bytes".into()));
     }
     Ok(out)
 }
@@ -419,7 +419,7 @@ pub fn encode_fulltext_doc_lengths(entries: &[(Nat, u64)]) -> Result<Vec<u8>> {
     let mut prev = Nat::ZERO;
     for (u, dl) in entries {
         if u <= &prev {
-            return Err(cfg_err("FULLTEXT Dokumentlaengen muessen streng aufsteigende u haben".into()));
+            return Err(cfg_err("FULLTEXT document lengths must have strictly ascending u".into()));
         }
         u.checked_sub(&prev).unwrap().put_vu(&mut out);
         put_vu64(&mut out, *dl);
@@ -430,13 +430,13 @@ pub fn encode_fulltext_doc_lengths(entries: &[(Nat, u64)]) -> Result<Vec<u8>> {
 
 pub fn decode_fulltext_doc_lengths(raw: &[u8], expected_count: Option<u64>) -> Result<FtCorpus> {
     if raw.len() < 4 || &raw[..4] != FT_DOC_MAGIC {
-        return Err(cfg_err("FULLTEXT Dokumentlaengen-Magic falsch".into()));
+        return Err(cfg_err("FULLTEXT document lengths magic is wrong".into()));
     }
     let mut p = 4;
     let count = take_u64(raw, &mut p)?;
     let total = take_u64(raw, &mut p)?;
     if expected_count.is_some_and(|e| e != count) {
-        return Err(cfg_err("FULLTEXT Dokumentanzahl stimmt nicht".into()));
+        return Err(cfg_err("FULLTEXT document count mismatch".into()));
     }
     let mut lengths = BTreeMap::new();
     let mut u = Nat::ZERO;
@@ -448,26 +448,26 @@ pub fn decode_fulltext_doc_lengths(raw: &[u8], expected_count: Option<u64>) -> R
         lengths.insert(u.clone(), dl);
     }
     if p != raw.len() {
-        return Err(cfg_err("FULLTEXT Dokumentlaengen haben Restbytes".into()));
+        return Err(cfg_err("FULLTEXT document lengths have trailing bytes".into()));
     }
     if check != total as u128 {
-        return Err(cfg_err("FULLTEXT total_tokens stimmt nicht".into()));
+        return Err(cfg_err("FULLTEXT total_tokens mismatch".into()));
     }
     Ok(FtCorpus { lengths, total_docs: count, total_tokens: total })
 }
 
 // ----------------------------------------------------------------------
-// Kandidaten und Ranking
+// Candidates and ranking
 // ----------------------------------------------------------------------
 
-/// Postinglisten je Term (geteilte Sicht, keine Kopie).
+/// Posting lists per term (shared view, no copy).
 pub type TermPostings<'a> = [(String, &'a [FtPosting])];
 
-/// `fulltext_candidate_docs` (Terme in Anfragereihenfolge).
+/// `fulltext_candidate_docs` (terms in query order).
 pub fn fulltext_candidate_docs(postings: &TermPostings<'_>, mode: &str) -> Result<Vec<Nat>> {
     let mode = unicode::lower(mode);
     if mode != "all" && mode != "any" {
-        return Err(cfg_err("FULLTEXT mode muss 'all' oder 'any' sein".into()));
+        return Err(cfg_err("FULLTEXT mode must be 'all' or 'any'".into()));
     }
     if postings.is_empty() {
         return Ok(Vec::new());
@@ -491,7 +491,7 @@ pub fn fulltext_candidate_docs(postings: &TermPostings<'_>, mode: &str) -> Resul
     Ok(out)
 }
 
-/// Galoppierende Suche des ersten Index `>= start` mit `list[i].u >= u`.
+/// Galloping search for the first index `>= start` with `list[i].u >= u`.
 fn seek(list: &[FtPosting], start: usize, u: &Nat) -> usize {
     let mut step = 1usize;
     let mut lo = start;
@@ -505,9 +505,9 @@ fn seek(list: &[FtPosting], start: usize, u: &Nat) -> usize {
     lo + list[lo..hi].partition_point(|x| &x.u < u)
 }
 
-/// `phrase_candidate_docs`: Dokumente, in denen die Tokenfolge zusammenhängend
-/// vorkommt (wiederholte Terme positionsgenau). Mehrwege-Merge über die nach
-/// u sortierten Postings, Positionsprüfung per Bisektion.
+/// `phrase_candidate_docs`: documents in which the token sequence occurs
+/// contiguously (repeated terms position-exact). Multi-way merge over the
+/// postings sorted by u, position check via bisection.
 pub fn phrase_candidate_docs(seq: &[String], postings: &TermPostings<'_>) -> Vec<Nat> {
     if seq.is_empty() {
         return Vec::new();
@@ -538,13 +538,13 @@ pub fn phrase_candidate_docs(seq: &[String], postings: &TermPostings<'_>) -> Vec
     out
 }
 
-/// `bm25_scores`: Summation je Term in Anfragereihenfolge (wie Python).
+/// `bm25_scores`: summation per term in query order.
 pub fn bm25_scores(postings: &TermPostings<'_>, corpus: &FtCorpus, candidates: Option<&[Nat]>, k1: f64, b: f64) -> Result<Vec<(Nat, f64)>> {
     if k1 <= 0.0 {
-        return Err(cfg_err("BM25 k1 muss > 0 sein".into()));
+        return Err(cfg_err("BM25 k1 must be > 0".into()));
     }
     if !(0.0..=1.0).contains(&b) {
-        return Err(cfg_err("BM25 b muss zwischen 0 und 1 liegen".into()));
+        return Err(cfg_err("BM25 b must be between 0 and 1".into()));
     }
     let n = corpus.total_docs as f64;
     if corpus.total_docs == 0 {

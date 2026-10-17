@@ -1,8 +1,9 @@
-"""Differenztests der QueryEngine gegen Python-v0.27 (zufällige Ausdrucksbäume).
+"""Differential tests of the QueryEngine against an external reference
+implementation (not included), using random expression trees.
 
-Dasselbe Szenario (Datenbank + deterministisch erzeugte Abfragen) läuft in
-getrennten Prozessen gegen die Referenz und gegen die Rust-Engine; alle
-Ergebnisse, Pläne (inkl. Kostenschätzung) und Fehler müssen gleich sein.
+The same scenario (database + deterministically generated queries) runs in
+separate processes against the reference and against the Rust engine; all
+results, plans (including cost estimates) and errors must be identical.
 """
 import pytest
 
@@ -44,8 +45,8 @@ db.create_fulltext_index(7, 1, "idx_note_ft", "note")
 db.create_token_index(8, 1, "idx_tag_tok", "tag")
 db.delete(1, 13)
 db.put(1, 61, [61, 3, "late", "late fox", 2, 7, 0.5])
-# Sparse-Überschreibungen von BASE-Feldern und reine Sparse-Records: S7/S8-Test
-# (Python v0.27 indiziert/selektiert dort veraltete Werte).
+# Sparse overrides of BASE fields and sparse-only records
+# (the reference implementation indexes/selects stale values there).
 db.put_points(1, [(70, 100, "sparse-only tag", "utf8")])
 db.build_indexes(commit=True)
 db.create_index(9, 1, "idx_amount_stale", "amount")
@@ -242,7 +243,7 @@ def test_specific_cases_identical(tmp_path):
 
 
 def test_struct_range_huge_rust_only(tmp_path):
-    """Python-v0.27 iteriert hier über 10**30 u (hängt); Rust nur über materialisierte u."""
+    """The reference implementation iterates over 10**30 u here (hangs); Rust only over materialized u."""
     import nhydb
     from nhydb.query import Q, QueryEngine
     db = nhydb.NHyDB.create(str(tmp_path / "h.nhydb"))
@@ -259,16 +260,16 @@ def test_struct_range_huge_rust_only(tmp_path):
     db.close()
 
 
-def test_s7_s8_s9_sparse_consistency(tmp_path):
-    """S7/S8: Python-v0.27 ignoriert in select/select_us (S7) und im Indexaufbau (S8)
-    Sparse-Überschreibungen von BASE-Feldern und reine Sparse-Records; Index-,
-    CLASSIC_U- und Scan-Pfad liefern dort verschiedene Ergebnisse. Rust liefert in
-    allen Pfaden die logischen (überschriebenen) Werte. S9: Der CLASSIC_U-Pfad
-    verliert in Python reine Sparse-Records (select_us liest nur Dense-Records):
-    count zählt sie, Zeilen/Aggregate nicht."""
+def test_sparse_overrides_consistent_across_access_paths(tmp_path):
+    """Sparse overrides of BASE fields and sparse-only records must be visible
+    in select/select_us and in the index build, so that the index, CLASSIC_U and
+    scan paths all return the logical (overridden) values. The CLASSIC_U path
+    must also keep sparse-only records: count, rows and aggregates agree.
+    (The reference implementation ignores these overrides and loses
+    sparse-only records in the CLASSIC_U path.)"""
     import nhydb
     from nhydb.query import Q, QueryEngine
-    db = nhydb.NHyDB.create(str(tmp_path / "s7.nhydb"))
+    db = nhydb.NHyDB.create(str(tmp_path / "sparse.nhydb"))
     db.create_realm(1, "r", base_reserve_to=8)
     db.create_shape(1, 1, "s", [{"v": 1, "name": "id", "type": "varuint"}, {"v": 2, "name": "status", "type": "utf8"},
                                 {"v": 3, "name": "amount", "type": "varuint"}])

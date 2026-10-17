@@ -1,5 +1,5 @@
-//! Wartung: Checkpoint, Verify, Health, Stats, Tail-Inspektion, Repair,
-//! Kompaktierung.
+//! Maintenance: checkpoint, verify, health, stats, tail inspection, repair,
+//! compaction.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,14 +53,14 @@ fn with_suffix_append(p: &Path, extra: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Optionen für `compact_file`.
+/// Options for `compact_file`.
 #[derive(Clone, Debug)]
 pub struct CompactOptions {
     pub output: Option<PathBuf>,
     pub make_backup: bool,
     pub rebuild_indexes: bool,
     pub batch_records: usize,
-    /// Öffnungsoptionen der Quelle (Sidecar-Pfade, Konfiguration, Sperre).
+    /// Open options of the source (sidecar paths, configuration, lock).
     pub open: OpenOptions,
 }
 
@@ -108,7 +108,7 @@ impl Db {
         Ok(off)
     }
 
-    /// Strukturprüfung aller Blöcke (`verify`).
+    /// Structural check of all blocks (`verify`).
     pub fn verify(&self, deep: bool) -> Result<Val> {
         let t0 = Instant::now();
         let size = self.store.len();
@@ -123,7 +123,7 @@ impl Db {
                 match info.block_type {
                     BT_DATA_DENSE => {
                         if !payload.starts_with(DATA_TAG) {
-                            return Err(Error::Corruption("DATA Tag falsch".into()));
+                            return Err(Error::Corruption("DATA wrong tag".into()));
                         }
                         let mut p = 4;
                         let realm = get_vu(&payload, &mut p)?;
@@ -136,12 +136,12 @@ impl Db {
                             .and_then(|t| t.checked_add(p))
                             .unwrap_or(usize::MAX);
                         if table_end > payload.len() {
-                            return Err(Error::Corruption("DATA Offsettabelle unvollstaendig".into()));
+                            return Err(Error::Corruption("DATA offset table incomplete".into()));
                         }
                         let tl = p + cnt as usize * 4;
                         let end_last = u32::from_le_bytes(payload[tl..tl + 4].try_into().unwrap()) as usize;
                         if table_end + end_last != payload.len() {
-                            return Err(Error::Corruption("DATA Recordbereich/Offsettabelle widersprechen sich".into()));
+                            return Err(Error::Corruption("DATA record area/offset table contradict each other".into()));
                         }
                         records += cnt as i64;
                         if deep {
@@ -163,7 +163,7 @@ impl Db {
                                 let s = u32::from_le_bytes(payload[p + i * 4..p + i * 4 + 4].try_into().unwrap()) as usize;
                                 let e = u32::from_le_bytes(payload[p + i * 4 + 4..p + i * 4 + 8].try_into().unwrap()) as usize;
                                 if e < s || table_end + e > payload.len() {
-                                    return Err(Error::Corruption("DATA Recordoffset ungueltig".into()));
+                                    return Err(Error::Corruption("DATA record offset invalid".into()));
                                 }
                                 self.decode_dense_record(&seg, &payload[table_end + s..table_end + e])?;
                             }
@@ -171,7 +171,7 @@ impl Db {
                     }
                     BT_SPARSE_CELLS => {
                         if !payload.starts_with(SPARSE_TAG) {
-                            return Err(Error::Corruption("SPARSE Tag falsch".into()));
+                            return Err(Error::Corruption("SPARSE wrong tag".into()));
                         }
                         let mut p = 4;
                         let realm = get_vu(&payload, &mut p)?;
@@ -180,7 +180,7 @@ impl Db {
                         let groups = get_vu_u64(&payload, &mut p, "SPARSE groups")?;
                         let cells = get_vu_u64(&payload, &mut p, "SPARSE cells")?;
                         if groups == 0 || cells == 0 || u1 < u0 {
-                            return Err(Error::Corruption("SPARSE Bereich/Gruppe ungueltig".into()));
+                            return Err(Error::Corruption("SPARSE range/group invalid".into()));
                         }
                         let seg = SparseSegment {
                             realm_id: realm.clone(),
@@ -197,7 +197,7 @@ impl Db {
                         };
                         let idx = self.sparse_block_index(&seg)?;
                         if idx.len() as u64 != groups {
-                            return Err(Error::Corruption("SPARSE Gruppenzahl widerspricht Stream".into()));
+                            return Err(Error::Corruption("SPARSE group count contradicts stream".into()));
                         }
                         if deep {
                             for (u, abs, len) in idx.iter() {
@@ -223,18 +223,18 @@ impl Db {
                     off = next;
                 }
                 Err(e) => {
-                    errors.push(format!("bei Byte {off}: {e}"));
+                    errors.push(format!("at byte {off}: {e}"));
                     break;
                 }
             }
         }
         if last != size {
-            errors.push(format!("letztes gueltiges Ende {last} != Dateigroesse {size}"));
+            errors.push(format!("last valid end {last} != file size {size}"));
         }
         for (iid, idx) in &self.index_defs {
             for lane in [0u8, 1] {
                 if self.secondary_source_block.contains_key(&(*iid, lane)) && !self.index_is_fresh(*iid, lane) {
-                    errors.push(format!("Index {}/{} ist stale", idx.name, lane_name(lane)));
+                    errors.push(format!("Index {}/{} is stale", idx.name, lane_name(lane)));
                 }
             }
         }
@@ -249,7 +249,7 @@ impl Db {
         })
     }
 
-    /// Prüft den physischen Dateischwanz ohne die Datenbank zu öffnen.
+    /// Checks the physical file tail without opening the database.
     pub fn inspect_tail(path: impl AsRef<Path>) -> Result<Val> {
         let p = path.as_ref();
         if !p.exists() {
@@ -264,7 +264,7 @@ impl Db {
         let mut error: Option<String> = None;
         while off < size {
             if size - off < BLOCK_HEADER_SIZE as u64 {
-                error = Some(format!("unvollstaendiger Blockkopf ab Byte {off}"));
+                error = Some(format!("incomplete block header at byte {off}"));
                 break;
             }
             let mut raw = [0u8; BLOCK_HEADER_SIZE];
@@ -278,18 +278,18 @@ impl Db {
             };
             let pstart = off + BLOCK_HEADER_SIZE as u64;
             if pstart.checked_add(h.payload_len).map(|e| e > size).unwrap_or(true) {
-                error = Some(format!("Block {}: Payload unvollstaendig", h.block_id));
+                error = Some(format!("Block {}: payload incomplete", h.block_id));
                 break;
             }
             let mut payload = vec![0u8; h.payload_len as usize];
             read_at(&mut payload, pstart)?;
             if crc32(&payload) != h.payload_crc {
-                error = Some(format!("Block {}: Payload CRC falsch", h.block_id));
+                error = Some(format!("Block {}: payload CRC mismatch", h.block_id));
                 break;
             }
             let nxt = align8(pstart + h.payload_len);
             if nxt > size {
-                error = Some(format!("Block {}: Ende unvollstaendig", h.block_id));
+                error = Some(format!("Block {}: end incomplete", h.block_id));
                 break;
             }
             last = nxt;
@@ -305,15 +305,15 @@ impl Db {
         })
     }
 
-    /// Schneidet einen defekten Schwanz ab und setzt beide Superblöcke neu
+    /// Cuts off a corrupt tail and rewrites both superblocks
     /// (`repair_file`).
     ///
-    /// v0.27-Korrekturen: (S4) Es werden nur Blöcke übernommen, deren
-    /// Schema durch eine im Layoutplan vorhandene Generation gedeckt ist –
-    /// Datenblöcke, die auf nie veröffentlichte Realms/Shapes/Indizes
-    /// verweisen, und SYSTEM-Blöcke ohne Plan-Generation werden abgeschnitten;
-    /// (S5) Sidecar-Pfade und Konfiguration werden für Prüfung und
-    /// Indexneuaufbau durchgereicht.
+    /// Only blocks whose schema is covered by a generation present in the
+    /// layout plan are kept –
+    /// data blocks referring to never-published realms/shapes/indexes
+    /// and SYSTEM blocks without a plan generation are cut off.
+    /// Sidecar paths and configuration are passed through for verification and
+    /// index rebuild.
     pub fn repair_file(path: impl AsRef<Path>, apply: bool, make_backup: bool, rebuild_indexes: bool) -> Result<Val> {
         Self::repair_file_with(path, apply, make_backup, rebuild_indexes, &OpenOptions::default())
     }
@@ -379,12 +379,12 @@ impl Db {
         Ok(out)
     }
 
-    /// Bestimmt das sichere neue Dateiende für `repair_file` (S4).
+    /// Determines the safe new end of file for `repair_file`.
     fn repair_safe_end(p: &Path, last_good: u64, open: &OpenOptions, cfg: &crate::config::Config) -> Result<(u64, u64, Option<String>)> {
         use std::collections::HashSet;
         let st = Storage::open(p, cfg.durability)?;
         let committed = super::best_super(&st).ok().map(|(_, s)| s.last_valid_end).filter(|e| *e <= last_good);
-        // Blöcke sammeln
+        // collect blocks
         struct B {
             off: u64,
             next: u64,
@@ -409,7 +409,7 @@ impl Db {
             blocks.push(B { off, next, bt: h.block_type, bid: h.block_id, payload });
             off = next;
         }
-        // R0-Kette und Plan
+        // R0 chain and plan
         let mut first: Option<Val> = None;
         let mut prev: Option<Val> = None;
         let mut systems: Vec<(usize, Val)> = Vec::new();
@@ -430,12 +430,12 @@ impl Db {
                 }
                 _ => {
                     end_idx = i;
-                    reason = Some(format!("ungueltiger R0-Block bei Byte {}", b.off));
+                    reason = Some(format!("invalid R0 block at byte {}", b.off));
                     break;
                 }
             }
         }
-        let first = first.ok_or_else(|| Error::Corruption("repair: R0,u1 Bootstrap fehlt".into()))?;
+        let first = first.ok_or_else(|| Error::Corruption("repair: R0,u1 bootstrap missing".into()))?;
         let cell = |r: &Val, k: &str| r.get("cells").and_then(|c| c.get(k)).cloned().unwrap_or(Val::None);
         let db_id = cell(&first, "1").py_str();
         let db_name = cell(&first, "2").py_str();
@@ -456,12 +456,12 @@ impl Db {
                 Some(e) => active = Some(e),
                 None => {
                     end_idx = *i;
-                    reason = Some(format!("R0-Generation {} nicht im Layoutplan (Byte {})", cell(rec, "5").py_repr(), blocks[*i].off));
+                    reason = Some(format!("R0 generation {} not in the layout plan (byte {})", cell(rec, "5").py_repr(), blocks[*i].off));
                     break;
                 }
             }
         }
-        let active = active.ok_or_else(|| Error::Corruption("repair: keine Layoutplan-Generation passt zu R0,u1".into()))?;
+        let active = active.ok_or_else(|| Error::Corruption("repair: no layout plan generation matches R0,u1".into()))?;
         let snap = system::open_entry(&db_id, active, &key)?;
         let ids = |k: &str, f: &str| -> HashSet<String> {
             snap.get(k).and_then(|v| v.as_list()).into_iter().flatten().filter_map(|r| r.get(f).map(|x| x.py_repr())).collect()
@@ -488,7 +488,7 @@ impl Db {
             if !ok {
                 end_idx = i;
                 reason = Some(format!(
-                    "Block {} ({}) verweist auf nicht veroeffentlichtes Schema (Byte {})",
+                    "Block {} ({}) refers to an unpublished schema (byte {})",
                     b.bid,
                     block_name(b.bt).unwrap_or("?"),
                     b.off
@@ -500,7 +500,7 @@ impl Db {
         if let Some(c) = committed {
             if safe_end < c {
                 return Err(Error::Corruption(format!(
-                    "repair: committeter Bereich bis Byte {c} ist inkonsistent ({}); keine automatische Reparatur",
+                    "repair: committed range up to byte {c} is inconsistent ({}); no automatic repair",
                     reason.unwrap_or_default()
                 )));
             }
@@ -521,30 +521,30 @@ impl Db {
         let mut layout_errors: Vec<Val> = Vec::new();
         for (lid, lay) in &self.layouts {
             if !self.realms.contains_key(&lay.realm_id) {
-                layout_errors.push(Val::Str(format!("Layout {lid}: Realm {} fehlt", lay.realm_id)));
+                layout_errors.push(Val::Str(format!("Layout {lid}: realm {} missing", lay.realm_id)));
             }
             if lay.u_start.is_zero() || lay.u_end.as_ref().map(|e| e < &lay.u_start).unwrap_or(false) {
-                layout_errors.push(Val::Str(format!("Layout {lid}: u-Bereich ungueltig")));
+                layout_errors.push(Val::Str(format!("Layout {lid}: u range invalid")));
             }
             match lay.kind {
                 LayoutKind::Classic => {
                     if lay.shape_id.map(|s| !self.shapes.contains_key(&s)).unwrap_or(true) {
-                        layout_errors.push(Val::Str(format!("Layout {lid}: CLASSIC Shape fehlt")));
+                        layout_errors.push(Val::Str(format!("Layout {lid}: CLASSIC shape missing")));
                     }
                 }
                 LayoutKind::Column => {
                     if lay.fields().is_empty() {
-                        layout_errors.push(Val::Str(format!("Layout {lid}: COLUMN ohne Felder")));
+                        layout_errors.push(Val::Str(format!("Layout {lid}: COLUMN without fields")));
                     }
                 }
                 LayoutKind::Packed => {
                     if lay.packed_span().is_err() || lay.packed_u().is_err() {
-                        layout_errors.push(Val::Str(format!("Layout {lid}: PACKED Parameter ungueltig")));
+                        layout_errors.push(Val::Str(format!("Layout {lid}: PACKED parameters invalid")));
                     }
                 }
                 LayoutKind::Custom => {
                     if lay.plugin.is_empty() {
-                        layout_errors.push(Val::Str(format!("Layout {lid}: CUSTOM ohne Plugin-ID")));
+                        layout_errors.push(Val::Str(format!("Layout {lid}: CUSTOM without plugin ID")));
                     }
                 }
             }
@@ -559,18 +559,18 @@ impl Db {
             match self.effective_spacemap(lay) {
                 Ok(eff) => {
                     if lay.kind.is_builtin() && lay.spacemap != eff {
-                        sm_err.push(Val::Str(format!("Layout {lid}: persistierte SpaceMap weicht von Mappinglogik ab")));
+                        sm_err.push(Val::Str(format!("Layout {lid}: persisted SpaceMap differs from the mapping logic")));
                     } else if lay.kind == LayoutKind::Custom {
                         if let Some(p) = self.plugin_for(lay) {
                             if p.has(crate::plugin::PluginMethod::Spacemap) && lay.spacemap != eff {
                                 sm_warn.push(Val::Str(format!(
-                                    "Layout {lid}: CUSTOM Plugin-SpaceMap weicht vom persistierten Snapshot ab"
+                                    "Layout {lid}: CUSTOM plugin SpaceMap differs from the persisted snapshot"
                                 )));
                             }
                         }
                     }
                 }
-                Err(e) => sm_err.push(Val::Str(format!("Layout {lid}: SpaceMap nicht ableitbar: {e}"))),
+                Err(e) => sm_err.push(Val::Str(format!("Layout {lid}: SpaceMap cannot be derived: {e}"))),
             }
         }
         let sm_status = if !sm_err.is_empty() { "error" } else if !sm_warn.is_empty() { "warning" } else { "ok" };
@@ -608,10 +608,10 @@ impl Db {
         let mut ext_errors = Vec::new();
         for (rid, v) in self.extension_defs.keys() {
             if !self.realms.contains_key(rid) {
-                ext_errors.push(Val::Str(format!("Extension R{rid}/v{v}: Realm fehlt")));
+                ext_errors.push(Val::Str(format!("Extension R{rid}/v{v}: realm missing")));
             }
             if v.is_zero() || v > realm_span() {
-                ext_errors.push(Val::Str(format!("Extension R{rid}/v{v}: ausserhalb Realm")));
+                ext_errors.push(Val::Str(format!("Extension R{rid}/v{v}: outside realm")));
             }
         }
         checks.push(vmap! {
@@ -759,11 +759,11 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Kompaktierung
+    // Compaction
     // ------------------------------------------------------------------
 
-    /// Schreibt den aktuellen logischen Zustand in eine neue Datei
-    /// (`compact_file`). Bei `output=None` wird das Original ersetzt.
+    /// Writes the current logical state into a new file
+    /// (`compact_file`). With `output=None` the original is replaced.
     pub fn compact_file(path: impl AsRef<Path>, opts: &CompactOptions) -> Result<Val> {
         let src_path = path.as_ref().to_path_buf();
         if !src_path.exists() {
@@ -775,8 +775,8 @@ impl Db {
         let tmp_path = with_suffix_append(&final_path, ".compacting");
         let cfg = opts.open.resolve_config(&src_path)?;
         let mode = cfg.durability;
-        // Sperren: Quelle für die gesamte Dauer inkl. atomarem Austausch,
-        // beim Export zusätzlich das Ziel.
+        // Locks: the source for the whole duration incl. the atomic swap,
+        // and additionally the target when exporting.
         let _src_lock = DbLock::acquire(&src_path, cfg.lock)?;
         let _dst_lock = if replace_original { None } else { Some(DbLock::acquire(&final_path, cfg.lock)?) };
         if tmp_path.exists() {
@@ -793,8 +793,8 @@ impl Db {
         let (dst_layout, dst_key);
         {
             let src = Db::open_locked(&src_path, &opts.open, cfg.clone(), DbLock::none(&src_path))?;
-            // Staging-Datei: in-place mit identischer R0-Identität und denselben
-            // Sidecars; Export mit neuer DB-ID und eigenen Sidecars.
+            // Staging file: in-place with identical R0 identity and the same
+            // sidecars; export with a new DB ID and its own sidecars.
             let mut stage_opts = OpenOptions { internal_compaction: true, ..opts.open.clone() };
             if replace_original {
                 system::write_initial_db(&tmp_path, &system::initial_record_from(&src.sys.record, src.sys.math_constants_stored), mode)?;
@@ -804,7 +804,7 @@ impl Db {
                 let base = OpenOptions { layout_path: None, key_path: None, ..opts.open.clone() };
                 let (lp, kp) = base.sidecars(&final_path, &cfg);
                 if lp.exists() || kp.exists() {
-                    return Err(Error::Exists("Zieldatenbank hat bereits Layout- oder Key-Datei".into()));
+                    return Err(Error::Exists("Target database already has a layout or key file".into()));
                 }
                 let fname = |q: &Path| q.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let db_id = crate::crypto::uuid4()?;
@@ -827,14 +827,14 @@ impl Db {
             let mut dst = Db::open_locked(&tmp_path, &stage_opts, cfg.clone(), DbLock::none(&tmp_path))?;
             dst_layout = dst.sys.layout_path.clone();
             dst_key = dst.sys.key_path.clone();
-            // Kopie physischer Zellen auch in exklusive MATH-Realms (Fix S2).
+            // Copy physical cells into exclusive MATH realms as well.
             dst.internal_math_writes = true;
             let res = (|| -> Result<()> {
                 if dst.max_db_size_bytes != src.max_db_size_bytes {
                     dst.set_max_db_size(src.max_db_size_bytes, false)?;
                 }
                 if !replace_original {
-                    // Realm vollständig inkl. Default-Shape und Reserve (Fix S3).
+                    // Realm complete incl. default shape and reserve.
                     for (rid, realm) in &src.realms {
                         dst.create_realm(rid, &realm.name, &realm.description, realm.default_shape_id, &realm.base_reserve_to)?;
                     }
@@ -878,8 +878,8 @@ impl Db {
                         )?;
                         let _ = idx;
                     }
-                    // Exakter MATH-Zustand (Definition, Fingerprint, RealmMap),
-                    // keine Neuplanung.
+                    // Exact MATH state (definition, fingerprint, RealmMap),
+                    // no re-planning.
                     for (lid, st) in &src.math_layouts {
                         dst.math_layouts.insert(*lid, st.clone());
                     }
@@ -887,8 +887,8 @@ impl Db {
                         dst.sys.layout_dirty = true;
                     }
                 }
-                // Dense: lebende Records mit ihren gespeicherten BASE-Rohwerten.
-                // Dense-EXT-Werte und Overlays folgen als Sparse-Zellen.
+                // Dense: live records with their stored BASE raw values.
+                // Dense EXT values and overlays follow as sparse cells.
                 let mut dense_present: std::collections::HashSet<(Nat, Lane, Nat)> = Default::default();
                 let mut dense_ext: Vec<(Nat, Lane, Nat, Nat, Val)> = Vec::new();
                 let mut shape_fields: std::collections::HashSet<(Nat, Lane, Nat, Nat)> = Default::default();
@@ -961,7 +961,7 @@ impl Db {
                         written_batches += 1;
                     }
                 }
-                // Sparse: neuester Zustand; Tombstones nur, wo sie Dense-Werte verdecken.
+                // Sparse: newest state; tombstones only where they hide dense values.
                 let states = src.latest_sparse_states()?;
                 let mut by_key: BTreeMap<(Nat, Lane), Vec<CellInput>> = BTreeMap::new();
                 for ((rid, lane, u, v), meta) in &states {
@@ -1004,7 +1004,7 @@ impl Db {
                 let v = dst.verify(true)?;
                 if !v.get("ok").map(|x| x.is_truthy()).unwrap_or(false) {
                     return Err(Error::Corruption(format!(
-                        "Compaction-Zieldatei Verify fehlgeschlagen: {}",
+                        "Compaction target file verify failed: {}",
                         v.get("errors").map(|e| e.py_repr()).unwrap_or_default()
                     )));
                 }
@@ -1024,7 +1024,7 @@ impl Db {
             let v = check.verify(true)?;
             if !v.get("ok").map(|x| x.is_truthy()).unwrap_or(false) {
                 return Err(Error::Corruption(format!(
-                    "Compaction-Reopen Verify fehlgeschlagen: {}",
+                    "Compaction reopen verify failed: {}",
                     v.get("errors").map(|e| e.py_repr()).unwrap_or_default()
                 )));
             }

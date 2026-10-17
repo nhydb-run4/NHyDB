@@ -1,11 +1,10 @@
-//! Physisches Containerformat.
+//! Physical container format.
 //!
-//! Dateiformat 0.16 (`NHYDB016`, Python-v0.27): bewährter Container der
-//! v0.14 (zwei alternierende 4-KiB-Superblöcke mit CRC32, append-only Blöcke
-//! mit 32-Byte-Header, 8-Byte-Ausrichtung, Commit-Grenze `last_valid_end`),
-//! neue Blocktypen 11–13. Schema-/Layoutmetadaten (1, 2, 3, 8, 9, 11) liegen
-//! nicht mehr in der DB, sondern verschlüsselt im externen Layoutplan.
-//! Siehe `docs/FORMAT.md`.
+//! File format 0.16 (`NHYDB016`): two alternating 4 KiB superblocks with
+//! CRC32, append-only blocks with a 32-byte header, 8-byte alignment, commit
+//! boundary `last_valid_end`; block types 1–13. Schema/layout metadata
+//! (types 1, 2, 3, 8, 9, 11) is not stored in the DB but encrypted in the
+//! external layout plan.
 
 use crate::error::{Error, Result};
 
@@ -35,10 +34,10 @@ pub const BT_LAYOUT_DEF: u8 = 9;
 pub const BT_SPARSE_CELLS: u8 = 10;
 pub const BT_MATH_LAYOUT_STATE: u8 = 11;
 pub const BT_DB_CONFIG: u8 = 12;
-/// R0,u1: DB-interne Bootstrap-/Generationsdatensätze.
+/// R0,u1: DB-internal bootstrap/generation records.
 pub const BT_SYSTEM: u8 = 13;
 
-/// Blocktypen, die in v0.27 ausschließlich im externen Layoutplan stehen.
+/// Block types stored exclusively in the external layout plan.
 pub const LAYOUT_META_TYPES: [u8; 6] = [BT_REALM, BT_SHAPE, BT_EXTENSION_DEF, BT_LAYOUT_DEF, BT_INDEX_DEF, BT_MATH_LAYOUT_STATE];
 
 #[inline]
@@ -114,20 +113,20 @@ pub fn pack_super(s: &SuperState) -> Vec<u8> {
 
 pub fn unpack_super(raw: &[u8]) -> Result<SuperState> {
     if raw.len() != SUPERBLOCK_SIZE {
-        return Err(Error::Corruption("Superblock unvollstaendig".into()));
+        return Err(Error::Corruption("superblock incomplete".into()));
     }
     let got = u32::from_le_bytes(raw[SUPER_CRC_OFFSET..].try_into().unwrap());
     if got != crc32(&raw[..SUPER_CRC_OFFSET]) {
-        return Err(Error::Corruption("Superblock CRC falsch".into()));
+        return Err(Error::Corruption("superblock CRC mismatch".into()));
     }
     let major = u16::from_le_bytes([raw[8], raw[9]]);
     let minor = u16::from_le_bytes([raw[10], raw[11]]);
     if &raw[0..8] != SUPER_MAGIC || major != FORMAT_MAJOR || minor != FORMAT_MINOR {
-        return Err(Error::Corruption("falsches NHyDB-Format, erwartet 0.16".into()));
+        return Err(Error::Corruption("wrong NHyDB format, expected 0.16".into()));
     }
     let sbsize = u32::from_le_bytes(raw[12..16].try_into().unwrap());
     if sbsize as usize != SUPERBLOCK_SIZE {
-        return Err(Error::Corruption("Superblockgroesse unbekannt".into()));
+        return Err(Error::Corruption("unknown superblock size".into()));
     }
     let q = |i: usize| u64::from_le_bytes(raw[16 + i * 8..24 + i * 8].try_into().unwrap());
     Ok(SuperState {
@@ -171,11 +170,11 @@ pub fn pack_block_header(bt: u8, bid: u64, payload: &[u8], flags: u16) -> [u8; B
 
 pub fn unpack_block_header(raw: &[u8]) -> Result<BlockHeader> {
     if raw.len() != BLOCK_HEADER_SIZE {
-        return Err(Error::Corruption("Blockkopf unvollstaendig".into()));
+        return Err(Error::Corruption("block header incomplete".into()));
     }
     let bt = raw[5];
     if &raw[0..4] != BLOCK_MAGIC || raw[4] != BLOCK_VERSION || block_name(bt).is_none() {
-        return Err(Error::Corruption("Blockkopf Magic/Version/Typ ungueltig".into()));
+        return Err(Error::Corruption("block header magic/version/type invalid".into()));
     }
     let h = BlockHeader {
         block_type: bt,
@@ -186,7 +185,7 @@ pub fn unpack_block_header(raw: &[u8]) -> Result<BlockHeader> {
     };
     let hcrc = u32::from_le_bytes(raw[28..32].try_into().unwrap());
     if crc32(&header_bytes(&h, 0)) != hcrc {
-        return Err(Error::Corruption("Blockkopf CRC falsch".into()));
+        return Err(Error::Corruption("block header CRC mismatch".into()));
     }
     Ok(h)
 }

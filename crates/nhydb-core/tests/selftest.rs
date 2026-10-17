@@ -1,5 +1,5 @@
-//! Rust-Portierung von `reference/nhydb_v014_selftest.py` (Teile build +
-//! reopen + compact) mit einem nativen ZigZag-CUSTOM-Plugin.
+//! End-to-end self-test (build + reopen + compact) of a mixed realm with
+//! CLASSIC, COLUMN, PACKED and a native ZigZag CUSTOM plugin.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("nhydb_rust_tests");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(name);
-    // v0.27: DB-Triade plus Sperrdatei entfernen
+    // remove the DB file triad plus the lock file
     for suffix in ["", ".layout.enc", ".layout.key", ".lock"] {
         let _ = std::fs::remove_file(dir.join(format!("{name}{suffix}")));
     }
@@ -206,7 +206,7 @@ fn build(path: &PathBuf) {
         assert_eq!(rec.get("object"), Some(&i(59)));
         assert_eq!(rec.get("data").unwrap().get("label"), Some(&s("obj-59")));
     }
-    // CLASSIC record_N mit leerem Anker
+    // CLASSIC record_N with an empty anchor
     db.put_points(&r, vec![CellInput::new(n(150), n(3), s("sparse-only"))], NL, false, 10_000).unwrap();
     let anchor = db.record_anchor(&LayoutRef::Id(1), &n(150), NL).unwrap();
     let c = db.get_n(&anchor.n, GetMode::Cell).unwrap();
@@ -240,7 +240,7 @@ fn build(path: &PathBuf) {
     db.evolve_layout(&LayoutRef::Id(4), &e4, false).unwrap();
     assert_eq!(db.get_layout(None, None, Some(&LayoutRef::Id(2))).unwrap().get("u_end"), Some(&i(20_003)));
     db.put_points(&r, vec![], NL, false, 1).unwrap();
-    // put_extensions über put_points (Python: put_extensions → put_points)
+    // put_extensions via put_points (put_extensions delegates to put_points)
     db.put_points(&r, vec![CellInput::new(n(59), n(100), Val::Float(9.5))], NL, false, 10_000).unwrap();
     for lid in 2..=4u64 {
         db.put_object(&LayoutRef::Id(lid), &n(59), &nhydb_core::vmap! {"score" => 9.5}, NL, false).unwrap();
@@ -249,7 +249,7 @@ fn build(path: &PathBuf) {
     for lid in 2..=4u64 {
         assert_eq!(get_obj(&db, lid, 59).get("score"), Some(&Val::Float(9.5)));
     }
-    // Übernahme belegten Raums wird abgewiesen
+    // taking over occupied space is rejected
     let mut probe = LayoutSpec::new(5, r.clone(), "Unsafe priority probe", "CUSTOM");
     probe.u_start = n(40_007);
     probe.u_end = Some(n(40_007));
@@ -316,10 +316,10 @@ fn commit_and_crash_tail() {
         db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &n(1), None, 0, "").unwrap();
         let rows: Vec<Vec<Val>> = (0..10).map(|k| vec![i(k)]).collect();
         db.put_dense_batch(&r, &n(1), &DenseRows::Tuples(&rows), None, &[], NL, true).unwrap();
-        // nicht committeter Nachtrag
+        // uncommitted append
         let rows2: Vec<Vec<Val>> = (0..5).map(|k| vec![i(100 + k)]).collect();
         db.put_dense_batch(&r, &n(11), &DenseRows::Tuples(&rows2), None, &[], NL, false).unwrap();
-        db.close(false).unwrap(); // Puffer geschrieben, aber kein Commit
+        db.close(false).unwrap(); // buffer written, but no commit
     }
     let db = Db::open(&p).unwrap();
     assert!(db.recovered_tail_bytes > 0);
@@ -327,7 +327,7 @@ fn commit_and_crash_tail() {
     assert!(db.get(&r, &n(11), NL, None, None, true).unwrap().is_none());
     assert_eq!(db.verify(true).unwrap().get("ok"), Some(&Val::Bool(true)));
     drop(db);
-    // abgeschnittener Block nach einem Commit + Müll am Ende
+    // truncated block after a commit + garbage at the end
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
@@ -364,7 +364,7 @@ fn corrupt_payload_detected() {
     let db = Db::open(&p).unwrap();
     let v = db.verify(false).unwrap();
     assert_eq!(v.get("ok"), Some(&Val::Bool(false)));
-    assert!(db.get(&r, &n(3), NL, None, None, true).is_err(), "CRC-Fehler muss beim Lesen auffallen");
+    assert!(db.get(&r, &n(3), NL, None, None, true).is_err(), "CRC error must be detected on read");
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn lanes_sparse_null_tombstone_big() {
     let mut db = Db::create(&p, true, OpenOptions::default()).unwrap();
     let r = n(23);
     db.create_realm(&r, "R23", "", None, &Nat::ZERO).unwrap();
-    // v744 ohne v1..v743, getrennte Spuren
+    // v744 without v1..v743, separate lanes
     let cells = vec![CellInput::typed(n(14), n(744), s("links"), Some(TypeCode::Utf8))];
     db.put_points(&r, cells, NL, true, 10_000).unwrap();
     let cells = vec![CellInput::typed(n(14), n(744), s("rechts"), Some(TypeCode::Utf8))];
@@ -383,7 +383,7 @@ fn lanes_sparse_null_tombstone_big() {
     assert_eq!(db.get_cell_n(&nl, false).unwrap().unwrap().get("value"), Some(&s("links")));
     let nr = address::dynadron_n(&r, &n(14), &n(744), NR).unwrap();
     assert_eq!(db.get_cell_n(&nr, false).unwrap().unwrap().get("value"), Some(&s("rechts")));
-    // Null ≠ Tombstone ≠ fehlend
+    // null ≠ tombstone ≠ missing
     let big_v = address::realm_span().clone();
     let big_u = Nat::S(u64::MAX).mul(&Nat::S(1000));
     db.put_points(

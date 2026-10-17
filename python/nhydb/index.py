@@ -1,8 +1,8 @@
-"""Indexfamilien und Textsemantik (Gegenstück zu ``nhydb_index_v027``).
+"""Index families and text semantics.
 
-VALUE, TOKEN, TRIGRAM und positionsbasiertes FULLTEXT: Normalisierung,
-Tokenizer (``\\w+`` exakt wie CPython-``re``), N-Gramme, Schlüssel,
-Prädikatverifikation, FULLTEXT-Payload-Codecs, Phrase, BM25. Nativ (Rust).
+VALUE, TOKEN, TRIGRAM and positional FULLTEXT: normalization, tokenizer
+(``\\w+`` exactly like CPython ``re``), n-grams, keys, predicate
+verification, FULLTEXT payload codecs, phrase search, BM25. Native (Rust).
 """
 from ._native import (  # noqa: F401
     IndexConfigError,

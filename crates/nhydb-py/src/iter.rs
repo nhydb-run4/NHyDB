@@ -1,10 +1,9 @@
-//! Python-Iteratoren über die speicherschonenden Cursor des Kerns.
+//! Python iterators over the memory-efficient cursors of the core.
 //!
-//! Wie die Generatoren der Python-Referenz starten sie erst beim ersten
-//! `next()` (auch Fehler wie `StaleIndexError` erscheinen dort) und lesen
-//! danach blockweise (256 Elemente je Schritt). Schreibzugriffe auf die
-//! Datenbank zwischen zwei Schritten sind erlaubt; der Iterator sieht dann
-//! den jeweils aktuellen Zustand.
+//! Like generators, they only start on the first `next()` (errors such as
+//! `StaleIndexError` also surface there) and then read in chunks
+//! (256 elements per step). Writes to the database between two steps are
+//! allowed; the iterator then sees the current state.
 
 use std::collections::VecDeque;
 

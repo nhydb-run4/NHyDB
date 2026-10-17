@@ -1,9 +1,9 @@
-//! Dynamischer Wert (`Val`) für Zellwerte, Layout-Parameter und
-//! dict-artige API-Ergebnisse, einschließlich unbeschränkter Ganzzahlen.
+//! Dynamic value (`Val`) for cell values, layout parameters and
+//! dict-like API results, including unbounded integers.
 //!
-//! Der JSON-Codec ist kompatibel zu Pythons
+//! The JSON codec is compatible with Python's
 //! `json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",",":"))`
-//! (v0.14 `json_bytes`), damit Metadatenblöcke bytegleich entstehen.
+//! (`json_bytes`), so that metadata blocks are produced byte-identically.
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -17,21 +17,21 @@ pub enum Val {
     #[default]
     None,
     Bool(bool),
-    /// Ganzzahl im i64-Bereich.
+    /// Integer within the i64 range.
     Int(i64),
-    /// Ganzzahl außerhalb des i64-Bereichs.
+    /// Integer outside the i64 range.
     Big(BigInt),
     Float(f64),
     Str(String),
     Bytes(Vec<u8>),
     List(Vec<Val>),
-    /// Geordnete Abbildung (Einfügereihenfolge wie bei Python-dicts).
+    /// Ordered map (insertion order, like Python dicts).
     Map(Vec<(String, Val)>),
 }
 
 
 impl PartialEq for Val {
-    /// Python-ähnliche Gleichheit: `1 == 1.0 == True`, dicts ordnungsfrei.
+    /// Python-like equality: `1 == 1.0 == True`, dicts order-independent.
     fn eq(&self, other: &Self) -> bool {
         use Val::*;
         match (self, other) {
@@ -50,7 +50,7 @@ impl PartialEq for Val {
     }
 }
 
-/// Numerische Sicht für Vergleiche.
+/// Numeric view for comparisons.
 #[derive(Debug, Clone)]
 pub enum Num {
     I(BigInt),
@@ -82,7 +82,7 @@ fn cmp_int_float(a: &BigInt, b: f64) -> Option<std::cmp::Ordering> {
         return Some(if b > 0.0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
     }
     let fl = b.floor();
-    let bi = BigInt::from(fl as i128); // ausreichend für typische Werte
+    let bi = BigInt::from(fl as i128); // sufficient for typical values
     let bi = if fl.abs() < 1e38 { bi } else { float_to_bigint(fl) };
     match a.cmp(&bi) {
         std::cmp::Ordering::Equal => {
@@ -143,7 +143,7 @@ impl Val {
         }
     }
 
-    /// Ganzzahl-Sicht (bool zählt wie in Python als int).
+    /// Integer view (bool counts as int, as in Python).
     pub fn as_bigint(&self) -> Option<BigInt> {
         match self {
             Val::Bool(b) => Some(BigInt::from(*b as i64)),
@@ -206,7 +206,7 @@ impl Val {
         }
     }
 
-    /// Schlüsselzugriff auf Map-Werte.
+    /// Key access on map values.
     pub fn get(&self, key: &str) -> Option<&Val> {
         match self {
             Val::Map(m) => m.iter().find(|(k, _)| k == key).map(|(_, v)| v),
@@ -221,7 +221,7 @@ impl Val {
         }
     }
 
-    /// Setzt/ersetzt einen Map-Eintrag (Position bleibt erhalten).
+    /// Sets/replaces a map entry (its position is preserved).
     pub fn set<K: Into<String>>(&mut self, key: K, value: Val) {
         if let Val::Map(m) = self {
             let key = key.into();
@@ -250,7 +250,7 @@ impl Val {
         Val::Map(Vec::new())
     }
 
-    /// Python-`str()` für Skalarwerte (für `utf8`-Felder: `str(value)`).
+    /// Python `str()` for scalar values (for `utf8` fields: `str(value)`).
     pub fn py_str(&self) -> String {
         match self {
             Val::Str(s) => s.clone(),
@@ -258,7 +258,7 @@ impl Val {
         }
     }
 
-    /// Python-`repr()`.
+    /// Python `repr()`.
     pub fn py_repr(&self) -> String {
         match self {
             Val::None => "None".into(),
@@ -291,17 +291,17 @@ impl Val {
         Ok(out)
     }
 
-    /// `json.dumps(..., sort_keys=True, separators=(",",":"))` mit dem
-    /// Python-Standard `ensure_ascii=True` (Nicht-ASCII als `\uXXXX`,
-    /// Zeichen außerhalb der BMP als Surrogatpaar). Verwendet für
-    /// MATH-Fingerprints.
+    /// `json.dumps(..., sort_keys=True, separators=(",",":"))` with the
+    /// Python default `ensure_ascii=True` (non-ASCII as `\uXXXX`,
+    /// characters outside the BMP as a surrogate pair). Used for
+    /// MATH fingerprints.
     pub fn to_json_ascii(&self) -> Result<String> {
         let mut out = String::new();
         self.write_json(&mut out, true, true)?;
         Ok(out)
     }
 
-    /// JSON ohne Schlüsselsortierung (Einfügereihenfolge).
+    /// JSON without key sorting (insertion order).
     pub fn to_json_unsorted(&self) -> Result<String> {
         let mut out = String::new();
         self.write_json(&mut out, false, false)?;
@@ -367,7 +367,7 @@ impl Val {
         let v = p.value()?;
         p.ws();
         if p.i != p.s.len() {
-            return Err(Error::Corruption("JSON: unerwartete Restzeichen".into()));
+            return Err(Error::Corruption("JSON: unexpected trailing characters".into()));
         }
         Ok(v)
     }
@@ -399,8 +399,8 @@ fn json_str_mode(out: &mut String, s: &str, ascii: bool) {
     out.push('"');
 }
 
-/// Pythons `repr(float)`: kürzeste rundungssichere Darstellung,
-/// Exponentialschreibweise für Exponenten < -4 oder >= 16.
+/// Python's `repr(float)`: shortest round-trip representation,
+/// exponential notation for exponents < -4 or >= 16.
 pub fn py_float_repr(f: f64) -> String {
     if f.is_nan() {
         return "nan".into();
@@ -411,7 +411,7 @@ pub fn py_float_repr(f: f64) -> String {
     if f == 0.0 {
         return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    // Rust liefert in `{:e}` die kürzeste rundungssichere Ziffernfolge.
+    // Rust's `{:e}` yields the shortest round-trip digit sequence.
     let sci = format!("{:e}", f);
     let (mant, exp) = sci.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();
@@ -454,7 +454,7 @@ pub fn py_float_repr(f: f64) -> String {
     out
 }
 
-/// Pythons `repr(str)`.
+/// Python's `repr(str)`.
 pub fn py_str_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::new();
@@ -517,7 +517,7 @@ struct JsonParser<'a> {
 
 impl JsonParser<'_> {
     fn err(&self, m: &str) -> Error {
-        Error::Corruption(format!("JSON ungueltig bei {}: {m}", self.i))
+        Error::Corruption(format!("invalid JSON at {}: {m}", self.i))
     }
 
     fn ws(&mut self) {
@@ -538,7 +538,7 @@ impl JsonParser<'_> {
     fn value(&mut self) -> Result<Val> {
         self.ws();
         let Some(&c) = self.s.get(self.i) else {
-            return Err(self.err("Ende"));
+            return Err(self.err("unexpected end"));
         };
         match c {
             b'{' => {
@@ -552,16 +552,16 @@ impl JsonParser<'_> {
                 loop {
                     self.ws();
                     if self.s.get(self.i) != Some(&b'"') {
-                        return Err(self.err("Schluessel erwartet"));
+                        return Err(self.err("key expected"));
                     }
                     let k = self.string()?;
                     self.ws();
                     if self.s.get(self.i) != Some(&b':') {
-                        return Err(self.err("':' erwartet"));
+                        return Err(self.err("':' expected"));
                     }
                     self.i += 1;
                     let v = self.value()?;
-                    // Python json: spätere doppelte Schlüssel gewinnen.
+                    // Python json: later duplicate keys win.
                     if let Some(slot) = m.iter_mut().find(|(kk, _): &&mut (String, Val)| *kk == k) {
                         slot.1 = v;
                     } else {
@@ -574,7 +574,7 @@ impl JsonParser<'_> {
                             self.i += 1;
                             return Ok(Val::Map(m));
                         }
-                        _ => return Err(self.err("',' oder '}' erwartet")),
+                        _ => return Err(self.err("',' or '}' expected")),
                     }
                 }
             }
@@ -595,7 +595,7 @@ impl JsonParser<'_> {
                             self.i += 1;
                             return Ok(Val::List(l));
                         }
-                        _ => return Err(self.err("',' oder ']' erwartet")),
+                        _ => return Err(self.err("',' or ']' expected")),
                     }
                 }
             }
@@ -607,7 +607,7 @@ impl JsonParser<'_> {
             b'I' if self.lit("Infinity") => Ok(Val::Float(f64::INFINITY)),
             b'-' if self.lit("-Infinity") => Ok(Val::Float(f64::NEG_INFINITY)),
             b'-' | b'0'..=b'9' => self.number(),
-            _ => Err(self.err("unerwartetes Zeichen")),
+            _ => Err(self.err("unexpected character")),
         }
     }
 
@@ -625,13 +625,13 @@ impl JsonParser<'_> {
             }
             self.i += 1;
         }
-        let txt = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| self.err("Zahl"))?;
+        let txt = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| self.err("number"))?;
         if is_float {
-            txt.parse::<f64>().map(Val::Float).map_err(|_| self.err("Zahl"))
+            txt.parse::<f64>().map(Val::Float).map_err(|_| self.err("number"))
         } else if let Ok(v) = txt.parse::<i64>() {
             Ok(Val::Int(v))
         } else {
-            BigInt::parse_bytes(txt.as_bytes(), 10).map(Val::Big).ok_or_else(|| self.err("Zahl"))
+            BigInt::parse_bytes(txt.as_bytes(), 10).map(Val::Big).ok_or_else(|| self.err("number"))
         }
     }
 
@@ -660,7 +660,7 @@ impl JsonParser<'_> {
                 Some(b'\\') => {
                     self.i += 1;
                     let Some(&e) = self.s.get(self.i) else {
-                        return Err(self.err("Escape"));
+                        return Err(self.err("escape"));
                     };
                     self.i += 1;
                     match e {
@@ -686,17 +686,17 @@ impl JsonParser<'_> {
                             }
                             out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                         }
-                        _ => return Err(self.err("Escape")),
+                        _ => return Err(self.err("escape")),
                     }
                 }
-                _ => return Err(self.err("String nicht beendet")),
+                _ => return Err(self.err("unterminated string")),
             }
         }
     }
 }
 
-/// Hashbarer Schlüssel mit Python-dict-Semantik für Indexwerte
-/// (`1`, `1.0` und `True` sind derselbe Schlüssel).
+/// Hashable key with Python dict semantics for index values
+/// (`1`, `1.0` and `True` are the same key).
 #[derive(Clone, Debug)]
 pub struct ValKey(pub Val);
 
@@ -743,12 +743,12 @@ impl std::hash::Hash for ValKey {
     }
 }
 
-/// Python-Ordnungsvergleich `a < b` / `a == b` / `a > b`.
-/// `None` bedeutet `TypeError` (nicht vergleichbare Typen) – wie CPython:
-/// Zahlen (bool/int/float) untereinander exakt, `str` mit `str`
-/// (Code-Point-Ordnung), `bytes` mit `bytes`, Listen lexikografisch;
-/// `None`, dicts und gemischte Typen sind nicht ordnungsvergleichbar.
-/// NaN liefert wie in Python „weder kleiner noch größer“ (hier `None`).
+/// Python ordering comparison `a < b` / `a == b` / `a > b`.
+/// `None` means `TypeError` (incomparable types), as in CPython:
+/// numbers (bool/int/float) compare exactly with each other, `str` with `str`
+/// (code point order), `bytes` with `bytes`, lists lexicographically;
+/// `None`, dicts and mixed types are not orderable.
+/// NaN yields "neither less nor greater", as in Python (here `None`).
 pub fn py_cmp(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     match (a, b) {
@@ -772,9 +772,9 @@ pub fn py_cmp(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// Typklasse für die Frage, ob ein Python-`sorted()` über Schlüssel ohne
-/// `TypeError` gelingt (jede Vergleichssortierung muss Elemente
-/// verschiedener Klassen miteinander vergleichen).
+/// Type class used to decide whether a Python `sorted()` over keys succeeds
+/// without `TypeError` (any comparison sort has to compare elements of
+/// different classes with each other).
 fn order_class(v: &Val) -> u8 {
     match v {
         Val::Bool(_) | Val::Int(_) | Val::Big(_) | Val::Float(_) => 0,
@@ -786,8 +786,8 @@ fn order_class(v: &Val) -> u8 {
     }
 }
 
-/// `sorted(keys)` mit Rückfall `sorted(keys, key=repr)` bei `TypeError`
-/// (Verzeichnisreihenfolge der SECONDARY-Blöcke ab v0.21/v0.27).
+/// `sorted(keys)` with fallback `sorted(keys, key=repr)` on `TypeError`
+/// (directory order of SECONDARY blocks).
 pub fn py_sort_keys<T>(items: &mut [T], key: impl Fn(&T) -> &Val) {
     let natural = match items.first() {
         None => true,
@@ -805,7 +805,7 @@ pub fn py_sort_keys<T>(items: &mut [T], key: impl Fn(&T) -> &Val) {
     }
 }
 
-/// Sortierschlüssel für Postinglisten-Verzeichnisse (v0.14: `repr(value)`).
+/// Sort key for posting-list directories (`repr(value)`).
 pub fn repr_sort_key(v: &Val) -> String {
     v.py_repr()
 }
@@ -851,7 +851,7 @@ impl<T: Into<Val>> From<Option<T>> for Val {
     }
 }
 
-/// Bequemer Konstruktor für geordnete Maps: `vmap! { "a" => 1, ... }`.
+/// Convenience constructor for ordered maps: `vmap! { "a" => 1, ... }`.
 #[macro_export]
 macro_rules! vmap {
     () => { $crate::val::Val::Map(Vec::new()) };

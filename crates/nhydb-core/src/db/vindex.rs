@@ -1,21 +1,21 @@
-//! Gezielter Zugriff auf Sparse-Zellen einer u-Gruppe ohne Vollmerge.
+//! Targeted access to the sparse cells of a u group without a full merge.
 //!
-//! v0.14 (`_sparse_updates_for_u`) dekodiert für jeden Zellzugriff alle
-//! Sparse-Records aller Segmente, die `u` enthalten, und führt sie zu einer
-//! Map zusammen. Bei COLUMN (u = Feld, v = Objekt) und PACKED (alle Objekte
-//! auf einem u) ist das der komplette Datenbestand des Layouts.
+//! A naive implementation (`_sparse_updates_for_u`) decodes, for every cell access, all
+//! sparse records of all segments containing `u` and merges them into one
+//! map. With COLUMN (u = field, v = object) and PACKED (all objects
+//! on one u) that is the entire data set of the layout.
 //!
-//! Hier wird je `(realm, lane, u)` einmalig ein v-Index im Speicher
-//! aufgebaut (Dateiformat unverändert):
-//! * pro Sparse-Record dessen v-Bereich `[v_first, v_last]` in einem
-//!   Intervallindex,
-//! * pro Record Sprungmarken alle `CK_EVERY` Zellen (Byteposition, v und
-//!   Vorgänger-v, weil v delta-kodiert ist).
+//! Here an in-memory v index is built once per `(realm, lane, u)`
+//! (file format unchanged):
+//! * per sparse record its v range `[v_first, v_last]` in an
+//!   interval index,
+//! * per record checkpoints every `CK_EVERY` cells (byte position, v and
+//!   previous v, because v is delta-encoded).
 //!
-//! Ein Punktzugriff prüft nur Records, deren v-Bereich `v` enthält, vom
-//! neuesten zum ältesten Block (der neueste Zustand gewinnt, wie beim Merge),
-//! springt per Sprungmarke in die Nähe von `v` und dekodiert nur die
-//! Trefferzelle. Bereichszugriffe arbeiten analog.
+//! A point access checks only records whose v range contains `v`, from the
+//! newest to the oldest block (the newest state wins, as in the merge),
+//! jumps via a checkpoint close to `v` and decodes only the
+//! matching cell. Range accesses work analogously.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,17 +29,17 @@ use super::interval::IntervalIndex;
 use super::layout::FieldResolver;
 use super::{Db, SVal, SparseCellMeta, SparseSegment};
 
-/// Abstand der Sprungmarken in Zellen.
+/// Distance between checkpoints in cells.
 const CK_EVERY: u64 = 128;
-/// Obergrenze aller gehaltenen Sprungmarken (≈ 50 B je Marke).
+/// Upper bound of all held checkpoints (≈ 50 B per checkpoint).
 pub(crate) const CK_BUDGET: usize = 4 << 20;
-/// Obergrenze gehaltener v-Indizes.
+/// Upper bound of held v indexes.
 const UINDEX_MAX_ENTRIES: usize = 4096;
-/// Höchstzahl gemeinsam indexierter u-Gruppen eines Blocks.
+/// Maximum number of u groups of one block indexed together.
 const MAX_SIBLINGS: usize = 64;
 
-/// Sprungmarke: Zelle Nr. `idx` beginnt bei `pos` (Schlüsselbyte), hat den
-/// Wert `v`, Vorgänger ist `prev`.
+/// Checkpoint: cell no. `idx` starts at `pos` (key byte), has the
+/// value `v`, its predecessor is `prev`.
 #[derive(Clone, Debug)]
 struct Ck {
     v: Nat,
@@ -48,7 +48,7 @@ struct Ck {
     idx: u64,
 }
 
-/// Ein Sparse-Record (eine u-Gruppe in einem Block) im v-Index.
+/// A sparse record (one u group in one block) in the v index.
 #[derive(Clone, Debug)]
 pub(crate) struct RecSpan {
     block_offset: u64,
@@ -60,12 +60,12 @@ pub(crate) struct RecSpan {
     ck: Vec<Ck>,
 }
 
-/// v-Index einer u-Gruppe über alle Segmente.
+/// v index of a u group across all segments.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UIndex {
     recs: Vec<RecSpan>,
     iv: IntervalIndex,
-    /// Anzahl der berücksichtigten Segmente (zur Konsistenzprüfung)
+    /// Number of segments taken into account (for consistency checks)
     segs_seen: usize,
 }
 
@@ -81,7 +81,7 @@ impl UIndex {
     }
 }
 
-/// Kopf einer Sparse-Zelle; `p` steht danach am Wertanfang.
+/// Header of a sparse cell; `p` then points to the start of the value.
 pub(crate) struct CellHead {
     pub v: Nat,
     pub tomb: bool,
@@ -90,7 +90,7 @@ pub(crate) struct CellHead {
     pub typ: Option<TypeCode>,
 }
 
-/// Liest den Zellkopf (`vu (v_delta<<3 | flags) [typecode]`).
+/// Reads the cell header (`vu (v_delta<<3 | flags) [typecode]`).
 pub(crate) fn read_head(raw: &[u8], p: &mut usize, prev: &Nat, realm: &Nat) -> Result<CellHead> {
     let key = get_vu(raw, p)?;
     let (flags, delta) = match &key {
@@ -98,7 +98,7 @@ pub(crate) fn read_head(raw: &[u8], p: &mut usize, prev: &Nat, realm: &Nat) -> R
         Nat::B(b) => ((&**b % 8u32).try_into().unwrap_or(0u64), Nat::from(&**b >> 3usize)),
     };
     if delta.is_zero() {
-        return Err(Error::Corruption("SPARSE v-Delta muss >0 sein".into()));
+        return Err(Error::Corruption("SPARSE v delta must be >0".into()));
     }
     let v = prev.add(&delta);
     validate_local_v(&v, Some(realm))?;
@@ -108,15 +108,15 @@ pub(crate) fn read_head(raw: &[u8], p: &mut usize, prev: &Nat, realm: &Nat) -> R
     let mut typ = None;
     if selftyped && !tomb {
         let Some(&code) = raw.get(*p) else {
-            return Err(Error::Corruption("SPARSE Typcode fehlt".into()));
+            return Err(Error::Corruption("SPARSE type code missing".into()));
         };
         *p += 1;
-        typ = Some(TypeCode::from_code(code).ok_or_else(|| Error::Corruption(format!("SPARSE Typcode {code} unbekannt")))?);
+        typ = Some(TypeCode::from_code(code).ok_or_else(|| Error::Corruption(format!("SPARSE type code {code} unknown")))?);
     }
     Ok(CellHead { v, tomb, null, selftyped, typ })
 }
 
-/// Lazily gebaute Typauflösung einer u-Gruppe.
+/// Lazily built type resolution of a u group.
 pub(crate) struct LazyResolver<'a> {
     db: &'a Db,
     realm: &'a Nat,
@@ -125,11 +125,11 @@ pub(crate) struct LazyResolver<'a> {
     fast: Option<FastTyp>,
 }
 
-/// Typ ohne `FieldDef`-Zugriff (nur zum Überspringen).
+/// Type without `FieldDef` access (only for skipping).
 enum FastTyp {
     No,
     Fixed(TypeCode),
-    /// span, Typ je Offset (dicht, Index = Offset)
+    /// span, type per offset (dense, index = offset)
     Packed(u64, Vec<Option<TypeCode>>),
 }
 
@@ -147,7 +147,7 @@ impl<'a> LazyResolver<'a> {
         let (db, realm, u) = (self.db, self.realm, self.u);
         let r = self.r.get_or_insert_with(|| db.field_resolver(realm, u));
         r.get(db, realm, u, v)?
-            .ok_or_else(|| Error::Corruption(format!("R{realm},u{u},v{v}: Typ nicht ableitbar")))
+            .ok_or_else(|| Error::Corruption(format!("R{realm},u{u},v{v}: type cannot be derived")))
     }
 
     #[inline]
@@ -179,7 +179,7 @@ impl<'a> LazyResolver<'a> {
         }
     }
 
-    /// Wert der Zelle dekodieren (Semantik `_decode_sparse_record`).
+    /// Decodes the cell value (semantics of `_decode_sparse_record`).
     pub(crate) fn decode(&mut self, h: &CellHead, raw: &[u8], p: &mut usize) -> Result<SVal> {
         if h.tomb {
             return Ok(SVal::Tomb);
@@ -195,7 +195,7 @@ impl<'a> LazyResolver<'a> {
         Ok(SVal::V(decode_value(&f, raw, p)?))
     }
 
-    /// Wert der Zelle überspringen.
+    /// Skips the cell value.
     pub(crate) fn skip(&mut self, h: &CellHead, raw: &[u8], p: &mut usize) -> Result<()> {
         if h.tomb || h.null {
             return Ok(());
@@ -216,11 +216,11 @@ impl<'a> LazyResolver<'a> {
 }
 
 impl Db {
-    /// Dekodiert eine u-Gruppe (`_decode_sparse_record`), Typauflösung
-    /// einmal pro Gruppe statt pro Zelle.
-    /// `_decode_sparse_selected` der v0.27 (Indexaufbau): Typ zuerst aus der
-    /// Extension-Definition, dann aus dem Layout; Abbruch nach der ersten
-    /// Zelle mit `v > max_v` (wie Python, ohne Restbytes-Prüfung).
+    /// Decodes a u group (`_decode_sparse_record`), type resolution
+    /// once per group instead of per cell.
+    /// `_decode_sparse_selected` (index build): type first from the
+    /// extension definition, then from the layout; stops after the first
+    /// cell with `v > max_v` (without a trailing-bytes check).
     pub(crate) fn decode_sparse_selected(&self, realm: &Nat, u: &Nat, raw: &[u8], max_v: &Nat) -> Result<Vec<(Nat, SparseCellMeta)>> {
         if raw.is_empty() {
             return Ok(Vec::new());
@@ -278,13 +278,13 @@ impl Db {
             prev = h.v;
         }
         if p != raw.len() {
-            return Err(Error::Corruption("SPARSE Record Restbytes".into()));
+            return Err(Error::Corruption("SPARSE record trailing bytes".into()));
         }
         Ok(out)
     }
 
-    /// Vollständiger Durchlauf eines Records ohne Dekodierung: v-Bereich und
-    /// Sprungmarken. `None` für einen leeren Record.
+    /// Full pass over a record without decoding: v range and
+    /// checkpoints. `None` for an empty record.
     fn scan_record(&self, realm: &Nat, u: &Nat, raw: &[u8], block_offset: u64, rel: usize) -> Result<Option<RecSpan>> {
         if raw.is_empty() {
             return Ok(None);
@@ -294,7 +294,7 @@ impl Db {
         let count = get_vu_u64(raw, &mut p, "SPARSE count")?;
         if count == 0 {
             if p != raw.len() {
-                return Err(Error::Corruption("SPARSE Record Restbytes".into()));
+                return Err(Error::Corruption("SPARSE record trailing bytes".into()));
             }
             return Ok(None);
         }
@@ -305,7 +305,7 @@ impl Db {
             let pos = p;
             let h = read_head(raw, &mut p, &prev, realm)?;
             if i % CK_EVERY == 0 {
-                let pos = u32::try_from(pos).map_err(|_| Error::Corruption("SPARSE Record zu gross".into()))?;
+                let pos = u32::try_from(pos).map_err(|_| Error::Corruption("SPARSE record too large".into()))?;
                 ck.push(Ck { v: h.v.clone(), prev: prev.clone(), pos, idx: i });
             }
             if i == 0 {
@@ -315,7 +315,7 @@ impl Db {
             prev = h.v;
         }
         if p != raw.len() {
-            return Err(Error::Corruption("SPARSE Record Restbytes".into()));
+            return Err(Error::Corruption("SPARSE record trailing bytes".into()));
         }
         Ok(Some(RecSpan { block_offset, rel, len: raw.len(), count, v_first, v_last: prev, ck }))
     }
@@ -327,7 +327,7 @@ impl Db {
         self.scan_record(realm, u, &payload[rel..rel + len], seg.block_offset, rel)
     }
 
-    /// v-Index der u-Gruppe (gecacht).
+    /// v index of the u group (cached).
     pub(crate) fn sparse_uindex(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<Option<Arc<UIndex>>> {
         let Some(idx) = self.sparse.get(&(realm.clone(), lane)) else {
             return Ok(None);
@@ -341,9 +341,9 @@ impl Db {
         let mut hits = Vec::new();
         idx.iv.stab(u, &mut hits);
         hits.sort_unstable();
-        // Geschwister-u-Gruppen mit derselben Segmentmenge (COLUMN: alle
-        // Felder liegen in denselben Blöcken) im selben Durchlauf indexieren,
-        // damit jeder Block nur einmal gelesen wird.
+        // Index sibling u groups with the same segment set (COLUMN: all
+        // fields live in the same blocks) in the same pass,
+        // so that each block is read only once.
         let mut us: Vec<Nat> = vec![u.clone()];
         if let Some(&first) = hits.first() {
             let bi = self.sparse_block_index(&idx.segs[first])?;
@@ -388,7 +388,7 @@ impl Db {
             }
         }
         let mut result = None;
-        // angefragte u-Gruppe zuletzt speichern (überlebt eine Budgetleerung)
+        // store the requested u group last (survives a budget flush)
         for (k, ui) in uis.into_iter().enumerate().rev() {
             let arc = Arc::new(ui);
             self.store_uindex((realm.clone(), lane, us[k].clone()), arc.clone());
@@ -416,9 +416,9 @@ impl Db {
         c.sparse_uindex.insert(key, ui);
     }
 
-    /// Nach dem Schreiben (und Registrieren) eines Sparse-Blocks: gecachte
-    /// v-Indizes desselben `(realm, lane)` fortschreiben; betroffene
-    /// u-Gruppen erhalten den neuen Record.
+    /// After writing (and registering) a sparse block: update cached
+    /// v indexes of the same `(realm, lane)`; affected
+    /// u groups receive the new record.
     pub(crate) fn uindex_note_written(&mut self, realm: &Nat, lane: Lane, us: &[Nat]) {
         let Some(idx) = self.sparse.get(&(realm.clone(), lane)) else {
             return;
@@ -439,7 +439,7 @@ impl Db {
                 let mut c = self.cache();
                 c.uindex_ck = c.uindex_ck.saturating_sub(ui.ck_count());
             }
-            // nur fortschreiben, wenn der Index bis zum Vorgängersegment aktuell war
+            // only update if the index was current up to the previous segment
             if ui.segs_seen != seg_idx {
                 continue;
             }
@@ -455,7 +455,7 @@ impl Db {
         }
     }
 
-    /// Neuester Zustand einer Sparse-Zelle oder `None` (nie geschrieben).
+    /// Newest state of a sparse cell or `None` (never written).
     pub(crate) fn sparse_point(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<SVal>> {
         let Some(ui) = self.sparse_uindex(realm, u, lane)? else {
             return Ok(None);
@@ -475,7 +475,7 @@ impl Db {
         Ok(None)
     }
 
-    /// Neueste Zustände aller Zellen mit `lo <= v <= hi` (inkl. Tombstones).
+    /// Newest states of all cells with `lo <= v <= hi` (incl. tombstones).
     pub(crate) fn sparse_range(&self, realm: &Nat, u: &Nat, lo: &Nat, hi: &Nat, lane: Lane) -> Result<BTreeMap<Nat, SVal>> {
         let mut out = BTreeMap::new();
         if hi < lo {
@@ -498,7 +498,7 @@ impl Db {
     }
 }
 
-/// Sprungmarke mit größtem `v <= x` (oder die erste).
+/// Checkpoint with the largest `v <= x` (or the first one).
 fn start_ck<'r>(r: &'r RecSpan, x: &Nat) -> &'r Ck {
     let i = r.ck.partition_point(|c| &c.v <= x);
     &r.ck[i.saturating_sub(1)]

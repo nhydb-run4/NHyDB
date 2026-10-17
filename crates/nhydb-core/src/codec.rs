@@ -1,4 +1,4 @@
-//! Datentypen, Felddefinitionen und Wert-Codec (v0.14 `enc_value`/`dec_value`).
+//! Data types, field definitions and value codec (`enc_value`/`dec_value`).
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -78,7 +78,7 @@ impl TypeCode {
         self as u8
     }
 
-    /// Größe fester Typen in Bytes.
+    /// Size of fixed-width types in bytes.
     pub fn fixed_size(self) -> Option<usize> {
         Some(match self {
             TypeCode::U8 | TypeCode::I8 | TypeCode::Bool => 1,
@@ -89,7 +89,7 @@ impl TypeCode {
         })
     }
 
-    /// Ganzzahliger Wertebereich fester Integer-Typen.
+    /// Integer value range of fixed-width integer types.
     fn int_range(self) -> Option<(i128, i128)> {
         Some(match self {
             TypeCode::U8 => (0, u8::MAX as i128),
@@ -105,7 +105,7 @@ impl TypeCode {
     }
 }
 
-/// Enum-Abbildung Label → Code (Einfügereihenfolge erhalten).
+/// Enum mapping label → code (insertion order preserved).
 pub type EnumMap = Vec<(String, i64)>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,8 +126,8 @@ impl FieldDef {
         self.enum_map.as_ref()?.iter().find(|(k, _)| k == label).map(|(_, v)| *v)
     }
 
-    /// Rückabbildung Code → Label (bei doppelten Codes gewinnt der letzte
-    /// Eintrag, wie beim Python-dict-Comprehension).
+    /// Reverse mapping code → label (for duplicate codes the last entry
+    /// wins, as with a Python dict comprehension).
     pub fn enum_label(&self, code: i64) -> Option<&str> {
         self.enum_map.as_ref()?.iter().rev().find(|(_, v)| *v == code).map(|(k, _)| k.as_str())
     }
@@ -144,18 +144,18 @@ pub fn enum_from_val(v: &Val) -> Result<Option<EnumMap>> {
             let mut out = Vec::with_capacity(m.len());
             for (k, x) in m {
                 let code = int_like(x).and_then(|b| b.to_i64()).ok_or_else(|| {
-                    Error::Value(format!("Enum-Code fuer {k:?} ist keine Ganzzahl"))
+                    Error::Value(format!("enum code for {k:?} is not an integer"))
                 })?;
                 out.push((k.clone(), code));
             }
             Ok(Some(out))
         }
-        _ => Err(Error::Schema("enum muss ein Dictionary sein".into())),
+        _ => Err(Error::Schema("enum must be a dictionary".into())),
     }
 }
 
-/// Python `int(value)` für numerische Werte (float wird abgeschnitten,
-/// numerische Strings werden geparst).
+/// Python `int(value)` for numeric values (floats are truncated,
+/// numeric strings are parsed).
 pub fn int_like(v: &Val) -> Option<BigInt> {
     match v {
         Val::Bool(b) => Some(BigInt::from(*b as i64)),
@@ -174,10 +174,10 @@ pub fn int_like(v: &Val) -> Option<BigInt> {
 }
 
 fn value_error_fit(f: &FieldDef, value: &Val) -> Error {
-    Error::Value(format!("{}: {} passt nicht in {}", f.name, value.py_repr(), f.typ.name()))
+    Error::Value(format!("{}: {} does not fit into {}", f.name, value.py_repr(), f.typ.name()))
 }
 
-/// Wendet die Enum-Abbildung an (`_enum_to_raw`).
+/// Applies the enum mapping (`_enum_to_raw`).
 fn enum_to_raw(f: &FieldDef, value: &Val) -> Result<Option<Val>> {
     if f.enum_map.is_none() {
         return Ok(None);
@@ -185,7 +185,7 @@ fn enum_to_raw(f: &FieldDef, value: &Val) -> Result<Option<Val>> {
     if let Val::Str(s) = value {
         return match f.enum_code(s) {
             Some(c) => Ok(Some(Val::Int(c))),
-            None => Err(Error::Value(format!("{}: unbekannter Enumwert {}", f.name, value.py_repr()))),
+            None => Err(Error::Value(format!("{}: unknown enum value {}", f.name, value.py_repr()))),
         };
     }
     match int_like(value) {
@@ -194,14 +194,14 @@ fn enum_to_raw(f: &FieldDef, value: &Val) -> Result<Option<Val>> {
     }
 }
 
-/// Kodiert einen Wert gemäß Feldtyp (inkl. Enum) und hängt die Bytes an.
+/// Encodes a value according to the field type (including enum) and appends the bytes.
 pub fn encode_value(f: &FieldDef, value: &Val, out: &mut Vec<u8>) -> Result<()> {
     let mapped = enum_to_raw(f, value)?;
     let value = mapped.as_ref().unwrap_or(value);
     encode_raw(f, f.typ, value, out)
 }
 
-/// Kodierung ohne Enum-Abbildung.
+/// Encoding without enum mapping.
 pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -> Result<()> {
     match typ {
         TypeCode::F32 => {
@@ -222,7 +222,7 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
                 Error::Type(format!("int() argument must be a string or a number, not {}", value.py_repr()))
             })?;
             if n.sign() == Sign::Minus {
-                return Err(Error::Value("varuint erwartet n>=0".into()));
+                return Err(Error::Value("varuint expects n>=0".into()));
             }
             match n.to_u64() {
                 Some(x) => put_vu64(out, x),
@@ -271,7 +271,7 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
             out.extend_from_slice(&raw);
         }
         _ => {
-            // feste Integer-Typen (struct.pack verlangt echte Ganzzahlen)
+            // fixed-width integer types (struct.pack requires real integers)
             let (lo, hi) = typ.int_range().unwrap();
             let n: i128 = match value {
                 Val::Bool(b) => *b as i128,
@@ -299,7 +299,7 @@ fn float_like(v: &Val) -> Option<f64> {
     }
 }
 
-/// Dekodiert einen Wert (inkl. Enum-Rückabbildung) ab `*pos`.
+/// Decodes a value (including reverse enum mapping) starting at `*pos`.
 pub fn decode_value(f: &FieldDef, buf: &[u8], pos: &mut usize) -> Result<Val> {
     let raw = decode_raw(f, f.typ, buf, pos)?;
     Ok(enum_from_raw(f, raw))
@@ -324,7 +324,7 @@ pub fn decode_raw(f: &FieldDef, typ: TypeCode, buf: &[u8], pos: &mut usize) -> R
         let end = *pos + size;
         if end > buf.len() {
             let _ = &f.name;
-            return Err(Error::Corruption("Fixed-Wert unvollstaendig".into()));
+            return Err(Error::Corruption("fixed-width value incomplete".into()));
         }
         let b = &buf[*pos..end];
         *pos = end;
@@ -354,16 +354,16 @@ pub fn decode_raw(f: &FieldDef, typ: TypeCode, buf: &[u8], pos: &mut usize) -> R
         }
         TypeCode::Utf8 | TypeCode::Bytes => {
             let n = get_vu(buf, pos)?;
-            let n = n.as_u64().ok_or_else(|| Error::Corruption("Laengenwert endet hinter Payload".into()))?;
+            let n = n.as_u64().ok_or_else(|| Error::Corruption("length value ends beyond the payload".into()))?;
             let end = pos.checked_add(n as usize).filter(|e| *e <= buf.len()).ok_or_else(|| {
-                Error::Corruption("Laengenwert endet hinter Payload".into())
+                Error::Corruption("length value ends beyond the payload".into())
             })?;
             let raw = &buf[*pos..end];
             *pos = end;
             if typ == TypeCode::Utf8 {
                 match std::str::from_utf8(raw) {
                     Ok(s) => Ok(Val::Str(s.to_string())),
-                    Err(e) => Err(Error::Corruption(format!("{}: UTF-8 ungueltig: {e}", f.name))),
+                    Err(e) => Err(Error::Corruption(format!("{}: invalid UTF-8: {e}", f.name))),
                 }
             } else {
                 Ok(Val::Bytes(raw.to_vec()))
@@ -373,18 +373,18 @@ pub fn decode_raw(f: &FieldDef, typ: TypeCode, buf: &[u8], pos: &mut usize) -> R
     }
 }
 
-/// Überspringt einen kodierten Wert ohne ihn zu materialisieren.
+/// Skips an encoded value without materializing it.
 pub fn skip_value(f: &FieldDef, buf: &[u8], pos: &mut usize) -> Result<()> {
     skip_raw(f.typ, buf, pos, || f.name.clone())
 }
 
-/// Überspringt einen Wert des Typs `typ`; `name` liefert den Feldnamen nur
-/// für die Fehlermeldung.
+/// Skips a value of type `typ`; `name` supplies the field name for the
+/// error message only.
 pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() -> String) -> Result<()> {
     if let Some(size) = typ.fixed_size() {
         if *pos + size > buf.len() {
             let _ = name;
-            return Err(Error::Corruption("Fixed-Wert unvollstaendig".into()));
+            return Err(Error::Corruption("fixed-width value incomplete".into()));
         }
         *pos += size;
         return Ok(());
@@ -393,7 +393,7 @@ pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() 
         TypeCode::VarUInt | TypeCode::VarInt => {
             loop {
                 let Some(&b) = buf.get(*pos) else {
-                    return Err(Error::Corruption("Varuint endet zu frueh".into()));
+                    return Err(Error::Corruption("Varuint ends prematurely".into()));
                 };
                 *pos += 1;
                 if b < 0x80 {
@@ -404,7 +404,7 @@ pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() 
         _ => {
             let n = get_vu(buf, pos)?.as_u64().unwrap_or(u64::MAX);
             let end = pos.checked_add(n as usize).filter(|e| *e <= buf.len()).ok_or_else(|| {
-                Error::Corruption("Laengenwert zeigt ueber Record hinaus".into())
+                Error::Corruption("length value points beyond the record".into())
             })?;
             *pos = end;
             Ok(())
@@ -412,7 +412,7 @@ pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() 
     }
 }
 
-/// Python-`int(x)` als Nat (für positive Parameter).
+/// Python `int(x)` as Nat (for positive parameters).
 pub fn val_to_nat(v: &Val) -> Option<Nat> {
     let b = int_like(v)?;
     if b.sign() == Sign::Minus { None } else { Some(Nat::from(b.magnitude().clone())) }

@@ -1,4 +1,4 @@
-"""NumPy-Batch-API: gleiche Ergebnisse wie die Einzel-/Listen-API, strenge Prüfung."""
+"""NumPy batch API: same results as the single-item/list API, strict validation."""
 import numpy as np
 import pytest
 
@@ -72,14 +72,14 @@ def test_numpy_roundtrip_read(tmp_path):
     cols = _cols(n)
     db = _db(tmp_path / "a.nhydb")
     db.put_numpy_batch(1, 1, cols)
-    db.put_points(1, [(5, 4, 12345)])          # Overlay auf BASE-Feld
-    db.delete(1, 7)                            # gelöschter Record
+    db.put_points(1, [(5, 4, 12345)])          # overlay on a BASE field
+    db.delete(1, 7)                            # deleted record
     out = db.read_numpy(1, 1, n + 2)
     assert out["_present"].dtype == bool and out["_present"].sum() == n - 1
     assert not out["_present"][6] and not out["_present"][n] and not out["_present"][n + 1]
     assert out["N"].dtype == np.uint64 and out["N"][9] == 10
     assert out["station"][4] == 12345
-    assert out["lage"][1] == "Gz"               # u=2 → Code 2 → Label (Objektarray)
+    assert out["lage"][1] == "Gz"               # u=2 → code 2 → label (object array)
     assert out["x"].dtype == np.float64 and out["x"][0] == pytest.approx(1 / 7)
     assert out["y"].dtype == np.float32
     assert out["ok"].dtype == bool and out["ok"][1]
@@ -93,9 +93,9 @@ def test_dtype_variants(tmp_path):
     n = 10
     base = _cols(n)
     variants = [
-        np.arange(1, n + 1, dtype=">u8"),            # Fremd-Endianness
-        np.arange(1, 2 * n + 1, dtype=np.int32)[::2],  # nicht zusammenhängend
-        list(range(1, n + 1)),                        # Python-Liste
+        np.arange(1, n + 1, dtype=">u8"),            # foreign endianness
+        np.arange(1, 2 * n + 1, dtype=np.int32)[::2],  # non-contiguous
+        list(range(1, n + 1)),                        # Python list
         np.arange(1, n + 1, dtype=np.uint16),
     ]
     for k, v in enumerate(variants):
@@ -109,16 +109,16 @@ def test_numpy_errors(tmp_path):
     db = _db(tmp_path / "a.nhydb")
     c = _cols(10)
     with pytest.raises(ValueError):
-        db.put_numpy_batch(1, 1, dict(c, N=np.arange(5, dtype=np.uint64)))  # Längen ungleich
+        db.put_numpy_batch(1, 1, dict(c, N=np.arange(5, dtype=np.uint64)))  # length mismatch
     with pytest.raises(ValueError):
-        db.put_numpy_batch(1, 1, dict(c, N=np.arange(-1, 9, dtype=np.int64)))  # negativ → varuint
+        db.put_numpy_batch(1, 1, dict(c, N=np.arange(-1, 9, dtype=np.int64)))  # negative → varuint
     with pytest.raises(ValueError):
-        db.put_numpy_batch(1, 1, dict(c, s16=np.full(10, 40000, dtype=np.int64)))  # Bereich i16
+        db.put_numpy_batch(1, 1, dict(c, s16=np.full(10, 40000, dtype=np.int64)))  # i16 range
     with pytest.raises(nhydb.SchemaError):
         db.put_numpy_batch(1, 1, {k: v for k, v in c.items() if k != "tp"})
     with pytest.raises(ValueError):
         db.put_numpy_batch(1, 1, dict(c, lage=np.array(["XX"] * 10, dtype=object)))
-    assert db.stats()["storage"]["physical_dense_records"] == 0  # nichts geschrieben
+    assert db.stats()["storage"]["physical_dense_records"] == 0  # nothing written
 
 
 def test_put_objects_numpy_matches_objects_batch(tmp_path):

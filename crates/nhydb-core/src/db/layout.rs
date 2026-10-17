@@ -1,5 +1,5 @@
-//! Layouts (CLASSIC/COLUMN/PACKED/CUSTOM), Mixed-Realm-Routing,
-//! Raumeigentumsschutz und sichere Layout-Evolution.
+//! Layouts (CLASSIC/COLUMN/PACKED/CUSTOM), mixed-realm routing,
+//! space-ownership protection and safe layout evolution.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::vmap;
 
 use super::Db;
 
-/// Eingabe für `create_layout`.
+/// Input for `create_layout`.
 #[derive(Clone, Debug)]
 pub struct LayoutSpec {
     pub layout_id: u64,
@@ -58,7 +58,7 @@ impl LayoutSpec {
     }
 }
 
-/// Layout-Referenz per ID oder eindeutigem Namen.
+/// Layout reference by ID or unique name.
 #[derive(Clone, Debug)]
 pub enum LayoutRef {
     Id(u64),
@@ -71,13 +71,13 @@ impl From<u64> for LayoutRef {
     }
 }
 
-/// Änderungen an einer Layout-Evolution (`None` = unverändert).
+/// Changes for a layout evolution (`None` = unchanged).
 #[derive(Clone, Debug, Default)]
 pub struct EvolveSpec {
     pub name: Option<String>,
     pub description: Option<String>,
     pub u_start: Option<Nat>,
-    /// `None` = unverändert; `Some(None)` = unbegrenzt.
+    /// `None` = unchanged; `Some(None)` = unbounded.
     pub u_end: Option<Option<Nat>>,
     pub priority: Option<i64>,
     pub add_fields: Vec<Val>,
@@ -124,12 +124,12 @@ pub(crate) fn lane_from_val(v: &Val) -> Result<Lane> {
         Val::Str(s) => address::normalize_lane_str(s),
         other => match other.as_i64() {
             Some(i) => address::normalize_lane_int(i),
-            None => Err(Error::Value("lane muss 0 oder 1 sein".into())),
+            None => Err(Error::Value("lane must be 0 or 1".into())),
         },
     }
 }
 
-/// Python `int(x)` für positive Koordinaten (negativ → 0 → Positivitätsfehler).
+/// Python `int(x)` for positive coordinates (negative → 0 → positivity error).
 pub(crate) fn coord(v: &Val) -> Result<Nat> {
     match int_like(v) {
         Some(b) if b.sign() == Sign::Minus => Ok(Nat::ZERO),
@@ -182,7 +182,7 @@ impl Db {
             if p.has(PluginMethod::Spacemap) {
                 let sm = p.spacemap(lay)?;
                 if !matches!(sm, Val::Map(_)) {
-                    return Err(Error::Schema(format!("CUSTOM Plugin '{}': spacemap() muss dict liefern", lay.plugin)));
+                    return Err(Error::Schema(format!("CUSTOM plugin '{}': spacemap() must return a dict", lay.plugin)));
                 }
                 return Ok(sm);
             }
@@ -213,14 +213,14 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// Kandidaten in Gewinnerreihenfolge (`layout_candidates`).
+    /// Candidates in winner order (`layout_candidates`).
     pub fn layout_candidates(&self, realm: &Nat, u: &Nat) -> Vec<&LayoutDef> {
         let mut c: Vec<&LayoutDef> = self.realm_layouts(realm).into_iter().filter(|l| l.contains_u(u)).collect();
         c.sort_by(|a, b| LayoutDef::sort_cmp(b, a));
         c
     }
 
-    /// Gewinnendes Layout an `(realm, u)`.
+    /// Winning layout at `(realm, u)`.
     pub fn layout_at(&self, realm: &Nat, u: &Nat) -> Option<&LayoutDef> {
         let ids = self.layouts_by_realm.get(realm)?;
         let mut best: Option<&LayoutDef> = None;
@@ -415,29 +415,29 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Anlegen
+    // Creation
     // ------------------------------------------------------------------
 
     pub fn create_layout(&mut self, spec: LayoutSpec) -> Result<LayoutDef> {
         let realm_id = spec.realm_id.clone();
         self.require_realm(&realm_id)?;
         if spec.layout_id == 0 {
-            return Err(Error::Value("layout_id muss > 0 sein".into()));
+            return Err(Error::Value("layout_id must be > 0".into()));
         }
         if self.math_layouts.contains_key(&spec.layout_id) {
-            return Err(Error::Schema(format!("Layout-ID {} gehoert bereits einem MATH Layout", spec.layout_id)));
+            return Err(Error::Schema(format!("layout ID {} already belongs to a MATH layout", spec.layout_id)));
         }
         self.deny_math_realm(&realm_id)?;
         let old_layout = self.layouts.get(&spec.layout_id).cloned();
         if let Some(old) = &old_layout {
             if !spec.replace {
                 return Err(Error::Schema(format!(
-                    "Layout {} existiert bereits; fuer Evolution replace=True verwenden",
+                    "layout {} already exists; use replace=True for evolution",
                     spec.layout_id
                 )));
             }
             if old.realm_id != realm_id {
-                return Err(Error::Schema("ein bestehendes Layout darf den Realm nicht wechseln".into()));
+                return Err(Error::Schema("an existing layout must not change its realm".into()));
             }
         }
         let mut params = if let Val::Map(_) = spec.params { spec.params.clone() } else { Val::map() };
@@ -445,11 +445,11 @@ impl Db {
         if let Some(sid) = spec.shape_id {
             match self.shapes.get(&sid) {
                 Some(sh) if sh.realm_id == realm_id => {}
-                _ => return Err(Error::Schema("Shape fehlt/passt nicht zum Realm".into())),
+                _ => return Err(Error::Schema("shape missing or does not match the realm".into())),
             }
         }
         if kind_u == "CLASSIC" && spec.shape_id.is_none() {
-            return Err(Error::Schema("CLASSIC benoetigt shape_id".into()));
+            return Err(Error::Schema("CLASSIC requires shape_id".into()));
         }
         if kind_u == "PACKED" {
             let span = match params.get("span") {
@@ -465,10 +465,10 @@ impl Db {
             params.set("span", Val::nat(&span));
             params.set("u", Val::nat(&pu));
             if &span > realm_span() {
-                return Err(Error::Schema("PACKED span darf REALM_SPAN nicht ueberschreiten".into()));
+                return Err(Error::Schema("PACKED span must not exceed REALM_SPAN".into()));
             }
             if pu < spec.u_start || spec.u_end.as_ref().map(|e| &pu > e).unwrap_or(false) {
-                return Err(Error::Schema("PACKED u muss im Layout-u-Bereich liegen".into()));
+                return Err(Error::Schema("PACKED u must lie within the layout u range".into()));
             }
         }
         if matches!(kind_u.as_str(), "COLUMN" | "PACKED" | "CUSTOM") {
@@ -480,28 +480,28 @@ impl Db {
                 let name_f = lf.name();
                 let typ = lf.type_name();
                 if TypeCode::from_name(&typ).is_none() {
-                    return Err(Error::Schema(format!("unbekannter Datentyp '{typ}'")));
+                    return Err(Error::Schema(format!("unknown data type '{typ}'")));
                 }
                 if !seen_n.insert(name_f.clone()) {
-                    return Err(Error::Schema(format!("Layout-Feldname '{name_f}' ist doppelt")));
+                    return Err(Error::Schema(format!("layout field name '{name_f}' is duplicated")));
                 }
                 if kind_u == "COLUMN" {
                     let pos = lf.u()?;
                     address::require_positive("column u", &pos)?;
                     if !seen_pos.insert(Val::nat(&pos).py_repr()) {
-                        return Err(Error::Schema("COLUMN-Felder muessen eindeutige u besitzen".into()));
+                        return Err(Error::Schema("COLUMN fields must have unique u".into()));
                     }
                     if pos < spec.u_start || spec.u_end.as_ref().map(|e| &pos > e).unwrap_or(false) {
-                        return Err(Error::Schema(format!("COLUMN-Feld u{pos} liegt ausserhalb des Layout-Bereichs")));
+                        return Err(Error::Schema(format!("COLUMN field u{pos} lies outside the layout range")));
                     }
                 } else if kind_u == "PACKED" {
                     let pos = lf.offset()?;
                     let span = params.get("span").and_then(|s| s.as_bigint()).unwrap_or_default();
                     if pos.sign() == Sign::Minus || pos >= span {
-                        return Err(Error::Schema("PACKED field offset ausserhalb span".into()));
+                        return Err(Error::Schema("PACKED field offset outside span".into()));
                     }
                     if !seen_pos.insert(pos.to_string()) {
-                        return Err(Error::Schema("PACKED-Felder muessen eindeutige offsets besitzen".into()));
+                        return Err(Error::Schema("PACKED fields must have unique offsets".into()));
                     }
                 }
             }
@@ -517,7 +517,7 @@ impl Db {
             }
         }
         if kind_u == "CUSTOM" && spec.plugin.trim().is_empty() {
-            return Err(Error::Schema("CUSTOM benoetigt eine persistierte Plugin-ID".into()));
+            return Err(Error::Schema("CUSTOM requires a persisted plugin ID".into()));
         }
         let kind = LayoutKind::parse(&kind_u)?;
         let sm = if kind.is_builtin() {
@@ -525,7 +525,7 @@ impl Db {
             if let Some(s) = &spec.spacemap {
                 if s != &canonical {
                     return Err(Error::Schema(format!(
-                        "{} SpaceMap ist in V0.15 read-only und wird aus der echten Mappinglogik abgeleitet",
+                        "{} SpaceMap is read-only and derived from the actual mapping logic",
                         kind.name()
                     )));
                 }
@@ -560,7 +560,7 @@ impl Db {
         let imp = plan.get("occupied_impact").cloned().unwrap_or_default();
         if imp.get("unsafe").map(|v| v.is_truthy()).unwrap_or(false) {
             return Err(Error::Schema(format!(
-                "Layout-Aenderung wuerde bereits materialisierten Raum neu routen (dense<={}, sparse_cells={}, sample_u={}). Vorher Routing-/Migrationsplan pruefen.",
+                "layout change would re-route already materialized space (dense<={}, sparse_cells={}, sample_u={}). Check the routing/migration plan first.",
                 imp.get("dense_records_at_risk_upper_bound").map(|v| v.py_repr()).unwrap_or_default(),
                 imp.get("sparse_cells_at_risk").map(|v| v.py_repr()).unwrap_or_default(),
                 imp.get("sample_u").map(|v| v.py_repr()).unwrap_or_default(),
@@ -606,7 +606,7 @@ impl Db {
         self.create_layout(s)
     }
 
-    #[allow(clippy::too_many_arguments)] // bildet die Python-Signatur (Keyword-Argumente) nach
+    #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     pub fn create_column_layout(
         &mut self,
         layout_id: u64,
@@ -683,7 +683,7 @@ impl Db {
     pub fn register_layout_plugin(&mut self, name: &str, plugin: Arc<dyn LayoutPlugin>) -> Result<()> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(Error::Value("Pluginname fehlt".into()));
+            return Err(Error::Value("plugin name missing".into()));
         }
         self.plugins.insert(name.to_string(), plugin);
         self.clear_decode_caches();
@@ -695,7 +695,7 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Diagnose / Abfrage
+    // Diagnostics / queries
     // ------------------------------------------------------------------
 
     pub fn layout_diagnostics(&self, realm: Option<&Nat>) -> Result<Val> {
@@ -708,7 +708,7 @@ impl Db {
         let (mut t_over, mut t_conf, mut t_gaps) = (0i64, 0i64, 0i64);
         for rid in realm_ids {
             if !self.realms.contains_key(&rid) {
-                return Err(Error::Schema(format!("Realm {rid} fehlt")));
+                return Err(Error::Schema(format!("realm {rid} missing")));
             }
             let mut lays = self.realm_layouts(&rid);
             let end_of = |l: &LayoutDef| l.u_end.clone().unwrap_or_else(|| big.clone());
@@ -771,7 +771,7 @@ impl Db {
             let mut risks = Vec::new();
             if classic_shapes.len() > 1 {
                 risks.push(Val::str(
-                    "mehrere CLASSIC Shapes im selben Realm; Realm-weite Extensionnamen bleiben gemeinsam",
+                    "multiple CLASSIC shapes in the same realm; realm-wide extension names remain shared",
                 ));
             }
             t_over += overlaps.len() as i64;
@@ -793,16 +793,16 @@ impl Db {
     /// `_layout_by_id`
     pub fn layout_by_ref(&self, r: &LayoutRef) -> Result<&LayoutDef> {
         match r {
-            LayoutRef::Id(id) => self.layouts.get(id).ok_or_else(|| Error::Schema(format!("Layout {id} fehlt"))),
+            LayoutRef::Id(id) => self.layouts.get(id).ok_or_else(|| Error::Schema(format!("layout {id} missing"))),
             LayoutRef::Name(name) => {
                 if let Ok(id) = name.parse::<u64>() {
-                    return self.layouts.get(&id).ok_or_else(|| Error::Schema(format!("Layout {name} fehlt")));
+                    return self.layouts.get(&id).ok_or_else(|| Error::Schema(format!("layout {name} missing")));
                 }
                 let m: Vec<&LayoutDef> = self.layouts.values().filter(|x| &x.name == name).collect();
                 match m.len() {
-                    0 => Err(Error::Schema(format!("Layout '{name}' fehlt"))),
+                    0 => Err(Error::Schema(format!("layout '{name}' missing"))),
                     1 => Ok(m[0]),
-                    _ => Err(Error::Schema(format!("Layoutname '{name}' ist nicht eindeutig; layout_id verwenden"))),
+                    _ => Err(Error::Schema(format!("layout name '{name}' is not unique; use layout_id"))),
                 }
             }
         }
@@ -833,7 +833,7 @@ impl Db {
         Ok(d)
     }
 
-    /// `get_layout(realm_id, u, layout_id)`: dict, None oder Liste.
+    /// `get_layout(realm_id, u, layout_id)`: dict, None or list.
     pub fn get_layout(&self, realm: Option<&Nat>, u: Option<&Nat>, layout: Option<&LayoutRef>) -> Result<Val> {
         let single = layout.is_some() || (realm.is_some() && u.is_some());
         let mut lays: Vec<&LayoutDef> = if let Some(r) = layout {
@@ -875,20 +875,20 @@ impl Db {
             }
         };
         if ns > old.u_start {
-            return Err(Error::Schema("Layout-Evolution darf u_start nicht nach rechts verschieben".into()));
+            return Err(Error::Schema("layout evolution must not move u_start to the right".into()));
         }
         if old.u_end.is_none() && ne.is_some() {
-            return Err(Error::Schema("unbegrenzter Layout-Bereich darf nicht verkleinert werden".into()));
+            return Err(Error::Schema("an unbounded layout range must not be shrunk".into()));
         }
         if let (Some(o), Some(n)) = (&old.u_end, &ne) {
             if n < o {
-                return Err(Error::Schema("Layout-Evolution darf u_end nicht verkleinern".into()));
+                return Err(Error::Schema("layout evolution must not decrease u_end".into()));
             }
         }
         let mut params = old.params.clone();
         if !e.add_fields.is_empty() {
             if old.kind == LayoutKind::Classic {
-                return Err(Error::Schema("CLASSIC-Felder ueber Shape/Extension-API erweitern".into()));
+                return Err(Error::Schema("extend CLASSIC fields via the shape/extension API".into()));
             }
             let mut fields: Vec<Val> = params.get("fields").and_then(|f| f.as_list()).cloned().unwrap_or_default();
             let mut names: Vec<String> = fields.iter().map(|f| crate::schema::LayoutField { raw: f }.name()).collect();
@@ -902,10 +902,10 @@ impl Db {
                         address::require_positive("column u", &pos)?;
                         let typ = lf.type_name();
                         if names.contains(&nm) || used.contains(&pos) {
-                            return Err(Error::Schema("COLUMN Evolution: Name/u bereits vorhanden".into()));
+                            return Err(Error::Schema("COLUMN evolution: name/u already exists".into()));
                         }
                         if TypeCode::from_name(&typ).is_none() {
-                            return Err(Error::Schema(format!("unbekannter Datentyp '{typ}'")));
+                            return Err(Error::Schema(format!("unknown data type '{typ}'")));
                         }
                         fields.push(f.clone());
                         names.push(nm);
@@ -929,13 +929,13 @@ impl Db {
                         let off = lf.offset()?;
                         let typ = lf.type_name();
                         if names.contains(&nm) || used.contains(&off) {
-                            return Err(Error::Schema("PACKED Evolution: Name/offset bereits vorhanden".into()));
+                            return Err(Error::Schema("PACKED evolution: name/offset already exists".into()));
                         }
                         if off.sign() == Sign::Minus || off >= span {
-                            return Err(Error::Schema("PACKED offset ausserhalb span".into()));
+                            return Err(Error::Schema("PACKED offset outside span".into()));
                         }
                         if TypeCode::from_name(&typ).is_none() {
-                            return Err(Error::Schema(format!("unbekannter Datentyp '{typ}'")));
+                            return Err(Error::Schema(format!("unknown data type '{typ}'")));
                         }
                         fields.push(f.clone());
                         names.push(nm);
@@ -948,10 +948,10 @@ impl Db {
                         let nm = lf.name();
                         let typ = lf.type_name();
                         if names.contains(&nm) {
-                            return Err(Error::Schema("CUSTOM Evolution: Feldname bereits vorhanden".into()));
+                            return Err(Error::Schema("CUSTOM evolution: field name already exists".into()));
                         }
                         if TypeCode::from_name(&typ).is_none() {
-                            return Err(Error::Schema(format!("unbekannter Datentyp '{typ}'")));
+                            return Err(Error::Schema(format!("unknown data type '{typ}'")));
                         }
                         fields.push(f.clone());
                         names.push(nm);
@@ -963,7 +963,7 @@ impl Db {
         let sm = if old.kind.is_builtin() {
             if e.spacemap_update.as_ref().map(|s| s.is_truthy()).unwrap_or(false) {
                 return Err(Error::Schema(format!(
-                    "{} SpaceMap ist read-only; sie wird aus der echten Mappinglogik abgeleitet",
+                    "{} SpaceMap is read-only; it is derived from the actual mapping logic",
                     old.kind.name()
                 )));
             }
@@ -1013,7 +1013,7 @@ impl Db {
         if !plan.get("safe").map(|v| v.is_truthy()).unwrap_or(false) {
             let imp = plan.get("occupied_impact").cloned().unwrap_or_default();
             return Err(Error::Schema(format!(
-                "UNSAFE Layout-Evolution: bereits materialisierter Raum wuerde neu geroutet (dense<={}, sparse_cells={}, sample_u={})",
+                "UNSAFE layout evolution: already materialized space would be re-routed (dense<={}, sparse_cells={}, sample_u={})",
                 imp.get("dense_records_at_risk_upper_bound").map(|v| v.py_repr()).unwrap_or_default(),
                 imp.get("sparse_cells_at_risk").map(|v| v.py_repr()).unwrap_or_default(),
                 imp.get("sample_u").map(|v| v.py_repr()).unwrap_or_default(),
@@ -1044,16 +1044,16 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Logische Adressen
+    // Logical addresses
     // ------------------------------------------------------------------
 
     fn assert_layout_address(&self, lay: &LayoutDef, addr: CellAddress) -> Result<CellAddress> {
         if addr.realm() != &lay.realm_id {
-            return Err(Error::Schema(format!("Layout {} darf Realm {} nicht verlassen", lay.layout_id, lay.realm_id)));
+            return Err(Error::Schema(format!("layout {} must not leave realm {}", lay.layout_id, lay.realm_id)));
         }
         if !lay.contains_u(addr.u()) {
             return Err(Error::Schema(format!(
-                "Layout {} erzeugt u={} ausserhalb {}..{}",
+                "layout {} produces u={} outside {}..{}",
                 lay.layout_id,
                 addr.u(),
                 lay.u_start,
@@ -1063,7 +1063,7 @@ impl Db {
         if let Some(w) = self.layout_at(&lay.realm_id, addr.u()) {
             if w.layout_id != lay.layout_id {
                 return Err(Error::Schema(format!(
-                    "Adresse wird durch Layout {} ({}) geroutet; Layout {} ist dort ueberschattet",
+                    "address is routed by layout {} ({}); layout {} is shadowed there",
                     w.layout_id, w.name, lay.layout_id
                 )));
             }
@@ -1071,8 +1071,8 @@ impl Db {
         Ok(addr)
     }
 
-    /// Logisches Objekt/Feld → Zelladresse (`logical_address`).
-    /// `field`: None, int oder str.
+    /// Logical object/field → cell address (`logical_address`).
+    /// `field`: None, int or str.
     pub fn logical_address(&self, r: &LayoutRef, object_id: &Nat, field: &Val, lane: Lane) -> Result<CellAddress> {
         let lay = self.layout_by_ref(r)?;
         address::require_positive("object_id", object_id)?;
@@ -1110,7 +1110,7 @@ impl Db {
                                 found = Some(u);
                             }
                         }
-                        found.ok_or_else(|| Error::Schema(format!("COLUMN-Feld {} unbekannt", other.py_repr())))?
+                        found.ok_or_else(|| Error::Schema(format!("COLUMN field {} unknown", other.py_repr())))?
                     }
                 };
                 let a = self.cell_address(&lay.realm_id, &u, obj, lane)?;
@@ -1121,7 +1121,7 @@ impl Db {
                 let span = lay.packed_span()?;
                 let anchor = obj.sub_u64(1).unwrap().mul(&span).add_u64(1);
                 if &anchor > realm_span() {
-                    return Err(Error::RealmLimit("PACKED record liegt ausserhalb dieses Realms".into()));
+                    return Err(Error::RealmLimit("PACKED record lies outside this realm".into()));
                 }
                 let off: BigInt = match field {
                     Val::None => BigInt::from(0),
@@ -1136,16 +1136,16 @@ impl Db {
                                 found = Some(off);
                             }
                         }
-                        found.ok_or_else(|| Error::Schema(format!("PACKED-Feld {} unbekannt", other.py_repr())))?
+                        found.ok_or_else(|| Error::Schema(format!("PACKED field {} unknown", other.py_repr())))?
                     }
                 };
                 let off = match big_to_nat_checked(&off) {
                     Some(o) if o < span => o,
-                    _ => return Err(Error::Schema("PACKED offset ausserhalb span".into())),
+                    _ => return Err(Error::Schema("PACKED offset outside span".into())),
                 };
                 let v = anchor.add(&off);
                 if &v > realm_span() {
-                    return Err(Error::RealmLimit("PACKED Feld liegt ausserhalb dieses Realms".into()));
+                    return Err(Error::RealmLimit("PACKED field lies outside this realm".into()));
                 }
                 let a = self.cell_address(&lay.realm_id, &u, &v, lane)?;
                 self.assert_layout_address(lay, a)
@@ -1154,7 +1154,7 @@ impl Db {
                 let plugin = self
                     .plugin_for(lay)
                     .filter(|p| p.has(PluginMethod::LogicalAddress))
-                    .ok_or_else(|| Error::Schema(format!("CUSTOM Layout benoetigt registriertes Plugin '{}'", lay.plugin)))?;
+                    .ok_or_else(|| Error::Schema(format!("CUSTOM layout requires registered plugin '{}'", lay.plugin)))?;
                 let result = plugin.logical_address(lay, obj, field, lane)?;
                 let a = match &result {
                     Val::Map(_) => {
@@ -1179,7 +1179,7 @@ impl Db {
                         &coord(&items[2])?,
                         lane_from_val(&items[3])?,
                     )?,
-                    _ => return Err(Error::Value("CUSTOM logical_address: ungueltiges Ergebnis".into())),
+                    _ => return Err(Error::Value("CUSTOM logical_address: invalid result".into())),
                 };
                 self.assert_layout_address(lay, a)
             }
@@ -1191,10 +1191,10 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Feldtypen / Interpretation
+    // Field types / interpretation
     // ------------------------------------------------------------------
 
-    /// Deklarierter Feldtyp einer Adresse (`_field_meta_for_address`).
+    /// Declared field type of an address (`_field_meta_for_address`).
     pub fn field_meta_for_address(&self, realm: &Nat, u: &Nat, v: &Nat) -> Result<Option<FieldDef>> {
         let key = (realm.clone(), u.clone(), v.clone());
         if let Some(c) = self.cache().field_meta.get(&key) {
@@ -1248,7 +1248,7 @@ impl Db {
                         if t.is_truthy() {
                             let tn = t.py_str();
                             let typ = TypeCode::from_name(&tn)
-                                .ok_or_else(|| Error::Schema(format!("unbekannter Datentyp '{tn}'")))?;
+                                .ok_or_else(|| Error::Schema(format!("unknown data type '{tn}'")))?;
                             r = Some(FieldDef::new(v.clone(), format!("v{v}"), typ));
                         }
                     }
@@ -1258,9 +1258,9 @@ impl Db {
         })
     }
 
-    /// Typauflösung für alle Zellen einer u-Gruppe (gleiche Semantik wie
-    /// `compute_field_meta`, aber ohne Arbeit pro Zelle). Jeder Fehler beim
-    /// Aufbau führt auf den exakten Einzelpfad zurück.
+    /// Type resolution for all cells of a u group (same semantics as
+    /// `compute_field_meta`, but without per-cell work). Any error while
+    /// building it falls back to the exact per-cell path.
     pub(crate) fn field_resolver(&self, realm: &Nat, u: &Nat) -> FieldResolver<'_> {
         let Some(lay) = self.layout_at(realm, u) else {
             return FieldResolver::Absent;
@@ -1294,7 +1294,7 @@ impl Db {
                     let Ok(off) = f.offset() else {
                         return FieldResolver::Dynamic;
                     };
-                    // negative Offsets treffen nie; spätere Duplikate sind unerreichbar
+                    // negative offsets never match; later duplicates are unreachable
                     let Some(off) = off.to_biguint().map(Nat::from) else {
                         continue;
                     };
@@ -1368,7 +1368,7 @@ impl Db {
                         let mut out = p.describe(lay, &addr.to_val())?;
                         if !matches!(out, Val::Map(_)) {
                             out = if out.is_truthy() {
-                                return Err(Error::Type("CUSTOM describe() muss dict liefern".into()));
+                                return Err(Error::Type("CUSTOM describe() must return a dict".into()));
                             } else {
                                 Val::map()
                             };
@@ -1406,7 +1406,7 @@ impl Db {
         }
     }
 
-    /// Record-ID aus einer Interpretation (`interp.get("record")`).
+    /// Record ID from an interpretation (`interp.get("record")`).
     pub(crate) fn interp_record(interp: &Val) -> Option<Nat> {
         match interp.get("record") {
             None | Some(Val::None) => None,
@@ -1415,16 +1415,16 @@ impl Db {
     }
 }
 
-/// Vorab aufgelöste Feldtypen einer u-Gruppe (siehe `Db::field_resolver`).
+/// Pre-resolved field types of a u group (see `Db::field_resolver`).
 pub enum FieldResolver<'a> {
-    /// kein Layout an dieser Stelle
+    /// no layout at this position
     Absent,
     Classic { realm: Nat, shape: Option<&'a crate::schema::ShapeDef> },
-    /// COLUMN: ein Typ für die ganze u-Gruppe
+    /// COLUMN: one type for the whole u group
     Fixed(Option<FieldDef>),
-    /// PACKED: Offset → Feld
+    /// PACKED: offset → field
     Packed { span: Nat, fields: Vec<(Nat, FieldDef)> },
-    /// CUSTOM oder Fehlerfall: `field_meta_for_address` je Zelle
+    /// CUSTOM or error case: `field_meta_for_address` per cell
     Dynamic,
 }
 

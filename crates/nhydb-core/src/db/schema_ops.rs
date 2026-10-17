@@ -1,4 +1,4 @@
-//! Realms, Shapes, Extensions, Indexdefinitionen und Adress-APIs.
+//! Realms, shapes, extensions, index definitions and address APIs.
 
 use crate::address::{self, realm_span, validate_local_v, CellAddress, DynAddress, Lane};
 use crate::codec::{FieldDef, TypeCode};
@@ -71,32 +71,32 @@ impl Db {
     fn validate_base_shape(&self, realm_id: &Nat, shape: &ShapeDef) -> Result<()> {
         for (i, f) in shape.fields.iter().enumerate() {
             if f.v != (i as u64 + 1) {
-                return Err(Error::Schema("BASE-Felder muessen dicht bei v=1 beginnen: v1..vN".into()));
+                return Err(Error::Schema("BASE fields must be contiguous starting at v=1: v1..vN".into()));
             }
         }
         let realm = self.require_realm(realm_id)?;
         if let Some(last) = shape.fields.last() {
             if !realm.base_reserve_to.is_zero() && last.v > realm.base_reserve_to {
                 return Err(Error::Schema(format!(
-                    "BASE ueberschreitet reservierten Bereich v1..v{}",
+                    "BASE exceeds reserved range v1..v{}",
                     realm.base_reserve_to
                 )));
             }
         }
         for f in &shape.fields {
             if self.extension_defs.contains_key(&(realm_id.clone(), f.v.clone())) {
-                return Err(Error::Schema(format!("v{} ist bereits als Extension definiert", f.v)));
+                return Err(Error::Schema(format!("v{} is already defined as an extension", f.v)));
             }
         }
         let Some(old) = self.current_base_shape(realm_id) else {
             return Ok(());
         };
         if shape.fields.len() < old.fields.len() {
-            return Err(Error::Schema("BASE darf nicht verkleinert werden".into()));
+            return Err(Error::Schema("BASE must not be shrunk".into()));
         }
         for (a, b) in old.fields.iter().zip(shape.fields.iter()) {
             if a != b {
-                return Err(Error::Schema(format!("BASE darf bestehendes Feld v{} nicht umdeuten", a.v)));
+                return Err(Error::Schema(format!("BASE must not redefine existing field v{}", a.v)));
             }
         }
         Ok(())
@@ -106,7 +106,7 @@ impl Db {
         self.require_realm(realm_id)?;
         let shape = match self.shapes.get(&shape_id) {
             Some(s) if &s.realm_id == realm_id => s.clone(),
-            _ => return Err(Error::Schema("Shape passt nicht zum Realm".into())),
+            _ => return Err(Error::Schema("Shape does not match the realm".into())),
         };
         self.validate_base_shape(realm_id, &shape)?;
         let old = self.realms[realm_id].clone();
@@ -136,27 +136,27 @@ impl Db {
         let boundary = self.extension_boundary(realm_id);
         if v <= &boundary {
             return Err(Error::Schema(format!(
-                "v{v} liegt im BASE/Reserve-Bereich v1..v{boundary}; Extensions beginnen danach"
+                "v{v} lies in the BASE/reserve range v1..v{boundary}; extensions start after it"
             )));
         }
         let ext = ExtensionDef::new(realm_id.clone(), v.clone(), typ, name.to_string(), enum_val, description.to_string())?;
         if let Some(old) = self.extension_defs.get(&(realm_id.clone(), v.clone())) {
             if !replace {
-                return Err(Error::Schema(format!("Extension v{v} ist bereits definiert")));
+                return Err(Error::Schema(format!("Extension v{v} is already defined")));
             }
             if old.typ != ext.typ || old.enum_map != ext.enum_map {
-                return Err(Error::Schema("Typ/Enum einer bestehenden Extension darf nicht geaendert werden".into()));
+                return Err(Error::Schema("Type/enum of an existing extension must not be changed".into()));
             }
         }
         if !ext.name.is_empty() {
             if let Some(base) = self.current_base_shape(realm_id) {
                 if base.by_name(&ext.name).is_some() {
-                    return Err(Error::Schema(format!("Name '{}' existiert bereits in BASE", ext.name)));
+                    return Err(Error::Schema(format!("Name '{}' already exists in BASE", ext.name)));
                 }
             }
             if let Some(other) = self.extension_name_map.get(&(realm_id.clone(), ext.name.clone())) {
                 if other != v {
-                    return Err(Error::Schema(format!("Extension-Name '{}' ist bereits vergeben", ext.name)));
+                    return Err(Error::Schema(format!("Extension name '{}' is already taken", ext.name)));
                 }
             }
         }
@@ -166,7 +166,7 @@ impl Db {
         Ok(ext)
     }
 
-    /// Spalte → lokales v (`resolve_v`). `column` ist int oder str.
+    /// Column → local v (`resolve_v`). `column` is int or str.
     pub fn resolve_v(&self, realm_id: &Nat, column: &Val) -> Result<Nat> {
         self.require_realm(realm_id)?;
         match column {
@@ -191,13 +191,13 @@ impl Db {
                         return Ok(v);
                     }
                 }
-                Err(Error::Schema(format!("unbekannte Spalte {}", column.py_repr())))
+                Err(Error::Schema(format!("unknown column {}", column.py_repr())))
             }
         }
     }
 
     /// `create_index(index_id, realm_id, name, v, *, kind, options, tokenizer,
-    /// casefold, ngram, description)` der v0.27.
+    /// casefold, ngram, description)`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_index_ext(
         &mut self,
@@ -215,14 +215,14 @@ impl Db {
         self.require_realm(realm_id)?;
         self.deny_math_realm(realm_id)?;
         if self.index_name_map.contains_key(&(realm_id.clone(), name.to_string())) {
-            return Err(Error::Schema("Indexname existiert".into()));
+            return Err(Error::Schema("Index name exists".into()));
         }
         let source_v = self.resolve_v(realm_id, v)?;
         let kind = normalize_kind(kind)?;
         let mut opt = match options {
             Val::Map(_) => options.clone(),
             Val::None => Val::map(),
-            other => return Err(Error::Type(format!("options muss ein Mapping sein, nicht {}", other.py_repr()))),
+            other => return Err(Error::Type(format!("options must be a mapping, not {}", other.py_repr()))),
         };
         if let Some(t) = tokenizer {
             opt.set("tokenizer", t.clone());
@@ -245,7 +245,7 @@ impl Db {
                     None => "None".into(),
                 };
                 return Err(Error::Schema(format!(
-                    "{} Index braucht utf8-Quellfeld; v{} hat {}",
+                    "{} index requires a utf8 source field; v{} has {}",
                     kind.name(),
                     source_v,
                     shown
@@ -270,7 +270,7 @@ impl Db {
         Ok(idx)
     }
 
-    /// VALUE-Index (API der v0.14).
+    /// VALUE index.
     pub fn create_index(&mut self, index_id: u64, realm_id: &Nat, name: &str, v: &Val, description: &str) -> Result<IndexDef> {
         self.create_index_ext(index_id, realm_id, name, v, &Val::None, &Val::None, None, None, None, description)
     }
@@ -301,7 +301,7 @@ impl Db {
     pub fn set_dyn_address_output(&mut self, mode: &str, v: Option<Nat>) -> Result<()> {
         let m = DynMode::parse(mode)?;
         if m == DynMode::Once && v.is_none() {
-            return Err(Error::Value("dyn-address once benoetigt v".into()));
+            return Err(Error::Value("dyn-address once requires v".into()));
         }
         if let Some(x) = &v {
             validate_local_v(x, None)?;
@@ -319,7 +319,7 @@ impl Db {
         let v = v.cloned().or_else(|| self.dyn_v.clone());
         if m == DynMode::Once {
             let Some(x) = &v else {
-                return Err(Error::Value("dyn-address once benoetigt dyn_v".into()));
+                return Err(Error::Value("dyn-address once requires dyn_v".into()));
             };
             validate_local_v(x, None)?;
         }
@@ -344,7 +344,7 @@ impl Db {
         }
     }
 
-    /// `_normalize_extensions`: Paare (Schlüssel, Wert) → sortierte (v, Wert).
+    /// `_normalize_extensions`: pairs (key, value) → sorted (v, value).
     pub fn normalize_extensions(&self, realm_id: &Nat, items: &[(Val, Val)]) -> Result<Vec<(Nat, Val)>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -356,15 +356,15 @@ impl Db {
             let v = self.resolve_v(realm_id, key)?;
             if v <= boundary {
                 return Err(Error::Schema(format!(
-                    "v{v} liegt im BASE/Reserve-Bereich v1..v{boundary} und ist keine Extension"
+                    "v{v} lies in the BASE/reserve range v1..v{boundary} and is not an extension"
                 )));
             }
             if !seen.insert(v.clone()) {
-                return Err(Error::Schema(format!("Extension v{v} doppelt im Record")));
+                return Err(Error::Schema(format!("Extension v{v} duplicated in the record")));
             }
             if !value.is_none() && !self.extension_defs.contains_key(&(realm_id.clone(), v.clone())) {
                 return Err(Error::Schema(format!(
-                    "v{v} hat einen Wert, aber keine Extension-Typdefinition. define_extension() zuerst aufrufen."
+                    "v{v} has a value but no extension type definition. Call define_extension() first."
                 )));
             }
             out.push((v, value.clone()));
@@ -373,16 +373,16 @@ impl Db {
         Ok(out)
     }
 
-    /// `_decode_extensions` (EXT-Bereich hinter BASE in Dense-Records).
+    /// `_decode_extensions` (EXT area after BASE in dense records).
     pub(crate) fn decode_extensions(&self, realm_id: &Nat, payload: &[u8], mut pos: usize) -> Result<(Vec<(Nat, Val)>, usize)> {
         if pos == payload.len() {
             return Ok((Vec::new(), pos));
         }
         if pos > payload.len() {
-            return Err(Error::Corruption("Record endet vor Extension-Bereich".into()));
+            return Err(Error::Corruption("Record ends before the extension area".into()));
         }
         if payload[pos] != EXT_TAG {
-            return Err(Error::Corruption("unbekannte Bytes hinter BASE; Extension-Tag fehlt".into()));
+            return Err(Error::Corruption("unknown bytes after BASE; extension tag missing".into()));
         }
         pos += 1;
         let count = crate::nat::get_vu_u64(payload, &mut pos, "EXT count")?;
@@ -396,16 +396,16 @@ impl Db {
                 Nat::B(b) => (Nat::from(&**b >> 1usize), b.bit(0)),
             };
             if delta.is_zero() {
-                return Err(Error::Corruption("Extension-v-Delta muss > 0 sein".into()));
+                return Err(Error::Corruption("Extension v delta must be > 0".into()));
             }
             let v = prev.add(&delta);
             validate_local_v(&v, Some(realm_id))?;
             if v <= boundary {
-                return Err(Error::Corruption(format!("Extension v{v} liegt im BASE/Reserve-Bereich")));
+                return Err(Error::Corruption(format!("Extension v{v} lies in the BASE/reserve range")));
             }
             let value = if has_value {
                 let ext = self.extension_defs.get(&(realm_id.clone(), v.clone())).ok_or_else(|| {
-                    Error::Corruption(format!("Extension v{v} enthaelt einen Wert, aber keine Typdefinition"))
+                    Error::Corruption(format!("Extension v{v} contains a value but no type definition"))
                 })?;
                 crate::codec::decode_value(&ext.field, payload, &mut pos)?
             } else {
@@ -420,7 +420,7 @@ impl Db {
         Ok((out, pos))
     }
 
-    /// Typ einer deklarierten Extension.
+    /// Type of a declared extension.
     pub fn extension_type(&self, realm_id: &Nat, v: &Nat) -> Option<TypeCode> {
         self.extension_defs.get(&(realm_id.clone(), v.clone())).map(|e| e.typ)
     }

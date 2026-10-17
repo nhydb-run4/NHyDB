@@ -1,16 +1,16 @@
-"""Harness für die Python-v0.27-Referenztests.
+"""Harness for the test scripts of the external reference implementation (not included).
 
-Die Referenzskripte schreiben ihre Datenbanken neben sich und erwarten die
-Module im selben Ordner. Deshalb wird für jeden Lauf eine **flache Kopie** in
-einem temporären Verzeichnis angelegt:
+The test scripts write their databases next to themselves and expect the
+modules in the same directory. Therefore every run gets a **flat copy** in a
+temporary directory:
 
-* ``engine="python"``: Referenzmodule aus ``reference_v0_27/`` (echte
-  AES-256-GCM über ``cryptography``),
-* ``engine="rust"``: statt der Referenzmodule die Kompatibilitätsmodule aus
-  ``tests/python/ref_v027/shims/`` (gleiche Modulnamen, Rust-Engine).
+* ``engine="python"``: modules of the reference implementation (``REF``,
+  real AES-256-GCM via ``cryptography``),
+* ``engine="rust"``: instead of those modules, the compatibility shims from
+  ``tests/python/ref_v027/shims/`` (same module names, Rust engine).
 
-Die Testskripte selbst werden unverändert kopiert. Der Referenzordner wird
-nie beschrieben.
+The test scripts themselves are copied unchanged. The reference directory is
+never written to.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ SHIMS = Path(__file__).resolve().parent / "shims"
 
 MODULES = ("nhydb_v027", "nhydb_math_v027", "nhydb_layout_v027", "nhydb_index_v027", "nhydb_query_v027")
 
-# Skript -> Phase, ab der die Rust-Engine es bestehen muss.
+# Script -> minimum implementation level at which the Rust engine must pass it.
 SCRIPTS = {
     "nhydb_math_v027_kernel_selftest": 1,
     "nhydb_v027_verify_smoke_selftest": 1,
@@ -42,7 +42,7 @@ SCRIPTS = {
     "nhydb_sql_v027_selftest": 5,
 }
 
-# Aktuell abgeschlossene Implementierungsphase der Rust-v0.27.
+# Implementation level of the Rust engine (all scripts above are enabled).
 RUST_PHASE = 5
 
 

@@ -1,4 +1,4 @@
-"""Wartungs-/Randfälle: Repair, Kompaktierung, große u, Plugin-Rückrufe."""
+"""Maintenance and edge cases: repair, compaction, large u, plugin callbacks."""
 import shutil
 
 import pytest
@@ -20,7 +20,7 @@ def test_repair_truncated_tail(tmpdb, ref):
     db.close()
     good = tmpdb.stat().st_size
     with open(tmpdb, "ab") as f:
-        f.write(b"NHBL" + b"\x0e\x04" + b"\x00" * 50)  # kaputter Blockkopf
+        f.write(b"NHBL" + b"\x0e\x04" + b"\x00" * 50)  # broken block header
     rep = nhydb.NHyDB.inspect_tail(tmpdb)
     assert rep == ref.NHyDB.inspect_tail(tmpdb)
     assert not rep["clean"] and rep["last_good_end"] == good
@@ -37,12 +37,12 @@ def test_strict_open_rejects_corrupt_header(tmpdb):
     off = db.stats()["storage"]["by_block_type"]
     db.close()
     raw = bytearray(tmpdb.read_bytes())
-    raw[8192 + 9] ^= 0xFF  # Block-ID des ersten Blocks verfälschen → Header-CRC
+    raw[8192 + 9] ^= 0xFF  # corrupt the block ID of the first block → header CRC
     tmpdb.write_bytes(bytes(raw))
     with pytest.raises(nhydb.CorruptionError):
         nhydb.NHyDB(tmpdb)
-    # v0.27: fail closed – der committete Bereich (inkl. R0,u1) muss
-    # unversehrt sein, unabhängig von strict (wie die Python-Referenz).
+    # Fail closed: the committed region (including R0,u1) must be
+    # intact, regardless of strict.
     with pytest.raises(nhydb.CorruptionError):
         nhydb.NHyDB(tmpdb, strict=False)
 
@@ -50,12 +50,12 @@ def test_strict_open_rejects_corrupt_header(tmpdb):
 def test_superblock_fallback(tmpdb):
     db = _classic(tmpdb)
     db.put_dense_batch(1, 1, [[1, "a"]], commit=True)
-    slot = db.stats()["generation"] % 2  # aktiver Slot = generation mod 2 bei Start 0
+    slot = db.stats()["generation"] % 2  # active slot = generation mod 2 (starting at 0)
     db.close()
     raw = bytearray(tmpdb.read_bytes())
-    raw[slot * 4096 + 20] ^= 0xFF  # aktuellen Superblock zerstören
+    raw[slot * 4096 + 20] ^= 0xFF  # destroy the current superblock
     tmpdb.write_bytes(bytes(raw))
-    db = nhydb.NHyDB(tmpdb)  # fällt auf die vorige Generation zurück
+    db = nhydb.NHyDB(tmpdb)  # falls back to the previous generation
     assert db.verify()["ok"]
 
 
@@ -63,16 +63,17 @@ def test_compaction_with_tombstoned_base_field(tmp_path, ref):
     p = tmp_path / "a.nhydb"
     db = _classic(p)
     db.put_dense_batch(1, 1, [[i, f"x{i}"] for i in range(1, 11)])
-    db.put_dense_batch(1, 3, [[99, "neu"]])          # Overlay (neueres Segment)
-    db.delete_point(1, 4, 2)                          # BASE-Feld per Tombstone gelöscht
+    db.put_dense_batch(1, 3, [[99, "neu"]])          # overlay (newer segment)
+    db.delete_point(1, 4, 2)                          # BASE field deleted via tombstone
     db.delete(1, 6)
-    db.put_points(1, [(8, 1, 777)])                   # BASE-Feld per Sparse überschrieben
+    db.put_points(1, [(8, 1, 777)])                   # BASE field overwritten via sparse cell
     db.put_points(1, [(20, 5, "frei", "utf8")], lane="NR")
     before = {u: db.get(1, u) for u in range(1, 12)}
     before_nr = db.get_cell(1, 20, 5, lane="NR")["value"]
     db.close()
-    # v0.14-Befund: gemergte BASE-Werte werden neu kodiert; ein per Tombstone
-    # gelöschtes utf8-Feld (None) wird dabei still zu 'None' (str(None)).
+    # Known weakness of the reference implementation: merged BASE values are
+    # re-encoded, and a utf8 field deleted via tombstone (None) silently
+    # becomes 'None' (str(None)). The Rust engine keeps it None.
     ref.NHyDB.compact_file(p, output=tmp_path / "py.nhydb", make_backup=False)
     assert before[4]["b"] is None
     assert ref.NHyDB(tmp_path / "py.nhydb").get(1, 4)["b"] == "None"
@@ -93,7 +94,7 @@ def test_compaction_with_tombstoned_base_field(tmp_path, ref):
 def test_compact_replace_original_with_backup(tmpdb):
     db = _classic(tmpdb)
     for i in range(1, 6):
-        db.put(1, i, [i, "v"], commit=True)  # viele kleine Blöcke
+        db.put(1, i, [i, "v"], commit=True)  # many small blocks
     db.close()
     res = nhydb.NHyDB.compact_file(tmpdb)
     assert res["replaced_original"] and res["backup"] and res["saved_bytes"] > 0
@@ -109,13 +110,13 @@ def test_big_u_index_and_dense(tmpdb, ref):
     db.build_indexes(commit=True)
     assert db.find_u(1, {"a": 2}) == [1, big + 2, big + 5, big + 8]
     db.close()
-    r = ref.NHyDB(tmpdb)  # Referenz liest Big-u-Postings (width 0)
+    r = ref.NHyDB(tmpdb)  # the reference reads big-u postings (width 0)
     assert r.find_u(1, {"a": 2}) == [1, big + 2, big + 5, big + 8]
     assert r.get(1, big + 9)["a"] == 0
 
 
 class Occ:
-    """CUSTOM-Plugin mit occupied_addresses, das in die DB zurückruft."""
+    """CUSTOM plugin with occupied_addresses that calls back into the DB."""
 
     def logical_address(self, layout, object_id, field, lane):
         off = {None: 0, "a": 0, "b": 1}[field]
@@ -152,12 +153,12 @@ def test_plugin_reentrant_occupied(tmpdb):
 def test_plugin_exception_propagates(tmpdb):
     class Bad:
         def logical_address(self, *a):
-            raise KeyError("plugin-fehler")
+            raise KeyError("plugin-error")
 
     db = _classic(tmpdb)
     db.create_custom_layout(2, 1, "bad", plugin="bad", u_start=100, u_end=100)
     db.register_layout_plugin("bad", Bad())
-    with pytest.raises(KeyError, match="plugin-fehler"):
+    with pytest.raises(KeyError, match="plugin-error"):
         db.logical_address(2, 1)
 
 
@@ -178,8 +179,8 @@ def test_cli_get_and_stats(tmpdb):
 
 
 def test_failed_append_is_rolled_back(tmp_path):
-    """Schreibfehler (hier: Dateigrößenlimit) darf keinen halben Block
-    hinterlassen, den ein späterer Commit dauerhaft macht."""
+    """A write error (here: file size limit) must not leave a partial block
+    behind that a later commit would make durable."""
     import subprocess
     import sys
     p = tmp_path / "efbig.nhydb"
@@ -195,7 +196,7 @@ soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
 resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, hard))
 try:
     db.put(1, 2, [b"x" * (9 << 20)])
-    raise SystemExit("kein Fehler")
+    raise SystemExit("no error raised")
 except OSError:
     pass
 resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
@@ -227,14 +228,14 @@ def test_crafted_huge_payload_len_is_corruption(tmpdb):
 
 
 def test_non_strict_open_fails_closed_on_committed_damage(tmpdb, ref):
-    """v0.14 erlaubte nicht-striktes Lesen bis zum Schaden; v0.27 verweigert
-    jeden beschädigten committeten Block (Rust wie Python-Referenz)."""
+    """Non-strict open refuses any damaged committed block instead of
+    reading up to the damage (Rust and the reference implementation alike)."""
     db = _classic(tmpdb)
     db.put(1, 1, [1, "a"], commit=True)
     db.put(1, 2, [2, "b"], commit=True)
     db.close()
     raw = bytearray(tmpdb.read_bytes())
-    idx = raw.rfind(b"NHBL\x10\x04")  # letzter DATA-Block (Version 16)
+    idx = raw.rfind(b"NHBL\x10\x04")  # last DATA block (version 16)
     assert idx > 0
     raw[idx + 9] ^= 0xFF
     tmpdb.write_bytes(bytes(raw))

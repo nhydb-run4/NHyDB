@@ -1,5 +1,5 @@
-//! Reiner Rust-Benchmark der Engine (ohne Python), Szenarien wie
-//! `kq_nhydb_v014_extension_benchmark.py`.
+//! Pure Rust benchmark of the engine (without Python): dense KQ records with
+//! optional reserve, extension definitions and sparse extension cells.
 //!
 //! `cargo run --release -p nhydb-core --example bench_native [records] [dir]`
 

@@ -1,14 +1,13 @@
-"""Differenztests Rust ↔ Python-v0.27.
+"""Differential tests: Rust engine vs. external reference implementation (not included).
 
-Ein Szenario ist Python-Quelltext, der mit ``from nhydb_v027 import ...``
-arbeitet und seine Beobachtungen über ``emit(label, value)`` meldet. Das
-Szenario läuft zweimal in getrennten Prozessen (Referenz bzw. Rust-Shim) im
-jeweils eigenen Temp-Verzeichnis; die Beobachtungen werden als JSON
-verglichen. Ausnahmen werden als ``{"exc": Klassenname, "msg": Text}``
-erfasst.
+A scenario is Python source code that works with ``from nhydb_v027 import ...``
+and reports its observations via ``emit(label, value)``. The scenario runs
+twice in separate processes (reference implementation and Rust shim), each in
+its own temp directory; the observations are compared as JSON. Exceptions are
+recorded as ``{"exc": class_name, "msg": text}``.
 
-Zufallswerte (UUID, Schlüssel, Nonce, Zeitstempel) dürfen nicht direkt
-gemeldet werden; ``normalize`` entfernt bekannte zufällige Felder.
+Random values (UUID, keys, nonce, timestamps) must not be reported directly;
+``normalize`` removes known random fields.
 """
 from __future__ import annotations
 
@@ -59,12 +58,12 @@ def run(code: str, workdir: Path, engine: str, timeout: int = 600):
     r = subprocess.run([sys.executable, "-B", script.name], cwd=workdir, env=env,
                        capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0 or "@@OBS@@" not in r.stdout:
-        raise AssertionError(f"Szenario ({engine}) fehlgeschlagen:\n{r.stdout[-3000:]}\n{r.stderr[-5000:]}")
+        raise AssertionError(f"scenario ({engine}) failed:\n{r.stdout[-3000:]}\n{r.stderr[-5000:]}")
     return json.loads(r.stdout.rsplit("@@OBS@@", 1)[1])
 
 
 def compare(code: str, tmp_path: Path, *, ignore=()):
-    """Führt ``code`` gegen beide Engines aus und liefert (python, rust)."""
+    """Run ``code`` against both engines and return (python, rust)."""
     py = run(code, tmp_path / "py", "python")
     rs = run(code, tmp_path / "rs", "rust")
     if ignore:

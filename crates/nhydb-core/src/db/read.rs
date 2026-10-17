@@ -1,5 +1,5 @@
-//! Lese-APIs: `get`, `get_cell`, Objekt-APIs, geometrisches GET
-//! (`cell`/`record`/`auto`), DESCRIBE, Belegungsabfragen, `range`/`select`.
+//! Read APIs: `get`, `get_cell`, object APIs, geometric GET
+//! (`cell`/`record`/`auto`), DESCRIBE, occupancy queries, `range`/`select`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +15,7 @@ use super::layout::{coord, lane_from_val, LayoutRef};
 use super::sparse::CellInput;
 use super::{Db, DynMode, SVal};
 
-/// GET-Modus für N-/Strukturadressen.
+/// GET mode for N/structural addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GetMode {
     Auto,
@@ -29,7 +29,7 @@ impl GetMode {
             "auto" => Ok(GetMode::Auto),
             "cell" => Ok(GetMode::Cell),
             "record" => Ok(GetMode::Record),
-            _ => Err(Error::Value("mode muss auto, cell oder record sein".into())),
+            _ => Err(Error::Value("mode must be auto, cell or record".into())),
         }
     }
     pub fn name(self) -> &'static str {
@@ -42,7 +42,7 @@ impl GetMode {
 }
 
 impl Db {
-    /// Vollständiger CLASSIC-Record (`get`).
+    /// Complete CLASSIC record (`get`).
     pub fn get(
         &self,
         realm: &Nat,
@@ -95,7 +95,7 @@ impl Db {
         Ok(Some(out))
     }
 
-    /// Einzelne Zelle (`get_cell`). `v` ist int, `"v123"` oder ein Feldname.
+    /// Single cell (`get_cell`). `v` is int, `"v123"` or a field name.
     pub fn get_cell(&self, realm: &Nat, u: &Nat, v: &Val, lane: Lane, dyn_address: bool) -> Result<Option<Val>> {
         let mut u = u.clone();
         let vnum: Nat = match v {
@@ -174,8 +174,8 @@ impl Db {
         Ok(Some(out))
     }
 
-    /// Nur der Zellwert (Rust-Schnellzugriff): None = nicht belegt.
-    /// Gleiche Belegungs-/Wertregeln wie `get_cell`, ohne Umschlag und Feldnamen.
+    /// Cell value only (fast Rust access): None = not occupied.
+    /// Same occupancy/value rules as `get_cell`, without envelope and field name.
     pub fn get_cell_value(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Val>> {
         if v.is_zero() || u.is_zero() {
             return Ok(None);
@@ -205,7 +205,7 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Objekte
+    // Objects
     // ------------------------------------------------------------------
 
     pub fn get_object(&self, r: &LayoutRef, obj: &Nat, lane: Lane, include_addresses: bool) -> Result<Option<Val>> {
@@ -241,13 +241,13 @@ impl Db {
 
     pub fn put_object(&mut self, r: &LayoutRef, obj: &Nat, values: &Val, lane: Lane, commit: bool) -> Result<Val> {
         let lay = self.layout_by_ref(r)?.clone();
-        let items = values.as_map().ok_or_else(|| Error::Schema("values muss ein Dictionary sein".into()))?;
+        let items = values.as_map().ok_or_else(|| Error::Schema("values must be a dictionary".into()))?;
         if lay.kind == LayoutKind::Classic {
-            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC Layout ohne Shape".into()))?;
+            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC layout without shape".into()))?;
             let shape = self.shapes.get(&sid).ok_or_else(|| Error::Key(sid.to_string()))?;
             let mut base = Vec::with_capacity(shape.fields.len());
             for f in &shape.fields {
-                let v = values.get(&f.name).ok_or_else(|| Error::Schema(format!("Pflichtfeld '{}' fehlt", f.name)))?;
+                let v = values.get(&f.name).ok_or_else(|| Error::Schema(format!("Required field '{}' missing", f.name)))?;
                 base.push(v.clone());
             }
             let ext: Vec<(Val, Val)> = items
@@ -262,7 +262,7 @@ impl Db {
         let mut cells = Vec::with_capacity(items.len());
         for (name, value) in items {
             if !declared.contains(name) {
-                return Err(Error::Schema(format!("Layout '{}': Feld '{}' unbekannt", lay.name, name)));
+                return Err(Error::Schema(format!("Layout '{}': field '{}' unknown", lay.name, name)));
             }
             address::require_positive("object_id", obj)?;
             let addr = self.logical_address_in(&lay, obj, &Val::str(name), lane)?;
@@ -271,14 +271,14 @@ impl Db {
         self.put_points(&lay.realm_id, cells, lane, commit, 10_000)
     }
 
-    /// Mehrere Objekte über ein Layout (`put_objects_batch`).
+    /// Several objects via one layout (`put_objects_batch`).
     pub fn put_objects_batch(&mut self, r: &LayoutRef, objects: Vec<(Nat, Val)>, lane: Lane, commit: bool, u_window: u64) -> Result<Val> {
         let lay = self.layout_by_ref(r)?.clone();
         let mut items = Vec::with_capacity(objects.len());
         for (oid, vals) in objects {
             address::require_positive("object_id", &oid)?;
             if !matches!(vals, Val::Map(_)) {
-                return Err(Error::Schema("values muss ein Dictionary sein".into()));
+                return Err(Error::Schema("values must be a dictionary".into()));
             }
             items.push((oid, vals));
         }
@@ -290,13 +290,13 @@ impl Db {
         }
         items.sort_by(|a, b| a.0.cmp(&b.0));
         if items.windows(2).any(|w| w[0].0 == w[1].0) {
-            return Err(Error::Schema("object_id im Batch doppelt".into()));
+            return Err(Error::Schema("object_id duplicated in batch".into()));
         }
         let n_objects = items.len() as i64;
         if lay.kind == LayoutKind::Classic {
-            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC Layout ohne Shape".into()))?;
+            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC layout without shape".into()))?;
             let shape = self.shapes.get(&sid).ok_or_else(|| Error::Key(sid.to_string()))?.clone();
-            // Läufe zusammenhängender object_ids sammeln (vollständig validiert)
+            // collect runs of contiguous object_ids (fully validated)
             struct Run {
                 start: Nat,
                 rows: Vec<Vec<Val>>,
@@ -312,7 +312,7 @@ impl Db {
                 let run = runs.last_mut().unwrap();
                 let mut row = Vec::with_capacity(shape.fields.len());
                 for f in &shape.fields {
-                    let v = vals.get(&f.name).ok_or_else(|| Error::Schema(format!("Pflichtfeld '{}' fehlt", f.name)))?;
+                    let v = vals.get(&f.name).ok_or_else(|| Error::Schema(format!("Required field '{}' missing", f.name)))?;
                     row.push(v.clone());
                 }
                 let ext: Vec<(Val, Val)> = vals
@@ -374,7 +374,7 @@ impl Db {
                             .iter()
                             .find(|(n, _)| n == name)
                             .map(|(_, u)| u.clone())
-                            .ok_or_else(|| Error::Schema(format!("Layout '{}': Feld '{}' unbekannt", lay.name, name)))?;
+                            .ok_or_else(|| Error::Schema(format!("Layout '{}': field '{}' unknown", lay.name, name)))?;
                         cells.push(CellInput::new(u, oid.clone(), value.clone()));
                     }
                 }
@@ -391,17 +391,17 @@ impl Db {
                 for (oid, vals) in &items {
                     let anchor = oid.sub_u64(1).unwrap().mul(&span).add_u64(1);
                     if &anchor > address::realm_span() {
-                        return Err(Error::RealmLimit("PACKED record liegt ausserhalb dieses Realms".into()));
+                        return Err(Error::RealmLimit("PACKED record lies outside this realm".into()));
                     }
                     for (name, value) in vals.as_map().unwrap() {
                         let off = by_name
                             .iter()
                             .find(|(n, _)| n == name)
                             .map(|(_, o)| o.clone())
-                            .ok_or_else(|| Error::Schema(format!("Layout '{}': Feld '{}' unbekannt", lay.name, name)))?;
+                            .ok_or_else(|| Error::Schema(format!("Layout '{}': field '{}' unknown", lay.name, name)))?;
                         let off = match off.to_biguint().map(Nat::from) {
                             Some(o) if o < span => o,
-                            _ => return Err(Error::Schema("PACKED offset ausserhalb span".into())),
+                            _ => return Err(Error::Schema("PACKED offset outside span".into())),
                         };
                         cells.push(CellInput::new(u.clone(), anchor.add(&off), value.clone()));
                     }
@@ -424,7 +424,7 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Geometrisches GET
+    // Geometric GET
     // ------------------------------------------------------------------
 
     pub fn get_record_view(&self, r: &LayoutRef, obj: &Nat, lane: Lane, request_n: Option<&Nat>) -> Result<Val> {
@@ -548,7 +548,7 @@ impl Db {
         };
         if chosen == GetMode::Record {
             let (Some(l), Some(rec)) = (lay, record_id.as_ref()) else {
-                return Err(Error::Schema("Adresse gehoert zu keinem aufloesbaren logischen Datensatz".into()));
+                return Err(Error::Schema("Address does not belong to any resolvable logical record".into()));
             };
             let mut out = self.get_record_view(&LayoutRef::Id(l.layout_id), rec, lane, Some(&addr.n))?;
             out.set("requested_mode", Val::str(mode.name()));
@@ -591,13 +591,13 @@ impl Db {
         Ok(out)
     }
 
-    /// GET über eine N-Referenz.
+    /// GET via an N reference.
     pub fn get_n(&self, n: &Nat, mode: GetMode) -> Result<Val> {
         let a = n_to_address(n)?;
         self.get_resolved_address(&a, mode)
     }
 
-    /// GET über die Strukturadresse (R, u, v, lane).
+    /// GET via the structural address (R, u, v, lane).
     pub fn get_address(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane, mode: GetMode) -> Result<Val> {
         let a = address::cell_address(realm, u, v, lane)?;
         self.get_resolved_address(&a, mode)
@@ -630,7 +630,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Belegte Zellen eines logischen Objekts als N-Zahlen (`occupied_n`).
+    /// Occupied cells of a logical object as N numbers (`occupied_n`).
     pub fn occupied_n(&self, r: &LayoutRef, obj: &Nat, lane: Lane) -> Result<Vec<Nat>> {
         let lay = self.layout_by_ref(r)?;
         let rid = &lay.realm_id;
@@ -694,7 +694,7 @@ impl Db {
                                 },
                             ),
                             Val::List(l) if l.len() >= 2 => (rid.clone(), coord(&l[0])?, coord(&l[1])?, lane),
-                            _ => return Err(Error::Value("occupied_addresses: ungueltiger Eintrag".into())),
+                            _ => return Err(Error::Value("occupied_addresses: invalid entry".into())),
                         };
                         if self.get_cell(&rr, &u, &Val::nat(&v), ll, false)?.is_some() {
                             out.push(address::dynadron_n(&rr, &u, &v, ll)?);
@@ -705,7 +705,7 @@ impl Db {
                 let fields = lay.fields();
                 if fields.is_empty() {
                     return Err(Error::Schema(
-                        "occupied_n fuer CUSTOM benoetigt deklarierte fields oder occupied_addresses()".into(),
+                        "occupied_n for CUSTOM requires declared fields or occupied_addresses()".into(),
                     ));
                 }
                 address::require_positive("object_id", obj)?;
@@ -726,7 +726,7 @@ impl Db {
         let interp = desc.get("interpretation").cloned().unwrap_or(Val::None);
         let record = Db::interp_record(&interp);
         if !lay_obj.is_truthy() || !interp.contains_key("record") || record.is_none() {
-            return Err(Error::Schema("N-Referenz gehoert zu keinem aufloesbaren logischen Objekt".into()));
+            return Err(Error::Schema("N reference does not belong to any resolvable logical object".into()));
         }
         let lid = lay_obj.get("layout_id").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
         let record = record.unwrap();
@@ -734,7 +734,7 @@ impl Db {
         let refs = self.occupied_n(&LayoutRef::Id(lid), &record, lane)?;
         let mode = output.to_uppercase();
         if !matches!(mode.as_str(), "N" | "ADDRESS" | "BOTH") {
-            return Err(Error::Value("output muss N, ADDRESS oder BOTH sein".into()));
+            return Err(Error::Value("output must be N, ADDRESS or BOTH".into()));
         }
         let mut cells = Vec::new();
         for nn in refs {
@@ -756,10 +756,10 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Bereichsabfragen
+    // Range queries
     // ------------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)] // bildet die Python-Signatur (Keyword-Argumente) nach
+    #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     pub fn range(
         &self,
         realm: &Nat,

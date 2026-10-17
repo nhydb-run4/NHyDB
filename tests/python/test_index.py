@@ -1,4 +1,4 @@
-"""Differenztests der Indexsemantik gegen ``nhydb_index_v027`` (Python-Referenz)."""
+"""Differential tests of the index semantics against ``nhydb_index_v027`` (external reference implementation, not included)."""
 import random
 import sys
 
@@ -95,7 +95,7 @@ def test_fulltext_codecs_phrase_bm25(px):
             assert px.fulltext_candidate_docs(sub_px, mode=mode) == rx.fulltext_candidate_docs(sub_rx, mode=mode)
         s_px = px.bm25_scores(sub_px, corpus_px)
         s_rx = rx.bm25_scores(sub_rx, corpus_rx)
-        assert list(s_px.items()) == list(s_rx.items())  # bitgleiche Floats, gleiche Reihenfolge
+        assert list(s_px.items()) == list(s_rx.items())  # bit-identical floats, same order
 
 
 def test_db_index_build_and_candidates_match_reference(tmp_path, ref):
@@ -115,7 +115,7 @@ def test_db_index_build_and_candidates_match_reference(tmp_path, ref):
         db.create_token_index(6, 1, "i_tag", "tag")
         rows = [[i, f"Red Fox {i % 3}", f"the quick brown fox {i} Straße" if i % 2 else "slow ABC abcd", ] for i in range(1, 40)]
         db.put_dense_batch(1, 1, rows, shape_id=1, extensions_by_u={2: {"tag": "Alpha Beta"}, 5: {"tag": "beta"}})
-        db.put_points(1, [(70, 100, "nur sparse tag", "utf8")])  # u ohne Dense-Record
+        db.put_points(1, [(70, 100, "nur sparse tag", "utf8")])  # u without a dense record
         built = db.build_indexes(commit=True)
         res = {"built": [(x["name"], x["lane"], x["distinct_values"], x["u_references"], x.get("documents")) for x in built["indexes"]]}
         for iid, op, val, opts in [(1, "eq", 7, None), (1, "between", (3, 9), None), (2, "token", "FOX", None),
@@ -136,12 +136,13 @@ def test_db_index_build_and_candidates_match_reference(tmp_path, ref):
     assert out["rust"] == out["py"]
 
 
-def test_s1_index_on_sparse_only_realm_becomes_fresh(tmp_path, ref):
-    """S1: Python v0.27 schreibt für Spuren ohne Dense-Segmente keinen
-    SECONDARY-Block – der Index bleibt für immer stale. Rust behebt das."""
+def test_index_on_sparse_only_realm_becomes_fresh(tmp_path, ref):
+    """The reference implementation writes no SECONDARY block for lanes
+    without dense segments, so the index stays stale forever. The Rust
+    engine builds the index and it becomes fresh."""
     res = {}
     for name, mod in (("rust", nhydb), ("py", ref)):
-        db = mod.NHyDB.create(tmp_path / f"s1_{name}.nhydb")
+        db = mod.NHyDB.create(tmp_path / f"sparse_only_{name}.nhydb")
         db.create_realm(1, "r")
         db.define_extension(1, 5, "utf8", name="note")
         db.create_index(1, 1, "by_note", "note")

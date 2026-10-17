@@ -1,7 +1,7 @@
-//! Spaltenorientierte Batch-Operationen (Grundlage der NumPy-API) und
-//! logisches Löschen von Objekten.
+//! Column-oriented batch operations (basis of the NumPy API) and
+//! logical deletion of objects.
 //!
-//! Alle Schleifen laufen in Rust; die Eingabe sind typisierte Slices.
+//! All loops run in Rust; inputs are typed slices.
 
 use crate::address::{self, Lane};
 use crate::codec::{decode_value, skip_value, TypeCode};
@@ -17,7 +17,7 @@ use super::sparse::CellInput;
 use super::{Db, SVal};
 
 impl ColData<'_> {
-    /// Teilbereich `[a, b)`.
+    /// Subrange `[a, b)`.
     pub fn slice(&self, a: usize, b: usize) -> ColData<'_> {
         match self {
             ColData::U8(x) => ColData::U8(&x[a..b]),
@@ -37,7 +37,7 @@ impl ColData<'_> {
     }
 }
 
-/// Typisierte Ausgabespalte für `read_columns`.
+/// Typed output column for `read_columns`.
 #[derive(Clone, Debug)]
 pub enum OutCol {
     I64(Vec<i64>),
@@ -76,8 +76,8 @@ impl OutCol {
         }
     }
 
-    /// Hängt einen Wert an; `None`/fehlend → Nullwert (0 / NaN / None).
-    /// Passt der Wert nicht in den Spaltentyp, wird auf `Vals` umgestellt.
+    /// Appends a value; `None`/missing → null value (0 / NaN / None).
+    /// If the value does not fit the column type, the column switches to `Vals`.
     fn push(&mut self, v: Option<&Val>) {
         let ok = match (&mut *self, v) {
             (OutCol::I64(c), None | Some(Val::None)) => {
@@ -134,7 +134,7 @@ impl OutCol {
     }
 }
 
-/// Ergebnis von `read_columns`.
+/// Result of `read_columns`.
 #[derive(Clone, Debug)]
 pub struct ColumnsOut {
     pub names: Vec<String>,
@@ -143,9 +143,9 @@ pub struct ColumnsOut {
 }
 
 impl Db {
-    /// Schreibt Objekte spaltenweise über ein Layout. `oids` müssen streng
-    /// aufsteigend sein. CLASSIC nutzt den Dense-Spaltenpfad (zusammenhängende
-    /// Läufe), COLUMN/PACKED/CUSTOM erzeugen Sparse-Zellen.
+    /// Writes objects column-wise via a layout. `oids` must be strictly
+    /// ascending. CLASSIC uses the dense column path (contiguous
+    /// runs), COLUMN/PACKED/CUSTOM produce sparse cells.
     pub fn put_object_columns(
         &mut self,
         r: &LayoutRef,
@@ -159,13 +159,13 @@ impl Db {
         let n = oids.len();
         for (name, c) in cols {
             if c.len() != n {
-                return Err(Error::Value(format!("Spalte '{name}' hat {} Werte, erwartet {n}", c.len())));
+                return Err(Error::Value(format!("Column '{name}' has {} values, expected {n}", c.len())));
             }
         }
         for (i, o) in oids.iter().enumerate() {
             address::require_positive("object_id", o)?;
             if i > 0 && oids[i - 1] >= *o {
-                return Err(Error::Schema("object_ids muessen streng aufsteigend sein (keine Duplikate)".into()));
+                return Err(Error::Schema("object_ids must be strictly ascending (no duplicates)".into()));
             }
         }
         if n == 0 {
@@ -175,7 +175,7 @@ impl Db {
             return Ok(vmap! {"objects" => 0i64, "cells" => 0i64, "blocks" => 0i64, "bytes" => 0i64});
         }
         if lay.kind == LayoutKind::Classic {
-            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC Layout ohne Shape".into()))?;
+            let sid = lay.shape_id.ok_or_else(|| Error::Schema("CLASSIC layout without shape".into()))?;
             let shape = self.shapes.get(&sid).ok_or_else(|| Error::Key(sid.to_string()))?.clone();
             let mut ordered: Vec<&ColData> = Vec::with_capacity(shape.fields.len());
             for f in &shape.fields {
@@ -183,7 +183,7 @@ impl Db {
                     .iter()
                     .find(|(nm, _)| *nm == f.name)
                     .map(|(_, c)| c)
-                    .ok_or_else(|| Error::Schema(format!("Pflichtfeld '{}' fehlt", f.name)))?;
+                    .ok_or_else(|| Error::Schema(format!("Required field '{}' missing", f.name)))?;
                 ordered.push(c);
             }
             let extra: Vec<&(String, ColData)> = cols.iter().filter(|(nm, _)| shape.by_name(nm).is_none()).collect();
@@ -246,7 +246,7 @@ impl Db {
                             hit = Some(f.u()?);
                         }
                     }
-                    col_u.push(hit.ok_or_else(|| Error::Schema(format!("Layout '{}': Feld '{}' unbekannt", lay.name, name)))?);
+                    col_u.push(hit.ok_or_else(|| Error::Schema(format!("Layout '{}': field '{}' unknown", lay.name, name)))?);
                 }
                 for (i, oid) in oids.iter().enumerate() {
                     for ((_, c), u) in cols.iter().zip(col_u.iter()) {
@@ -266,16 +266,16 @@ impl Db {
                             hit = Some(f.offset()?);
                         }
                     }
-                    let off = hit.ok_or_else(|| Error::Schema(format!("Layout '{}': Feld '{}' unbekannt", lay.name, name)))?;
+                    let off = hit.ok_or_else(|| Error::Schema(format!("Layout '{}': field '{}' unknown", lay.name, name)))?;
                     match off.to_biguint().map(Nat::from) {
                         Some(o) if o < span => col_off.push(o),
-                        _ => return Err(Error::Schema("PACKED offset ausserhalb span".into())),
+                        _ => return Err(Error::Schema("PACKED offset outside span".into())),
                     }
                 }
                 for (i, oid) in oids.iter().enumerate() {
                     let anchor = oid.sub_u64(1).unwrap().mul(&span).add_u64(1);
                     if &anchor > address::realm_span() {
-                        return Err(Error::RealmLimit("PACKED record liegt ausserhalb dieses Realms".into()));
+                        return Err(Error::RealmLimit("PACKED record lies outside this realm".into()));
                     }
                     for ((_, c), off) in cols.iter().zip(col_off.iter()) {
                         out_cells.push(CellInput::new(u.clone(), anchor.add(off), c.get_val(i)));
@@ -298,8 +298,8 @@ impl Db {
         Ok(res)
     }
 
-    /// Liest `count` CLASSIC-Records ab `u_start` spaltenweise
-    /// (inkl. Sparse-Overlays, Tombstones, Deletes).
+    /// Reads `count` CLASSIC records starting at `u_start` column-wise
+    /// (including sparse overlays, tombstones, deletes).
     pub fn read_columns(&self, realm: &Nat, u_start: &Nat, count: usize, fields: Option<&[Val]>, lane: Lane) -> Result<ColumnsOut> {
         self.require_realm(realm)?;
         address::require_positive("u_start", u_start)?;
@@ -318,7 +318,7 @@ impl Db {
                 out
             }
             None => base
-                .ok_or_else(|| Error::Schema("kein Shape angegeben/default".into()))?
+                .ok_or_else(|| Error::Schema("no shape given/default".into()))?
                 .fields
                 .iter()
                 .map(|f| (f.name.clone(), f.v.clone()))
@@ -345,7 +345,7 @@ impl Db {
         let mut u = u_start.clone();
         let mut done = 0usize;
         while done < count {
-            // Lauf innerhalb eines Segments bestimmen
+            // determine the run within one segment
             let seg = self.resolve_segment(realm, &u, lane);
             let run = match seg {
                 Some(s) if !overlay => {
@@ -368,7 +368,7 @@ impl Db {
                         let st = u32::from_le_bytes(payload[toff + i * 4..toff + i * 4 + 4].try_into().unwrap()) as usize;
                         let en = u32::from_le_bytes(payload[toff + i * 4 + 4..toff + i * 4 + 8].try_into().unwrap()) as usize;
                         if en < st || rbase + en > payload.len() {
-                            return Err(Error::Corruption("DATA Recordoffset ungueltig".into()));
+                            return Err(Error::Corruption("DATA record offset invalid".into()));
                         }
                         let uu = if k == 0 { u.clone() } else { u.add_u64(k as u64) };
                         if check_deletes {
@@ -433,7 +433,7 @@ impl Db {
         Ok(ColumnsOut { names: wanted.into_iter().map(|(n, _)| n).collect(), cols, present })
     }
 
-    /// Sparse-Zustand einer u-Gruppe ohne Merge-/Record-Cache (Batch-Lesen).
+    /// Sparse state of a u group without merge/record cache (batch reads).
     fn sparse_states_direct(
         &self,
         realm: &Nat,
@@ -453,9 +453,9 @@ impl Db {
         Ok(out)
     }
 
-    /// Logisches Löschen eines Objekts. CLASSIC: BASE-Record (DELETE-Block)
-    /// und lebende Sparse-Zellen der u-Gruppe; sonst alle belegten Zellen
-    /// per Tombstone. Rückgabe: Anzahl gelöschter Records + Zellen.
+    /// Logical deletion of an object. CLASSIC: BASE record (DELETE block)
+    /// and live sparse cells of the u group; otherwise all occupied cells
+    /// via tombstone. Returns: number of deleted records + cells.
     pub fn delete_object(&mut self, r: &LayoutRef, obj: &Nat, lane: Lane, commit: bool) -> Result<u64> {
         let lay = self.layout_by_ref(r)?.clone();
         address::require_positive("object_id", obj)?;

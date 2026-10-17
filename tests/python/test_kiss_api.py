@@ -1,4 +1,4 @@
-"""Einfache Einzel-API: ein Datensatz/eine Zelle pro Aufruf, optional mit Commit."""
+"""Simple single-item API: one record/cell per call, optionally with commit."""
 import pytest
 
 import nhydb
@@ -34,7 +34,7 @@ def test_uncommitted_record_lost_after_crash(tmpdb):
     db = _setup(tmpdb)
     db.put_record(1, 1, {"N": 1, "tp": 1}, commit=True)
     db.put_record(1, 2, {"N": 2, "tp": 2}, commit=False)
-    db.close(commit=False)  # wie Absturz: Daten im Tail, aber kein Superblock-Commit
+    db.close(commit=False)  # like a crash: data in the tail, but no superblock commit
     db = nhydb.NHyDB(tmpdb)
     assert db.recovered_tail_bytes > 0
     assert db.get_record(1, 1) is not None
@@ -49,12 +49,12 @@ def test_put_cell_get_value_delete(tmpdb):
     assert db.get_value(1, 14, 744, lane="NR") == "y"
     assert db.get_value(1, 14, 743) is None
     db.put_cell(1, 14, 745, None, type="bytes")
-    assert db.get_cell(1, 14, 745)["value"] is None  # Null ist belegt
+    assert db.get_cell(1, 14, 745)["value"] is None  # a null value still occupies the cell
     db.delete_cell(1, 14, 744, commit=True)
     assert db.get_value(1, 14, 744) is None
     assert db.get_value(1, 14, 744, lane="NR") == "y"
     with pytest.raises(nhydb.SchemaError):
-        db.put_cell(1, 14, 746, 5)  # kein Typ ableitbar
+        db.put_cell(1, 14, 746, 5)  # no type can be inferred
     with pytest.raises(nhydb.RealmLimitError):
         db.put_cell(1, 14, 10**100 + 1, 5, type="u8")
 
@@ -65,7 +65,7 @@ def test_delete_record_all_geometries(tmpdb):
     for lid in (1, 2, 3):
         db.put_record(lid, 7, {"N": 7, "tp": 7})
     db.put_extensions(1, 7, {"note": "n"})
-    assert db.delete_record(1, 7, commit=True) == 2  # BASE-Record + Extension-Zelle
+    assert db.delete_record(1, 7, commit=True) == 2  # BASE record + extension cell
     assert db.get_record(1, 7) is None
     assert db.get_value(1, 7, 50) is None
     for lid in (2, 3):

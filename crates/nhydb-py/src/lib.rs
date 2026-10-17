@@ -1,15 +1,15 @@
-//! PyO3-Fassade der nativen NHyDB (`nhydb._native`).
+//! PyO3 facade of the native NHyDB (`nhydb._native`).
 //!
-//! Die Klasse `NHyDB` spiegelt die öffentliche API der Python-v0.14
-//! (Methodennamen, Keyword-Argumente, Ergebnis-dicts). Zusätzlich:
-//! * KISS-Einzel-API: `put_cell`, `put_record`, `get_value`, … mit `commit=`
-//! * NumPy-Batch-API: `put_numpy_batch`, `put_cells_numpy`,
-//!   `put_objects_numpy`, `read_numpy` (Schleifen vollständig in Rust).
+//! The `NHyDB` class exposes the public Python API (method names, keyword
+//! arguments, result dicts). In addition:
+//! * KISS single-item API: `put_cell`, `put_record`, `get_value`, … with `commit=`
+//! * NumPy batch API: `put_numpy_batch`, `put_cells_numpy`,
+//!   `put_objects_numpy`, `read_numpy` (loops run entirely in Rust).
 //!
-//! Hier findet keine Datenbanklogik statt; alles delegiert an `nhydb-core`.
+//! No database logic lives here; everything is delegated to `nhydb-core`.
 
-// Verschachtelte Bedingungen bleiben bewusst erhalten: Sie folgen der Struktur
-// der Python-Referenz und erleichtern den zeilenweisen Abgleich.
+// Nested conditions are kept on purpose: they mirror the structure of the
+// Python API logic and keep the code easy to compare line by line.
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 mod conv;
 mod exceptions;
@@ -41,14 +41,14 @@ use exceptions::*;
 use pyplugin::{PyLayoutDef, PyPlugin};
 
 // ----------------------------------------------------------------------
-// Argumenthilfen
+// Argument helpers
 // ----------------------------------------------------------------------
 
 pub(crate) fn layout_ref(obj: &Bound<'_, PyAny>) -> PyResult<LayoutRef> {
     if let Ok(s) = obj.cast::<PyString>() {
         let s = s.to_str()?;
         if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-            return Ok(LayoutRef::Id(s.parse().map_err(|_| PyValueError::new_err("layout_id zu gross"))?));
+            return Ok(LayoutRef::Id(s.parse().map_err(|_| PyValueError::new_err("layout_id too large"))?));
         }
         return Ok(LayoutRef::Name(s.to_owned()));
     }
@@ -56,10 +56,10 @@ pub(crate) fn layout_ref(obj: &Bound<'_, PyAny>) -> PyResult<LayoutRef> {
 }
 
 fn type_code(name: &str) -> PyResult<TypeCode> {
-    TypeCode::from_name(name).ok_or_else(|| SchemaError::new_err(format!("unbekannter Datentyp '{name}'")))
+    TypeCode::from_name(name).ok_or_else(|| SchemaError::new_err(format!("unknown data type '{name}'")))
 }
 
-/// Felder für `create_shape`: dicts oder Objekte mit `to_dict()`.
+/// Fields for `create_shape`: dicts or objects with `to_dict()`.
 fn shape_fields(fields: &Bound<'_, PyAny>) -> PyResult<Vec<FieldDef>> {
     let mut out = Vec::new();
     for f in fields.try_iter()? {
@@ -70,7 +70,7 @@ fn shape_fields(fields: &Bound<'_, PyAny>) -> PyResult<Vec<FieldDef>> {
     Ok(out)
 }
 
-/// Extension-Argument (`_normalize_extensions`-Eingabeformen) → Paare.
+/// Extension argument (`_normalize_extensions` input forms) → pairs.
 fn ext_items(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(Val, Val)>> {
     let Some(obj) = obj else { return Ok(vec![]) };
     if obj.is_none() {
@@ -102,7 +102,7 @@ fn ext_items(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(Val, Val)>> {
     Ok(out)
 }
 
-/// Zellen für `put_points`: dicts `{u,v,value,type}` oder Tupel `(u,v,value[,type])`.
+/// Cells for `put_points`: dicts `{u,v,value,type}` or tuples `(u,v,value[,type])`.
 fn cells_from_py(cells: &Bound<'_, PyAny>) -> PyResult<Vec<CellInput>> {
     let mut out = Vec::new();
     for item in cells.try_iter()? {
@@ -117,7 +117,7 @@ fn cells_from_py(cells: &Bound<'_, PyAny>) -> PyResult<Vec<CellInput>> {
         } else {
             let n = item.len()?;
             if n != 3 && n != 4 {
-                return Err(PyValueError::new_err("Cell erwartet (u,v,value[,type])"));
+                return Err(PyValueError::new_err("cell expects (u,v,value[,type])"));
             }
             let typ = if n == 4 {
                 let t = item.get_item(3)?;
@@ -198,7 +198,7 @@ fn evolve_spec(
     })
 }
 
-/// Öffnungsoptionen aus den Python-Schlüsselwortargumenten.
+/// Open options from the Python keyword arguments.
 #[allow(clippy::too_many_arguments)]
 fn open_opts(
     strict: bool,
@@ -229,7 +229,7 @@ fn open_opts(
 #[pyclass(name = "NHyDB", module = "nhydb", weakref, dict)]
 pub struct NHyDB {
     pub(crate) db: Db,
-    /// Position der Dateisicht `db.f` (seek/tell über mehrere Zugriffe).
+    /// Position of the file view `db.f` (seek/tell across multiple accesses).
     fpos: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -241,7 +241,7 @@ impl NHyDB {
 
 #[pymethods]
 impl NHyDB {
-    /// Öffnet eine bestehende Datenbank.
+    /// Opens an existing database.
     #[new]
     #[pyo3(signature = (path, *, strict=true, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
@@ -261,7 +261,7 @@ impl NHyDB {
         Ok(NHyDB { db, fpos: Default::default() })
     }
 
-    /// Legt eine neue Datenbank mit Layoutplan und Schlüssel an.
+    /// Creates a new database with a layout plan and key.
     #[classmethod]
     #[pyo3(signature = (path, *, overwrite=false, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
@@ -282,7 +282,7 @@ impl NHyDB {
         Ok(NHyDB { db, fpos: Default::default() })
     }
 
-    /// `get_system_metadata()`: R0,u1 (nur lesen).
+    /// `get_system_metadata()`: R0,u1 (read-only).
     fn get_system_metadata(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         from_val(py, &self.db.get_system_metadata())
     }
@@ -291,7 +291,7 @@ impl NHyDB {
     fn get_system_cell(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let n = match to_nat(v) {
             Ok(n) => n,
-            Err(_) => return Err(AddressError::new_err("System-v ausserhalb R0,u1")),
+            Err(_) => return Err(AddressError::new_err("system v outside R0,u1")),
         };
         from_val(py, &self.db.get_system_cell(&n).py()?)
     }
@@ -321,11 +321,11 @@ impl NHyDB {
     #[pyo3(signature = (size_bytes, *, commit=false))]
     fn set_max_db_size(&mut self, size_bytes: &Bound<'_, PyAny>, commit: bool) -> PyResult<u64> {
         if size_bytes.is_instance_of::<pyo3::types::PyBool>() || !size_bytes.is_instance_of::<pyo3::types::PyInt>() {
-            return Err(PyValueError::new_err("size_bytes muss ein positiver Integer sein"));
+            return Err(PyValueError::new_err("size_bytes must be a positive integer"));
         }
-        let n: i128 = size_bytes.extract().map_err(|_| PyValueError::new_err("size_bytes muss ein positiver Integer sein"))?;
+        let n: i128 = size_bytes.extract().map_err(|_| PyValueError::new_err("size_bytes must be a positive integer"))?;
         if n <= 0 || n > u64::MAX as i128 {
-            return Err(PyValueError::new_err("size_bytes muss ein positiver Integer sein"));
+            return Err(PyValueError::new_err("size_bytes must be a positive integer"));
         }
         self.db.set_max_db_size(n as u64, commit).py()
     }
@@ -396,7 +396,7 @@ impl NHyDB {
         from_val(py, &r)
     }
 
-    /// `sql(text, parameters=None, *, lane=0)`: ein lesendes NHySQL-SELECT.
+    /// `sql(text, parameters=None, *, lane=0)`: a read-only NHySQL SELECT.
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn sql(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
@@ -404,9 +404,9 @@ impl NHyDB {
         from_val(py, &r)
     }
 
-    /// `sql_numpy(text, parameters=None, *, lane=0)`: Ergebnis eines SELECT als
-    /// `{Spalte: numpy.ndarray}` in Spaltenreihenfolge (Typregeln siehe
-    /// `docs/PYTHON_API.md`).
+    /// `sql_numpy(text, parameters=None, *, lane=0)`: result of a SELECT as
+    /// `{column: numpy.ndarray}` in column order (bool, int64, float64 or
+    /// object, whichever is the most compact exact representation).
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn sql_numpy(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
@@ -461,7 +461,7 @@ impl NHyDB {
     ) -> PyResult<mathapi::PyMathLayoutState> {
         let spec = spec
             .cast::<mathapi::PyMathMapLayoutSpec>()
-            .map_err(|_| PyTypeError::new_err("spec muss MathMapLayoutSpec sein"))?
+            .map_err(|_| PyTypeError::new_err("spec must be a MathMapLayoutSpec"))?
             .get()
             .inner
             .clone();
@@ -513,7 +513,7 @@ impl NHyDB {
     fn replace_math_spec(&mut self, layout_id: u64, spec: &Bound<'_, PyAny>, payload_type: Option<String>, commit: bool) -> PyResult<mathapi::PyMathLayoutState> {
         let spec = spec
             .cast::<mathapi::PyMathMapLayoutSpec>()
-            .map_err(|_| PyTypeError::new_err("spec muss MathMapLayoutSpec sein"))?
+            .map_err(|_| PyTypeError::new_err("spec must be a MathMapLayoutSpec"))?
             .get()
             .inner
             .clone();
@@ -535,11 +535,11 @@ impl NHyDB {
 
     /// `put_math_numpy(layout_id, inputs, payloads, *, overwrite=False, commit=False)`
     ///
-    /// NumPy-Batch für MATH-Layouts: `inputs` als 2D-Array (Zeilen ×
-    /// Parameter), 1D-Array (ein Parameter) oder Liste von Spalten je
-    /// Parameter; `payloads` als 1D-Array/Liste. Gleiche Semantik wie
-    /// `put_math_batch` (Planung, Konflikte, vollständiger Rollback), die
-    /// Schleife läuft ohne GIL in Rust.
+    /// NumPy batch for MATH layouts: `inputs` as a 2D array (rows ×
+    /// parameters), 1D array (one parameter) or list of columns per
+    /// parameter; `payloads` as a 1D array/list. Same semantics as
+    /// `put_math_batch` (planning, conflicts, full rollback); the
+    /// loop runs in Rust without the GIL.
     #[pyo3(signature = (layout_id, inputs, payloads, *, overwrite=false, commit=false))]
     fn put_math_numpy(
         &mut self,
@@ -558,13 +558,13 @@ impl NHyDB {
                 (0..k).map(|j| Ok(numpy_io::col_from_py(&t.get_item(j)?)?.to_vals())).collect::<PyResult<_>>()?
             }
             Some(1) => vec![numpy_io::col_from_py(inputs)?.to_vals()],
-            Some(_) => return Err(PyValueError::new_err("inputs muss 1D oder 2D sein")),
+            Some(_) => return Err(PyValueError::new_err("inputs must be 1D or 2D")),
             None => inputs.try_iter()?.map(|c| Ok(numpy_io::col_from_py(&c?)?.to_vals())).collect::<PyResult<_>>()?,
         };
         let vals = numpy_io::col_from_py(payloads)?.to_vals();
         let n = vals.len();
         if columns.iter().any(|c| c.len() != n) {
-            return Err(PyValueError::new_err("inputs und payloads muessen gleich viele Zeilen haben"));
+            return Err(PyValueError::new_err("inputs and payloads must have the same number of rows"));
         }
         let db = &mut self.db;
         let res = py.detach(move || {
@@ -588,7 +588,7 @@ impl NHyDB {
         let ins = mathapi::inputs_of(inputs)?;
         match self.db.get_math_cell(layout_id, &ins, dyn_address).py()? {
             Some(mut v) => {
-                // _math_inputs ist in Python ein Tupel
+                // _math_inputs is a tuple in Python
                 let d = from_val(py, &{
                     v.remove("_math_inputs");
                     v
@@ -606,7 +606,7 @@ impl NHyDB {
         from_val(py, &self.db.get_math(layout_id, &mathapi::inputs_of(inputs)?).py()?)
     }
 
-    /// MATH-Zustände `{layout_id: MathLayoutState}`.
+    /// MATH states `{layout_id: MathLayoutState}`.
     #[getter]
     fn math_layouts(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
@@ -616,7 +616,7 @@ impl NHyDB {
         Ok(d.into_any().unbind())
     }
 
-    /// Lesende Dateisicht (`seek`/`tell`) für Werkzeuge und Referenztests.
+    /// Read-only file view (`seek`/`tell`) for tools and conformance tests.
     #[getter]
     fn f(&self) -> FileView {
         FileView { len: self.db.file_len(), pos: self.fpos.clone() }
@@ -656,7 +656,7 @@ impl NHyDB {
         Ok(textapi::PyFtCorpus { inner: (*self.db.fulltext_corpus(index_id, to_lane(lane)?).py()?).clone() })
     }
 
-    /// `fulltext_payloads(index_id, terms, *, lane=0)` → (dict term→Postings, Corpus)
+    /// `fulltext_payloads(index_id, terms, *, lane=0)` → (dict term→postings, corpus)
     #[pyo3(signature = (index_id, terms, *, lane=None))]
     fn fulltext_payloads<'py>(&self, py: Python<'py>, index_id: u64, terms: &Bound<'py, PyAny>, lane: Option<&Bound<'py, PyAny>>) -> PyResult<(Bound<'py, PyDict>, textapi::PyFtCorpus)> {
         let ts: Vec<String> = terms.try_iter()?.map(|x| x?.str().map(|s| s.to_string())).collect::<PyResult<_>>()?;
@@ -668,7 +668,7 @@ impl NHyDB {
         Ok((d, textapi::PyFtCorpus { inner: (*c).clone() }))
     }
 
-    /// `posting_count(index_id, cond, *, lane=0)`; `cond` Wert oder (lo, hi).
+    /// `posting_count(index_id, cond, *, lane=0)`; `cond` is a value or (lo, hi).
     #[pyo3(signature = (index_id, cond, *, lane=None))]
     fn posting_count(&self, index_id: u64, cond: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let c = match cond.cast::<PyTuple>() {
@@ -737,7 +737,7 @@ impl NHyDB {
         Ok(d)
     }
 
-    /// Realm-Definitionen `{realm_id: dict}`.
+    /// Realm definitions `{realm_id: dict}`.
     #[getter]
     fn realms(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
@@ -747,24 +747,24 @@ impl NHyDB {
         Ok(d.into_any().unbind())
     }
 
-    /// Zufällige Datenbank-ID (R0,u1,v1).
+    /// Random database ID (R0,u1,v1).
     #[getter]
     fn _db_id(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         from_val(py, &self.db.get_system_cell(&Nat::S(1)).py()?)
     }
 
-    /// Aktiver versiegelter Plan-Eintrag (Generation, Hash, Nonce, Ciphertext).
+    /// Active sealed plan entry (generation, hash, nonce, ciphertext).
     #[getter]
     fn _active_layout_entry(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         from_val(py, &self.db.active_layout_entry())
     }
 
-    /// Aktueller Schema-Snapshot (Klartext, wie er versiegelt würde).
+    /// Current schema snapshot (plaintext, as it would be sealed).
     fn _export_external_schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         from_val(py, &self.db.export_schema().py()?)
     }
 
-    /// Index-Definitionen `{index_id: IndexDef}`.
+    /// Index definitions `{index_id: IndexDef}`.
     #[getter]
     fn index_defs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
@@ -865,7 +865,7 @@ impl NHyDB {
     ) -> PyResult<Py<PyAny>> {
         let realm = to_nat(realm_id)?;
         if !self.db.has_realm(&realm) {
-            return Err(SchemaError::new_err("Realm fehlt"));
+            return Err(SchemaError::new_err("realm missing"));
         }
         let fs = shape_fields(fields)?;
         let s = self.db.create_shape(to_id(shape_id, "shape_id")?, &realm, &name, fs, &description).py()?;
@@ -907,7 +907,7 @@ impl NHyDB {
             let d = to_val(&d)?;
             if let Some(r) = d.get("realm_id") {
                 if r.as_nat().as_ref() != Some(&realm) {
-                    return Err(SchemaError::new_err("Extension passt nicht zum Realm"));
+                    return Err(SchemaError::new_err("extension does not match the realm"));
                 }
             }
             let v = d.get("v").and_then(|x| x.as_nat()).ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("v"))?;
@@ -1124,7 +1124,7 @@ impl NHyDB {
     ) -> PyResult<PyLayoutDef> {
         let realm = to_nat(realm_id)?;
         if !self.db.has_realm(&realm) {
-            return Err(SchemaError::new_err("Realm fehlt"));
+            return Err(SchemaError::new_err("realm missing"));
         }
         let spec = LayoutSpec {
             layout_id: to_id(layout_id, "layout_id")?,
@@ -1190,7 +1190,7 @@ impl NHyDB {
     ) -> PyResult<PyLayoutDef> {
         let fs = match to_val(fields)? {
             Val::List(l) => l,
-            _ => return Err(PyTypeError::new_err("fields muss eine Liste sein")),
+            _ => return Err(PyTypeError::new_err("fields must be a list")),
         };
         let lay = self
             .db
@@ -1215,7 +1215,7 @@ impl NHyDB {
         let fs = match fields.filter(|f| !f.is_none()).map(|f| to_val(f)).transpose()? {
             Some(Val::List(l)) => l,
             None => vec![],
-            _ => return Err(PyTypeError::new_err("fields muss eine Liste sein")),
+            _ => return Err(PyTypeError::new_err("fields must be a list")),
         };
         let lay = self
             .db
@@ -1266,7 +1266,7 @@ impl NHyDB {
         Ok(PyLayoutDef { inner: lay })
     }
 
-    /// Registriert ein Python-Objekt als CUSTOM-Plugin (Laufzeit, nicht persistiert).
+    /// Registers a Python object as a CUSTOM plugin (runtime only, not persisted).
     fn register_layout_plugin(slf: Bound<'_, Self>, name: String, plugin: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let weak = PyWeakrefReference::new(slf.as_any())?.unbind();
         let p = PyPlugin { obj: plugin.clone().unbind(), db: Some(weak) };
@@ -1375,7 +1375,7 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // Schreiben
+    // Writing
     // ------------------------------------------------------------------
 
     #[pyo3(signature = (realm_id, cells, *, lane=None, commit=false, u_window=10_000))]
@@ -1390,7 +1390,7 @@ impl NHyDB {
     ) -> PyResult<Py<PyAny>> {
         let realm = to_nat(realm_id)?;
         if !self.db.has_realm(&realm) {
-            return Err(SchemaError::new_err("Realm fehlt"));
+            return Err(SchemaError::new_err("realm missing"));
         }
         let lane = to_lane(lane)?;
         let cells = cells_from_py(cells)?;
@@ -1483,7 +1483,7 @@ impl NHyDB {
                 }
                 if flat.len() - before != width {
                     let sid_show = sid.or_else(|| self.db.realms.get(&realm).and_then(|r| r.default_shape_id)).unwrap_or(0);
-                    return Err(SchemaError::new_err(format!("Shape {sid_show} erwartet {width} Werte")));
+                    return Err(SchemaError::new_err(format!("shape {sid_show} expects {width} values")));
                 }
             }
             let db = &mut self.db;
@@ -1514,7 +1514,7 @@ impl NHyDB {
         let vals = match to_val(values)? {
             Val::Map(m) => Val::Map(m),
             Val::List(l) => Val::List(l),
-            _ => return Err(PyTypeError::new_err("values muss Liste/Tupel oder dict sein")),
+            _ => return Err(PyTypeError::new_err("values must be a list/tuple or dict")),
         };
         let r = self.db.put(&to_nat(realm_id)?, &to_nat(u)?, vals, sid, ext, lane, commit).py()?;
         from_val(py, &r)
@@ -1557,7 +1557,7 @@ impl NHyDB {
                 let a: Vec<Bound<'_, PyAny>> = vs.try_iter()?.collect::<PyResult<_>>()?;
                 let b: Vec<Bound<'_, PyAny>> = vals.try_iter()?.collect::<PyResult<_>>()?;
                 if a.len() != b.len() {
-                    return Err(PyValueError::new_err("vs und values muessen gleich lang sein"));
+                    return Err(PyValueError::new_err("vs and values must have the same length"));
                 }
                 a.iter().zip(b.iter()).map(|(k, v)| Ok((to_val(k)?, to_val(v)?))).collect::<PyResult<_>>()?
             }
@@ -1640,7 +1640,7 @@ impl NHyDB {
                 _ => {
                     let it: Vec<Bound<'_, PyAny>> = item.try_iter()?.collect::<PyResult<_>>()?;
                     if it.len() != 2 {
-                        return Err(PyValueError::new_err("Objekt erwartet (object_id, values)"));
+                        return Err(PyValueError::new_err("object expects (object_id, values)"));
                     }
                     (it[0].clone(), it[1].clone())
                 }
@@ -1653,7 +1653,7 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // Lesen
+    // Reading
     // ------------------------------------------------------------------
 
     #[pyo3(signature = (realm_id, u, *, lane=None))]
@@ -1810,7 +1810,7 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // Indizes
+    // Indexes
     // ------------------------------------------------------------------
 
     #[pyo3(signature = (index_ids=None, *, commit=false))]
@@ -1873,7 +1873,7 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // Wartung
+    // Maintenance
     // ------------------------------------------------------------------
 
     fn checkpoint(&mut self) -> PyResult<u64> {
@@ -1946,11 +1946,11 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // KISS-Einzel-API
+    // KISS single-item API
     // ------------------------------------------------------------------
 
-    /// Schreibt eine einzelne Zelle `(R,u,v,lane)`; `commit=True` macht sie
-    /// vor der Rückkehr dauerhaft.
+    /// Writes a single cell `(R,u,v,lane)`; `commit=True` makes it
+    /// durable before returning.
     #[pyo3(signature = (realm_id, u, v, value, *, r#type=None, lane=None, commit=false))]
     #[allow(clippy::too_many_arguments)]
     fn put_cell(
@@ -1971,7 +1971,7 @@ impl NHyDB {
         from_val(py, &self.db.put_points(&realm, vec![cell], lane, commit, 10_000).py()?)
     }
 
-    /// Wert einer Zelle (None, wenn nicht belegt).
+    /// Value of a cell (None if not occupied).
     #[pyo3(signature = (realm_id, u, v, *, lane=None))]
     fn get_value(&self, py: Python<'_>, realm_id: &Bound<'_, PyAny>, u: &Bound<'_, PyAny>, v: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let lane = to_lane(lane)?;
@@ -1991,7 +1991,7 @@ impl NHyDB {
         self.delete_point(py, realm_id, u, v, lane, commit)
     }
 
-    /// Schreibt einen logischen Datensatz über ein Layout.
+    /// Writes a logical record via a layout.
     #[pyo3(signature = (layout_id, object_id, values, *, lane=None, commit=false))]
     fn put_record(
         &mut self,
@@ -2010,8 +2010,8 @@ impl NHyDB {
         self.get_object(py, layout_id, object_id, lane, false)
     }
 
-    /// Löscht einen logischen Datensatz (CLASSIC: BASE-Record + Sparse-Zellen;
-    /// sonst alle belegten Zellen per Tombstone). Rückgabe: gelöschte Zellen/Records.
+    /// Deletes a logical record (CLASSIC: BASE record + sparse cells;
+    /// otherwise all occupied cells via tombstone). Returns deleted cells/records.
     #[pyo3(signature = (layout_id, object_id, *, lane=None, commit=false))]
     fn delete_record(&mut self, layout_id: &Bound<'_, PyAny>, object_id: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>, commit: bool) -> PyResult<u64> {
         let r = self.rlookup(layout_id)?;
@@ -2020,12 +2020,12 @@ impl NHyDB {
     }
 
     // ------------------------------------------------------------------
-    // NumPy-Batch-API
+    // NumPy batch API
     // ------------------------------------------------------------------
 
-    /// Schreibt `len` zusammenhängende BASE-Records ab `u_start` aus Spalten
-    /// (dict Feldname→Array oder Sequenz in Shape-Reihenfolge). Die gesamte
-    /// Kodier- und Schreibschleife läuft in Rust ohne GIL.
+    /// Writes `len` contiguous BASE records starting at `u_start` from columns
+    /// (dict field name→array or sequence in shape order). The entire
+    /// encode and write loop runs in Rust without the GIL.
     #[pyo3(signature = (realm_id, u_start, columns, *, shape_id=None, lane=None, commit=false))]
     #[allow(clippy::too_many_arguments)]
     fn put_numpy_batch(
@@ -2042,16 +2042,16 @@ impl NHyDB {
         let realm = to_nat(realm_id)?;
         let us = to_nat(u_start)?;
         let sid = shape_id.filter(|x| !x.is_none()).map(|x| to_id(x, "shape_id")).transpose()?;
-        let r = self.db.realms.get(&realm).ok_or_else(|| SchemaError::new_err("Realm fehlt"))?;
-        let sid_eff = sid.or(r.default_shape_id).ok_or_else(|| SchemaError::new_err("kein Shape angegeben/default"))?;
+        let r = self.db.realms.get(&realm).ok_or_else(|| SchemaError::new_err("realm missing"))?;
+        let sid_eff = sid.or(r.default_shape_id).ok_or_else(|| SchemaError::new_err("no shape given/default"))?;
         let shape = match self.db.shapes.get(&sid_eff) {
             Some(s) if s.realm_id == realm => s.clone(),
-            _ => return Err(SchemaError::new_err("Shape fehlt/passt nicht")),
+            _ => return Err(SchemaError::new_err("shape missing/mismatched")),
         };
         let owned: Vec<numpy_io::OwnedCol> = if let Ok(d) = columns.cast::<PyDict>() {
             let mut v = Vec::with_capacity(shape.fields.len());
             for f in &shape.fields {
-                let c = d.get_item(&f.name)?.ok_or_else(|| SchemaError::new_err(format!("Pflichtfeld '{}' fehlt", f.name)))?;
+                let c = d.get_item(&f.name)?.ok_or_else(|| SchemaError::new_err(format!("required field '{}' missing", f.name)))?;
                 v.push(numpy_io::col_from_py(&c)?);
             }
             v
@@ -2068,8 +2068,8 @@ impl NHyDB {
         from_val(py, &res.py()?)
     }
 
-    /// Schreibt Sparse-Zellen aus Arrays: `u`, `v` (Array oder Skalar),
-    /// `values` (Array/Liste). `type` erzwingt einen selbsttypisierten Datentyp.
+    /// Writes sparse cells from arrays: `u`, `v` (array or scalar),
+    /// `values` (array/list). `type` forces a self-typed data type.
     #[pyo3(signature = (realm_id, u, v, values, *, r#type=None, lane=None, commit=false, u_window=10_000))]
     #[allow(clippy::too_many_arguments)]
     fn put_cells_numpy(
@@ -2087,7 +2087,7 @@ impl NHyDB {
         let lane = to_lane(lane)?;
         let realm = to_nat(realm_id)?;
         if !self.db.has_realm(&realm) {
-            return Err(SchemaError::new_err("Realm fehlt"));
+            return Err(SchemaError::new_err("realm missing"));
         }
         let typ = r#type.map(|t| type_code(&t)).transpose()?;
         let vals = numpy_io::col_from_py(values)?;
@@ -2095,7 +2095,7 @@ impl NHyDB {
         let us = numpy_io::nats_from_py(u, Some(n), "u")?;
         let vs = numpy_io::nats_from_py(v, Some(n), "v")?;
         if us.len() != n || vs.len() != n {
-            return Err(PyValueError::new_err("u, v und values muessen gleich lang sein"));
+            return Err(PyValueError::new_err("u, v and values must have the same length"));
         }
         let db = &mut self.db;
         let res = py.detach(move || {
@@ -2111,8 +2111,8 @@ impl NHyDB {
         from_val(py, &res.py()?)
     }
 
-    /// Schreibt Objekte spaltenweise über ein beliebiges Layout.
-    /// `object_ids`: aufsteigendes Ganzzahl-Array (oder Startwert int + Spaltenlänge).
+    /// Writes objects column-wise via any layout.
+    /// `object_ids`: increasing integer array (or start value int + column length).
     #[pyo3(signature = (layout_id, object_ids, columns, *, lane=None, commit=false, u_window=10_000))]
     #[allow(clippy::too_many_arguments)]
     fn put_objects_numpy(
@@ -2146,8 +2146,8 @@ impl NHyDB {
         from_val(py, &res.py()?)
     }
 
-    /// Liest `count` CLASSIC-Records ab `u_start` als dict Feldname → NumPy-Array
-    /// plus `"_present"` (bool-Array). Fehlende Werte: 0 bzw. NaN bzw. None.
+    /// Reads `count` CLASSIC records starting at `u_start` as dict field name → NumPy array
+    /// plus `"_present"` (bool array). Missing values: 0, NaN or None respectively.
     #[pyo3(signature = (realm_id, u_start, count, fields=None, *, lane=None))]
     fn read_numpy(
         &self,
@@ -2178,16 +2178,16 @@ impl NHyDB {
 
 impl NHyDB {
     fn dense_width(&self, realm: &Nat, sid: Option<u64>) -> PyResult<usize> {
-        let r = self.db.realms.get(realm).ok_or_else(|| SchemaError::new_err("Realm fehlt"))?;
-        let sid = sid.or(r.default_shape_id).ok_or_else(|| SchemaError::new_err("kein Shape angegeben/default"))?;
+        let r = self.db.realms.get(realm).ok_or_else(|| SchemaError::new_err("realm missing"))?;
+        let sid = sid.or(r.default_shape_id).ok_or_else(|| SchemaError::new_err("no shape given/default"))?;
         match self.db.shapes.get(&sid) {
             Some(s) if &s.realm_id == realm => Ok(s.fields.len()),
-            _ => Err(SchemaError::new_err("Shape fehlt/passt nicht")),
+            _ => Err(SchemaError::new_err("shape missing/mismatched")),
         }
     }
 }
 
-// u_end-Sentinel (v0.14 `_UNSET`): nicht übergeben ≠ None (= unbegrenzt).
+// u_end sentinel (`_UNSET`): not passed ≠ None (= unbounded).
 pub struct UEnd(Option<Py<PyAny>>);
 
 fn unset_marker() -> UEnd {
@@ -2201,7 +2201,7 @@ impl<'a, 'py> FromPyObject<'a, 'py> for UEnd {
     }
 }
 
-/// None (explizit) → unbegrenzt; nicht übergeben → unverändert.
+/// None (explicit) → unbounded; not passed → unchanged.
 fn ue_spec(py: Python<'_>, u_end: Option<UEnd>) -> PyResult<Option<Option<Nat>>> {
     match u_end {
         None => Ok(Some(None)),
@@ -2211,7 +2211,7 @@ fn ue_spec(py: Python<'_>, u_end: Option<UEnd>) -> PyResult<Option<Option<Nat>>>
 }
 
 // ----------------------------------------------------------------------
-// Modulfunktionen (Adressmathematik, Codec)
+// Module functions (address mathematics, codec)
 // ----------------------------------------------------------------------
 
 #[pyfunction]
@@ -2285,7 +2285,7 @@ fn cell_address(py: Python<'_>, realm_id: &Bound<'_, PyAny>, u: &Bound<'_, PyAny
 fn enc_vu<'py>(py: Python<'py>, n: &Bound<'py, PyAny>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
     let b: num_bigint::BigInt = n.extract()?;
     if b.sign() == num_bigint::Sign::Minus {
-        return Err(PyValueError::new_err("varuint erwartet n>=0"));
+        return Err(PyValueError::new_err("varuint expects n>=0"));
     }
     let mut out = Vec::new();
     Nat::from_bigint(&b).unwrap().put_vu(&mut out);
@@ -2316,7 +2316,7 @@ fn dec_vi(py: Python<'_>, buf: &[u8], pos: usize) -> PyResult<(Py<PyAny>, usize)
     Ok((nhydb_core::nat::zigzag_decode(&z).into_py_any(py)?, p))
 }
 
-/// Persistierte Indexdefinition (`IndexDef` der v0.27).
+/// Persisted index definition (`IndexDef`).
 #[pyclass(name = "IndexDef", module = "nhydb", frozen)]
 pub struct PyIndexDef {
     def: nhydb_core::schema::IndexDef,
@@ -2387,7 +2387,7 @@ impl PyIndexDef {
     }
 }
 
-/// Minimaler, lesender Ersatz für das Python-Dateiobjekt `db.f`.
+/// Minimal read-only substitute for the Python file object `db.f`.
 #[pyclass(module = "nhydb")]
 pub struct FileView {
     len: u64,

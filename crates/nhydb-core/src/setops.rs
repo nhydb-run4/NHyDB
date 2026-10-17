@@ -1,7 +1,7 @@
-//! Sortierte Mengenkerne (`sorted_unique_ints`, `intersect/union/
-//! difference_sorted_ints`) über aufsteigend sortierten Folgen.
+//! Sorted set kernels (`sorted_unique_ints`, `intersect/union/
+//! difference_sorted_ints`) over ascending sorted sequences.
 
-/// Schnitt zweier sortierter Folgen (galoppierend bei stark ungleichen Längen).
+/// Intersection of two sorted sequences (galloping when lengths differ greatly).
 pub fn intersect_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let mut out = Vec::with_capacity(small.len());
@@ -36,7 +36,7 @@ pub fn intersect_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     out
 }
 
-/// Vereinigung ohne Duplikate.
+/// Union without duplicates.
 pub fn union_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
@@ -57,7 +57,7 @@ pub fn union_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     out
 }
 
-/// Differenz A \ B.
+/// Difference A \ B.
 pub fn difference_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     let mut out = Vec::with_capacity(a.len());
     let mut j = 0;
@@ -72,7 +72,7 @@ pub fn difference_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     out
 }
 
-/// Sortiert und entfernt Duplikate.
+/// Sorts and removes duplicates.
 pub fn sorted_unique<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v.sort();
     v.dedup();

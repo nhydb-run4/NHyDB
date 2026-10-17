@@ -1,9 +1,9 @@
-//! Differenzieller Test des gezielten Sparse-Zugriffs (`vindex.rs`):
-//! Punkt- und Bereichszugriffe gegen ein unabhängiges Modell und gegen den
-//! vollständigen Merge (`sparse_updates_for_u`, v0.14-Semantik).
-//! Abgedeckt: Überschreiben über viele Blöcke, Tombstones, Null,
-//! selbsttypisierte Zellen, beide Lanes, BigInt-u/v, verschränktes
-//! Schreiben/Lesen (inkrementelle Indexpflege), Commit + Reopen.
+//! Differential test of targeted sparse access (`vindex.rs`):
+//! point and range accesses against an independent model and against the
+//! full merge (`sparse_updates_for_u`).
+//! Covered: overwrites across many blocks, tombstones, null,
+//! self-typed cells, both lanes, BigInt u/v, interleaved
+//! writing/reading (incremental index maintenance), commit + reopen.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("nhydb_rust_tests");
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(name);
-    // v0.27: DB-Triade plus Sperrdatei entfernen
+    // remove the DB file triad plus the lock file
     for suffix in ["", ".layout.enc", ".layout.key", ".lock"] {
         let _ = std::fs::remove_file(dir.join(format!("{name}{suffix}")));
     }
@@ -33,14 +33,14 @@ impl Rng {
     }
 }
 
-/// Eine Koordinatenzone mit Typregel für die Wertgenerierung.
+/// A coordinate zone with a type rule for value generation.
 #[derive(Clone)]
 struct Zone {
     realm: Nat,
     us: Vec<Nat>,
     v_base: Nat,
     v_width: u64,
-    /// Typ je (u-Index, v-Offset); None → selbsttypisiert schreiben
+    /// Type per (u index, v offset); None → write self-typed
     typ: fn(usize, u64) -> Option<TypeCode>,
 }
 
@@ -60,7 +60,7 @@ fn value_for(rng: &mut Rng, t: TypeCode) -> Val {
 }
 
 fn check_all(db: &Db, zones: &[Zone], model: &BTreeMap<Key, Option<Val>>, rng: &mut Rng) {
-    // Punktzugriffe auf geschriebene und nie geschriebene Zellen
+    // point accesses to written and never-written cells
     for z in zones {
         for (ui, u) in z.us.iter().enumerate() {
             for lane in [NL, NR] {
@@ -73,20 +73,20 @@ fn check_all(db: &Db, zones: &[Zone], model: &BTreeMap<Key, Option<Val>>, rng: &
                         Some(Some(x)) => Some(x.clone()),
                         _ => None,
                     };
-                    assert_eq!(got, want, "Punkt R{} u{} v{} lane{} (u-Index {ui})", z.realm, u, v, lane);
+                    assert_eq!(got, want, "point R{} u{} v{} lane{} (u index {ui})", z.realm, u, v, lane);
                     let from_merge = match merged.get(&v) {
                         Some(SVal::V(x)) => Some(x.clone()),
                         _ => None,
                     };
-                    assert_eq!(got, from_merge, "Merge-Orakel R{} u{} v{}", z.realm, u, v);
+                    assert_eq!(got, from_merge, "merge oracle R{} u{} v{}", z.realm, u, v);
                 }
-                // Bereiche (inkl. Tombstones) gegen den vollständigen Merge
+                // ranges (including tombstones) against the full merge
                 for _ in 0..8 {
                     let a = z.v_base.add_u64(rng.below(z.v_width + 2));
                     let b = a.add_u64(rng.below(z.v_width / 3 + 1));
                     let got = db.sparse_updates_for_u_range(&z.realm, u, &a, &b, lane).unwrap();
                     let want: Vec<(Nat, SVal)> = merged.range(a.clone()..=b.clone()).map(|(k, s)| (k.clone(), s.clone())).collect();
-                    assert_eq!(got, want, "Bereich R{} u{} [{a},{b}]", z.realm, u);
+                    assert_eq!(got, want, "range R{} u{} [{a},{b}]", z.realm, u);
                 }
             }
         }
@@ -99,7 +99,7 @@ fn run(seed: u64) {
     let big_u = Nat::from(num_bigint::BigUint::from(1u8) << 70usize);
     let big_v = Nat::from(num_bigint::BigUint::from(10u8).pow(40));
     let zones = vec![
-        // PACKED: u=1, span 5, Offsets 0..2 deklariert, 3..4 selbsttypisiert
+        // PACKED: u=1, span 5, offsets 0..2 declared, 3..4 self-typed
         Zone {
             realm: Nat::S(7),
             us: vec![Nat::S(1)],
@@ -112,7 +112,7 @@ fn run(seed: u64) {
                 _ => None,
             },
         },
-        // COLUMN: drei Feld-u, v = Objekt
+        // COLUMN: three field u, v = object
         Zone {
             realm: Nat::S(8),
             us: vec![Nat::S(10), Nat::S(11), Nat::S(12)],
@@ -120,7 +120,7 @@ fn run(seed: u64) {
             v_width: 300,
             typ: |ui, _| [Some(TypeCode::VarUInt), Some(TypeCode::Utf8), Some(TypeCode::U8)][ui],
         },
-        // BigInt: COLUMN-Feld auf u = 2^70, v ab 10^40 (PACKED-Span 10^39)
+        // BigInt: COLUMN field at u = 2^70, v from 10^40 (PACKED span 10^39)
         Zone {
             realm: Nat::S(9),
             us: vec![big_u.clone()],
@@ -128,7 +128,7 @@ fn run(seed: u64) {
             v_width: 200,
             typ: |_, _| Some(TypeCode::VarInt),
         },
-        // ohne Layout: nur selbsttypisierte Zellen
+        // no layout: self-typed cells only
         Zone { realm: Nat::S(7), us: vec![Nat::S(5000), Nat::S(5001)], v_base: Nat::S(1), v_width: 150, typ: |_, _| None },
     ];
     let mut db = Db::create(&p, true, OpenOptions::default()).unwrap();
@@ -156,13 +156,13 @@ fn run(seed: u64) {
         let z = &zones[rng.below(zones.len() as u64) as usize];
         let lane = if rng.below(3) == 0 { NR } else { NL };
         if rng.below(5) == 0 && !model.is_empty() {
-            // Tombstone auf eine zufällige Zelle dieser Zone (auch nie geschriebene)
+            // tombstone on a random cell of this zone (also never-written ones)
             let u = z.us[rng.below(z.us.len() as u64) as usize].clone();
             let v = z.v_base.add_u64(rng.below(z.v_width));
             db.delete_point(&z.realm, &u, &v, lane, false).unwrap();
             model.insert((z.realm.clone(), lane, u, v), None);
         } else {
-            // Batch: zusammenhängender v-Bereich (wie Objekt-Batches) oder Streuung
+            // batch: contiguous v range (like object batches) or scattered
             let n = 1 + rng.below(60);
             let start = rng.below(z.v_width);
             let scatter = rng.below(3) == 0;
@@ -212,8 +212,8 @@ fn sparse_point_and_range_match_full_merge() {
     }
 }
 
-/// get_object / occupied_n / get_record_view für PACKED und COLUMN über viele
-/// Blöcke, mit Überschreiben und Tombstones, gegen das Modell.
+/// get_object / occupied_n / get_record_view for PACKED and COLUMN across many
+/// blocks, with overwrites and tombstones, against the model.
 #[test]
 fn objects_over_many_blocks() {
     let p = tmp("sparse_access_objects.nhydb");
@@ -226,14 +226,14 @@ fn objects_over_many_blocks() {
     let cf = |u: i64, name: &str, t: &str| vmap! {"u" => u, "name" => name, "type" => t};
     db.create_column_layout(2, &Nat::S(4), "C", vec![cf(1, "a", "varuint"), cf(2, "b", "utf8")], None, 0, "").unwrap();
     let obj = |k: u64, gn: u64| vmap! {"a" => (k * 10 + gn) as i64, "b" => format!("o{k}g{gn}")};
-    // 50 Blöcke à 20 Objekte, danach Überschreiben einzelner Objekte
+    // 50 blocks of 20 objects each, then overwrite individual objects
     for b in 0..50u64 {
         let batch: Vec<(Nat, Val)> = (0..20).map(|j| (Nat::S(b * 20 + j + 1), obj(b * 20 + j + 1, 0))).collect();
         for lid in [1u64, 2] {
             db.put_objects_batch(&LayoutRef::Id(lid), batch.clone(), NL, false, 10_000).unwrap();
         }
     }
-    // erst lesen (baut die v-Indizes), dann schreiben (inkrementelle Pflege)
+    // read first (builds the v indexes), then write (incremental maintenance)
     for lid in [1u64, 2] {
         let o = db.get_object(&LayoutRef::Id(lid), &Nat::S(500), NL, false).unwrap().unwrap();
         assert_eq!(o.get("b"), Some(&Val::str("o500g0")));

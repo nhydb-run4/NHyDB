@@ -1,5 +1,5 @@
-//! Python-API der Indexsemantik (`nhydb_index_v027`): zustandslose
-//! Funktionen sowie `FullTextPosting`, `FullTextCorpus`, `PostingRef`.
+//! Python API of the index semantics (`nhydb.index`): stateless
+//! functions plus `FullTextPosting`, `FullTextCorpus`, `PostingRef`.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -25,7 +25,7 @@ fn str_tuple<'py>(py: Python<'py>, v: Vec<String>) -> PyResult<Bound<'py, PyTupl
     PyTuple::new(py, v)
 }
 
-/// Eintrag einer positionsbasierten FULLTEXT-Postingliste.
+/// Entry of a position-based FULLTEXT posting list.
 #[pyclass(name = "FullTextPosting", module = "nhydb", frozen, eq, skip_from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyFtPosting {
@@ -58,7 +58,7 @@ impl PyFtPosting {
     }
 }
 
-/// Dokumentlängen und Korpusstatistik eines FULLTEXT-Index.
+/// Document lengths and corpus statistics of a FULLTEXT index.
 #[pyclass(name = "FullTextCorpus", module = "nhydb", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyFtCorpus {
@@ -92,7 +92,7 @@ impl PyFtCorpus {
     }
 }
 
-/// Verzeichniseintrag eines SECONDARY-Blocks.
+/// Directory entry of a SECONDARY block.
 #[pyclass(name = "PostingRef", module = "nhydb", frozen)]
 pub struct PyPostingRef {
     #[pyo3(get)]
@@ -281,7 +281,7 @@ fn encode_fulltext_doc_lengths<'py>(py: Python<'py>, entries: &Bound<'py, PyAny>
         let it = it?;
         let dl: i64 = it.get_item(1)?.extract()?;
         if dl < 0 {
-            return Err(crate::exceptions::IndexConfigError::new_err("FULLTEXT Dokumentlaenge darf nicht negativ sein"));
+            return Err(crate::exceptions::IndexConfigError::new_err("FULLTEXT document length must not be negative"));
         }
         e.push((to_nat(&it.get_item(0)?)?, dl as u64));
     }
@@ -313,7 +313,7 @@ fn phrase_candidate_docs<'py>(py: Python<'py>, query_sequence: &Bound<'py, PyAny
     let seq: Vec<String> = query_sequence.try_iter()?.map(|x| x?.str().map(|s| s.to_string())).collect::<PyResult<_>>()?;
     let owned = postings_from_py(postings)?;
     let view: Vec<(String, &[FtPosting])> = owned.iter().map(|(t, p)| (t.clone(), &p[..])).collect();
-    // Python: fehlende Terme zählen als leere Postingliste
+    // missing terms count as an empty posting list
     nat_tuple(py, &ti::phrase_candidate_docs(&seq, &view))
 }
 
@@ -327,7 +327,7 @@ fn bm25_scores<'py>(
     k1: f64,
     b: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let corpus = corpus.cast::<PyFtCorpus>().map_err(|_| PyValueError::new_err("corpus muss FullTextCorpus sein"))?.get().inner.clone();
+    let corpus = corpus.cast::<PyFtCorpus>().map_err(|_| PyValueError::new_err("corpus must be a FullTextCorpus"))?.get().inner.clone();
     let cands: Option<Vec<Nat>> = match candidates {
         Some(c) if !c.is_none() => Some(c.try_iter()?.map(|x| to_nat(&x?)).collect::<PyResult<_>>()?),
         _ => None,

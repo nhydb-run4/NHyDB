@@ -1,4 +1,4 @@
-"""MATH-Realmplaner (Gegenstück zu ``nhydb_layout_v027``), nativ."""
+"""MATH realm planner (native)."""
 from ._native import (  # noqa: F401
     LayoutError,
     LayoutStateError,

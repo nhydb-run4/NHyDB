@@ -1,10 +1,10 @@
-//! Intervallindex über `[u_start, u_end]`-Bereiche von Segmenten.
+//! Interval index over `[u_start, u_end]` ranges of segments.
 //!
-//! Einträge sind nach `(start, id)` sortiert; zusätzlich wird das
-//! Präfixmaximum der Endwerte gehalten. Eine Punktanfrage startet beim
-//! letzten Eintrag mit `start <= u` und läuft rückwärts, bis das
-//! Präfixmaximum kleiner als `u` ist. Für nicht überlappende Segmente ist
-//! das O(log n); v0.14 durchsuchte bei Overlays linear alle Segmente.
+//! Entries are sorted by `(start, id)`; in addition the
+//! prefix maximum of the end values is kept. A point query starts at the
+//! last entry with `start <= u` and walks backwards until the
+//! prefix maximum is smaller than `u`. For non-overlapping segments this is
+//! O(log n) instead of a linear scan over all segments with overlays.
 
 use crate::nat::Nat;
 
@@ -27,7 +27,7 @@ impl IntervalIndex {
 
     pub fn insert(&mut self, start: Nat, end: Nat, id: usize) {
         let pos = self.starts.partition_point(|s| s <= &start);
-        // gleiche Starts: aufsteigende id (Einfügereihenfolge = Blockreihenfolge)
+        // equal starts: ascending id (insertion order = block order)
         let pos = {
             let mut p = pos;
             while p > 0 && self.starts[p - 1] == start && self.ids[p - 1] > id {
@@ -52,7 +52,7 @@ impl IntervalIndex {
         }
     }
 
-    /// Alle ids, deren Intervall `u` enthält (unsortiert).
+    /// All ids whose interval contains `u` (unsorted).
     pub fn stab(&self, u: &Nat, out: &mut Vec<usize>) {
         let mut j = self.starts.partition_point(|s| s <= u);
         while j > 0 {
@@ -66,7 +66,7 @@ impl IntervalIndex {
         }
     }
 
-    /// Alle ids, deren Intervall `[lo, hi]` schneidet.
+    /// All ids whose interval intersects `[lo, hi]`.
     pub fn overlapping(&self, lo: &Nat, hi: &Nat, out: &mut Vec<usize>) {
         let mut j = self.starts.partition_point(|s| s <= hi);
         while j > 0 {
@@ -94,7 +94,7 @@ impl IntervalIndex {
         false
     }
 
-    /// ids in Reihenfolge `(start, id)`.
+    /// ids in `(start, id)` order.
     pub fn ids_by_start(&self) -> &[usize] {
         &self.ids
     }

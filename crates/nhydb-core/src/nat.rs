@@ -1,12 +1,12 @@
-//! `Nat`: nichtnegative Ganzzahl beliebiger Größe mit u64-Schnellpfad.
+//! `Nat`: arbitrary-size non-negative integer with a u64 fast path.
 //!
-//! Mathematische Koordinaten (Realm, u, lokales v, V, G, N) sind in der
-//! NHyDB unbeschränkt (lokales v bis 10^100, N mit hunderten Stellen).
-//! Der Großteil realer Werte passt aber in 64 Bit. `Nat` speichert deshalb
-//! kleine Werte direkt und weicht nur bei Bedarf auf `BigUint` aus.
+//! Mathematical coordinates (realm, u, local v, V, G, N) are unbounded in
+//! NHyDB (local v up to 10^100, N with hundreds of digits). Most real
+//! values fit into 64 bits, however, so `Nat` stores small values directly
+//! and falls back to `BigUint` only when needed.
 //!
-//! Invariante: `Nat::B` enthält ausschließlich Werte > `u64::MAX`.
-//! Dadurch sind die abgeleiteten `Eq`, `Ord` und `Hash` numerisch korrekt.
+//! Invariant: `Nat::B` holds only values > `u64::MAX`.
+//! This makes the derived `Eq`, `Ord` and `Hash` numerically correct.
 
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -106,7 +106,7 @@ impl Nat {
         BigInt::from_biguint(Sign::Plus, self.to_big())
     }
 
-    /// Konvertiert eine vorzeichenbehaftete Ganzzahl; negative Werte → None.
+    /// Converts a signed integer; negative values → None.
     pub fn from_bigint(v: &BigInt) -> Option<Nat> {
         if v.sign() == Sign::Minus {
             return None;
@@ -138,7 +138,7 @@ impl Nat {
         Nat::from(self.to_big() + BigUint::from(o))
     }
 
-    /// `self - o`, falls nichtnegativ.
+    /// `self - o`, if non-negative.
     #[inline]
     pub fn checked_sub(&self, o: &Nat) -> Option<Nat> {
         match (self, o) {
@@ -169,7 +169,7 @@ impl Nat {
         Nat::from(self.to_big() * o.to_big())
     }
 
-    /// Ganzzahlige Division mit Rest. `o` darf nicht 0 sein.
+    /// Integer division with remainder. `o` must not be 0.
     pub fn div_rem(&self, o: &Nat) -> (Nat, Nat) {
         match (self, o) {
             (Nat::S(a), Nat::S(b)) => (Nat::S(a / b), Nat::S(a % b)),
@@ -195,14 +195,13 @@ impl Nat {
         BigUint::parse_bytes(s.as_bytes(), 10).map(Nat::from)
     }
 
-    /// Anzahl Dezimalstellen.
+    /// Number of decimal digits.
     pub fn decimal_len(&self) -> usize {
         self.to_string().len()
     }
 
     // ------------------------------------------------------------------
-    // VarUInt (Basis-128, 7 Datenbits pro Byte, little endian) – identisch
-    // zu `enc_vu`/`dec_vu` der v0.14.
+    // VarUInt (base 128, 7 data bits per byte, little endian).
     // ------------------------------------------------------------------
 
     #[inline]
@@ -249,7 +248,7 @@ impl PartialOrd<u64> for Nat {
 }
 
 // ----------------------------------------------------------------------
-// VarUInt-Primitive
+// VarUInt primitives
 // ----------------------------------------------------------------------
 
 #[inline]
@@ -279,9 +278,9 @@ fn put_vu_big(out: &mut Vec<u8>, b: &BigUint) {
     }
 }
 
-/// VarUInt mit Ergebnis als u64; liefert `None`, falls der Wert nicht in
-/// 64 Bit passt (Position bleibt dann unverändert). Fehler bei
-/// abgeschnittenen Eingaben.
+/// VarUInt decoded as u64; returns `None` if the value does not fit into
+/// 64 bits (the position is then left unchanged). Errors on truncated
+/// input.
 #[inline]
 pub fn get_vu64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     let mut p = *pos;
@@ -289,7 +288,7 @@ pub fn get_vu64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     let mut shift: u32 = 0;
     loop {
         let Some(&b) = buf.get(p) else {
-            return Err(Error::Corruption("VarUInt endet zu frueh".into()));
+            return Err(Error::Corruption("VarUInt ends prematurely".into()));
         };
         p += 1;
         value |= ((b & 0x7F) as u128) << shift;
@@ -307,7 +306,7 @@ pub fn get_vu64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     }
 }
 
-/// Dekodiert eine VarUInt beliebiger Größe.
+/// Decodes a VarUInt of arbitrary size.
 pub fn get_vu(buf: &[u8], pos: &mut usize) -> Result<Nat> {
     let start = *pos;
     if let Some(v) = get_vu64(buf, pos)? {
@@ -318,7 +317,7 @@ pub fn get_vu(buf: &[u8], pos: &mut usize) -> Result<Nat> {
     let mut shift = 0usize;
     loop {
         let Some(&b) = buf.get(p) else {
-            return Err(Error::Corruption("VarUInt endet zu frueh".into()));
+            return Err(Error::Corruption("VarUInt ends prematurely".into()));
         };
         p += 1;
         digits.push(b & 0x7F);
@@ -327,7 +326,7 @@ pub fn get_vu(buf: &[u8], pos: &mut usize) -> Result<Nat> {
         }
         shift += 7;
         if shift > 16384 {
-            return Err(Error::Corruption("VarUInt unplausibel gross".into()));
+            return Err(Error::Corruption("VarUInt implausibly large".into()));
         }
     }
     *pos = p;
@@ -335,16 +334,16 @@ pub fn get_vu(buf: &[u8], pos: &mut usize) -> Result<Nat> {
     Ok(Nat::from(big))
 }
 
-/// Strenger u64-Dekoder für physische Felder (Längen, Zähler, IDs).
+/// Strict u64 decoder for physical fields (lengths, counters, IDs).
 #[inline]
 pub fn get_vu_u64(buf: &[u8], pos: &mut usize, what: &str) -> Result<u64> {
     match get_vu64(buf, pos)? {
         Some(v) => Ok(v),
-        None => Err(Error::Corruption(format!("{what}: Wert zu gross"))),
+        None => Err(Error::Corruption(format!("{what}: value too large"))),
     }
 }
 
-/// ZigZag-artige Abbildung der v0.14 (`2n` für n>=0, sonst `-2n-1`).
+/// ZigZag-style mapping (`2n` for n>=0, otherwise `-2n-1`).
 pub fn put_vi_big(out: &mut Vec<u8>, n: &BigInt) {
     let z: BigUint = if n.sign() == Sign::Minus {
         let m = n.magnitude();
@@ -366,7 +365,7 @@ pub fn put_vi64(out: &mut Vec<u8>, n: i64) {
     }
 }
 
-/// Dekodiert eine VarInt; Rückgabe als BigInt-fähiger Wert über `Nat`.
+/// Decodes a VarInt; returned as a BigInt-capable value via `Nat`.
 pub fn zigzag_decode(z: &Nat) -> BigInt {
     match z {
         Nat::S(v) => {
@@ -409,7 +408,7 @@ mod tests {
         }
         let big = Nat::pow10(100);
         let b = enc(&big);
-        assert_eq!(b.len(), 48); // wie im v0.14-Benchmark (v10^100 << 3 → 48 B)
+        assert_eq!(b.len(), 48); // 10^100 has 333 bits → 48 VarUInt bytes
         let mut p = 0;
         assert_eq!(get_vu(&b, &mut p).unwrap(), big);
         let over = Nat::S(u64::MAX).add_u64(1);

@@ -1,13 +1,13 @@
-//! Layoutunabhängige Sicht auf materialisierte Zellen
+//! Layout-independent view of materialized cells
 //! (`iter_materialized_cells`, `iter_materialized_record_ns`,
 //! `record_n_for_address`, `record_n_from_n`).
 //!
-//! Der Iterator ist ein Materialisierungsscan (kein Adressraumscan) und
-//! liefert dieselbe Reihenfolge wie Python v0.27: zuerst Dense-Records je
-//! `(realm, lane)` sortiert mit überlagerten Sparse-Zellen, danach die
-//! reinen Sparse-Punkte. Statt einer Menge aller Dense-Schlüssel (Python)
-//! wird die Zugehörigkeit über `resolve_segment` geprüft – gleiches Ergebnis,
-//! konstanter Speicher.
+//! The iterator is a materialization scan (not an address-space scan) and
+//! returns cells in a fixed order: first dense records per
+//! `(realm, lane)`, sorted, with overlaid sparse cells, then the
+//! pure sparse points. Instead of keeping a set of all dense keys,
+//! membership is checked via `resolve_segment` – same result,
+//! constant memory.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -21,7 +21,7 @@ use crate::vmap;
 use super::cursor::SparsePointCursor;
 use super::{Db, SVal, RL};
 
-/// Rohzelle des Materialisierungsscans.
+/// Raw cell of the materialization scan.
 #[derive(Clone, Debug)]
 pub struct RawCell {
     pub realm: Nat,
@@ -37,7 +37,7 @@ enum Phase {
     Done,
 }
 
-/// Lazy-Iterator über alle materialisierten Zellen (Rohform).
+/// Lazy iterator over all materialized cells (raw form).
 pub struct RawCellCursor {
     realm: Option<Nat>,
     lane: Option<Lane>,
@@ -90,7 +90,7 @@ impl RawCellCursor {
         }
     }
 
-    /// Nächste Dense-u-Gruppe in `pending` laden; `false` = Dense-Phase fertig.
+    /// Load the next dense u group into `pending`; `false` = dense phase done.
     fn advance_dense(&mut self, db: &Db) -> Result<bool> {
         loop {
             if self.next_u.is_none() {
@@ -172,7 +172,7 @@ impl RawCellCursor {
         Ok(out)
     }
 
-    /// Callback-Variante; `f` liefert `false` zum vorzeitigen Abbruch.
+    /// Callback variant; `f` returns `false` to stop early.
     pub fn for_each(mut self, db: &Db, mut f: impl FnMut(RawCell) -> Result<bool>) -> Result<()> {
         loop {
             let batch = self.next_batch(db, 1024)?;
@@ -188,7 +188,7 @@ impl RawCellCursor {
     }
 }
 
-/// Lazy-Iterator mit layoutbewussten Umschlägen (`iter_materialized_cells`).
+/// Lazy iterator with layout-aware envelopes (`iter_materialized_cells`).
 pub struct MaterializedCellCursor {
     raw: RawCellCursor,
 }
@@ -207,7 +207,7 @@ impl MaterializedCellCursor {
     }
 }
 
-/// Lazy-Iterator über eindeutige record_N-Referenzen (`iter_materialized_record_ns`).
+/// Lazy iterator over unique record_N references (`iter_materialized_record_ns`).
 pub struct RecordNCursor {
     raw: RawCellCursor,
     seen: HashSet<Nat>,
@@ -219,7 +219,7 @@ impl RecordNCursor {
         RecordNCursor { raw: RawCellCursor::new(db, realm, lane), seen: HashSet::new(), memo: RecordNMemo::default() }
     }
 
-    /// Nächste eindeutige record_N (als Zahl), Reihenfolge des ersten Auftretens.
+    /// Next unique record_N (as a number), in order of first occurrence.
     pub fn next_batch_nat(&mut self, db: &Db, max: usize) -> Result<Vec<Nat>> {
         let mut out = Vec::new();
         while out.len() < max {
@@ -228,8 +228,8 @@ impl RecordNCursor {
                 break;
             }
             for c in batch {
-                // CLASSIC: record_N je u-Gruppe eindeutig (jede u-Gruppe erscheint
-                // genau einmal im Scan) → keine Mengenhaltung nötig (P4).
+                // CLASSIC: record_N is unique per u group (each u group appears
+                // exactly once in the scan) → no set needs to be kept.
                 match self.memo.lookup(db, &c)? {
                     (Some(r), true, fresh) => {
                         if fresh {
@@ -248,14 +248,14 @@ impl RecordNCursor {
         Ok(out)
     }
 
-    /// Wie `next_batch_nat`, als `"N…"`-Referenzen.
+    /// Like `next_batch_nat`, as `"N…"` references.
     pub fn next_batch(&mut self, db: &Db, max: usize) -> Result<Vec<String>> {
         Ok(self.next_batch_nat(db, max)?.into_iter().map(|n| format!("N{n}")).collect())
     }
 }
 
-/// record_N einer Rohzelle, für CLASSIC je u-Gruppe nur einmal berechnet
-/// (bei CLASSIC ist der Record jeder Zelle ihr u).
+/// record_N of a raw cell, computed only once per u group for CLASSIC
+/// (with CLASSIC the record of every cell is its u).
 #[derive(Default)]
 pub struct RecordNMemo {
     last: Option<(Nat, Lane, Nat, Option<Nat>)>,
@@ -266,7 +266,7 @@ impl RecordNMemo {
         Ok(self.lookup(db, c)?.0)
     }
 
-    /// `(record_N, ist_CLASSIC, erste_Zelle_der_u_Gruppe)`
+    /// `(record_N, is_CLASSIC, first_cell_of_the_u_group)`
     pub fn lookup(&mut self, db: &Db, c: &RawCell) -> Result<(Option<Nat>, bool, bool)> {
         if let Some((r, l, u, out)) = &self.last {
             if r == &c.realm && *l == c.lane && u == &c.u {
@@ -282,8 +282,8 @@ impl RecordNMemo {
 }
 
 impl Db {
-    /// record_N einer materialisierten Zelle wie im Umschlag
-    /// (`_materialized_cell_envelope`: Fehler der Ankerberechnung ⇒ None).
+    /// record_N of a materialized cell as in the envelope
+    /// (`_materialized_cell_envelope`: error in the anchor computation ⇒ None).
     pub(crate) fn cell_record_n(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Nat>> {
         let addr = self.cell_address(realm, u, v, lane)?;
         let Some(lay) = self.layout_at(realm, u) else {
@@ -341,12 +341,12 @@ impl Db {
         })
     }
 
-    /// `record_n_for_address`: geometrisch, ohne Nutzdaten zu lesen.
+    /// `record_n_for_address`: geometric, without reading payload data.
     pub fn record_n_for_address(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<String>> {
         Ok(self.record_n_nat(realm, u, v, lane)?.map(|n| format!("N{n}")))
     }
 
-    /// `record_n_for_address` als Zahl.
+    /// `record_n_for_address` as a number.
     pub fn record_n_nat(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Nat>> {
         if !self.realms.contains_key(realm) {
             return Ok(None);

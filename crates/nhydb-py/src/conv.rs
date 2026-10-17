@@ -1,4 +1,4 @@
-//! Konvertierung Python ⇄ Rust (`Val`, `Nat`, Lanes, Fehler).
+//! Conversion Python ⇄ Rust (`Val`, `Nat`, lanes, errors).
 
 use num_bigint::BigInt;
 use pyo3::exceptions::*;
@@ -10,7 +10,7 @@ use nhydb_core::{Error, Lane, Nat, Val};
 
 use crate::exceptions::*;
 
-/// Rust-Fehler → Python-Ausnahme.
+/// Rust error → Python exception.
 pub fn to_pyerr(e: Error) -> PyErr {
     match e {
         Error::NHyDB(m) => NHyDBError::new_err(m),
@@ -20,8 +20,8 @@ pub fn to_pyerr(e: Error) -> PyErr {
         Error::RealmLimit(m) => RealmLimitError::new_err(m),
         Error::Address(m) => AddressError::new_err(m),
         Error::Value(m) => PyValueError::new_err(m),
-        // Error::Key trägt den Text von str(KeyError) (= repr des Schlüssels);
-        // für Python wird der Schlüssel selbst übergeben.
+        // Error::Key carries the text of str(KeyError) (= repr of the key);
+        // Python receives the key itself.
         Error::Key(m) => match m.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
             Some(k) if m.len() >= 2 => PyKeyError::new_err(k.to_string()),
             _ => PyKeyError::new_err(m),
@@ -54,7 +54,7 @@ pub fn to_pyerr(e: Error) -> PyErr {
     }
 }
 
-/// Python-Ausnahme → Rust-Fehler (für Plugin-Rückrufe; Typ bleibt erhalten).
+/// Python exception → Rust error (for plugin callbacks; the type is preserved).
 pub fn from_pyerr(e: PyErr) -> Error {
     let msg = e.to_string();
     Error::Foreign(Box::new(e), msg)
@@ -71,7 +71,7 @@ impl<T> IntoPy<T> for nhydb_core::Result<T> {
     }
 }
 
-/// Python-Objekt → `Val`.
+/// Python object → `Val`.
 pub fn to_val(obj: &Bound<'_, PyAny>) -> PyResult<Val> {
     if obj.is_none() {
         return Ok(Val::None);
@@ -119,7 +119,7 @@ pub fn to_val(obj: &Bound<'_, PyAny>) -> PyResult<Val> {
     if let Ok(t) = obj.cast::<PyTuple>() {
         return Ok(Val::List(t.iter().map(|x| to_val(&x)).collect::<PyResult<_>>()?));
     }
-    // NumPy-Skalare und andere Zahlobjekte
+    // NumPy scalars and other number objects
     if obj.hasattr("__index__")? {
         let i = obj.call_method0("__index__")?;
         return to_val(&i);
@@ -137,10 +137,10 @@ pub fn to_val(obj: &Bound<'_, PyAny>) -> PyResult<Val> {
         }
         return Ok(Val::List(out));
     }
-    Err(PyTypeError::new_err(format!("Wert vom Typ {} wird nicht unterstuetzt", obj.get_type().name()?)))
+    Err(PyTypeError::new_err(format!("value of type {} is not supported", obj.get_type().name()?)))
 }
 
-/// `Val` → Python-Objekt.
+/// `Val` → Python object.
 pub fn from_val(py: Python<'_>, v: &Val) -> PyResult<Py<PyAny>> {
     Ok(match v {
         Val::None => py.None(),
@@ -181,8 +181,8 @@ pub fn nat_py(py: Python<'_>, n: &Nat) -> PyResult<Py<PyAny>> {
     }
 }
 
-/// Python `int(x)` → Nat; negative Werte → 0 (gleiche Fehlermeldung wie v0.14
-/// bei den nachfolgenden Positivitätsprüfungen).
+/// Python `int(x)` → Nat; negative values → 0 (so the subsequent positivity
+/// checks report the usual error message).
 pub fn to_nat(obj: &Bound<'_, PyAny>) -> PyResult<Nat> {
     if let Ok(v) = obj.extract::<u64>() {
         return Ok(Nat::S(v));
@@ -209,7 +209,7 @@ pub fn opt_nat(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Nat>> {
 pub fn to_id(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<u64> {
     match to_nat(obj)?.as_u64() {
         Some(v) => Ok(v),
-        None => Err(PyValueError::new_err(format!("{what} zu gross (max 2^64-1)"))),
+        None => Err(PyValueError::new_err(format!("{what} too large (max 2^64-1)"))),
     }
 }
 
@@ -233,7 +233,7 @@ pub fn to_lane(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Lane> {
     nhydb_core::address::normalize_lane_int(i.to_i64().unwrap_or(2)).py()
 }
 
-/// N-Referenz (int oder `"N…"`-Text).
+/// N reference (int or `"N…"` text).
 pub fn to_n(obj: &Bound<'_, PyAny>) -> PyResult<Nat> {
     if let Ok(s) = obj.cast::<PyString>() {
         return nhydb_core::address::parse_n_reference(s.to_str()?).py();

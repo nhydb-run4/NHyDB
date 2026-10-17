@@ -1,4 +1,4 @@
-"""Adressmathematik: Rust gegen Python-v0.14 als Orakel."""
+"""Address mathematics, partly checked against an external reference implementation as oracle (not included)."""
 import random
 
 import pytest

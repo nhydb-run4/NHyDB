@@ -1,11 +1,11 @@
-//! NHySQL-0.24: lesende SELECT-Sprache (Python `nhydb_query_v027`, Teil SQL).
+//! NHySQL-0.24: read-only SELECT language.
 //!
-//! Lexer, rekursiver Abstiegsparser, Übersetzung in den Abfragebaum
-//! (`query::Expr`) und Ausführung über die native QueryEngine. Positionen,
-//! Zeilen/Spalten und `near`-Ausschnitte der Fehlermeldungen zählen wie
-//! Python in Code Points; Zeichenklassen (`isspace`, `isdigit`, `isalpha`,
-//! `isalnum`) und Zahlumwandlung (`int()`/`float()` mit Unicode-Dezimalziffern)
-//! folgen CPython.
+//! Lexer, recursive descent parser, translation into the query tree
+//! (`query::Expr`) and execution via the native QueryEngine. Positions,
+//! lines/columns and `near` snippets in error messages count code points
+//! as Python does; character classes (`isspace`, `isdigit`, `isalpha`,
+//! `isalnum`) and number conversion (`int()`/`float()` with Unicode decimal
+//! digits) follow CPython.
 
 use std::collections::HashMap;
 
@@ -70,7 +70,7 @@ impl TokKind {
     }
 }
 
-/// `SQLToken(kind, value, pos)`; `pos` in Code Points.
+/// `SQLToken(kind, value, pos)`; `pos` in code points.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SqlToken {
     pub kind: TokKind,
@@ -86,8 +86,8 @@ fn ident_char(c: char) -> bool {
     unicode::is_alnum(c) || c == '_' || c == '$'
 }
 
-/// Ziffernfolge (`str.isdigit`-Zeichen, Vorzeichen, Punkt, Exponent) → ASCII,
-/// wie `int()`/`float()` sie lesen; nicht-dezimale Ziffern (z. B. `²`) ⇒ None.
+/// Digit sequence (`str.isdigit` characters, sign, point, exponent) → ASCII,
+/// as read by `int()`/`float()`; non-decimal digits (e.g. `²`) ⇒ None.
 fn ascii_number(raw: &[char]) -> Option<String> {
     let mut s = String::with_capacity(raw.len());
     for &c in raw {
@@ -127,7 +127,7 @@ pub fn scan(text: &str) -> Result<Vec<SqlToken>> {
         }
         if starts(i, "/*") {
             match find(i + 2, "*/") {
-                None => return Err(syn("nicht abgeschlossener /* ... */ Kommentar")),
+                None => return Err(syn("unterminated /* ... */ comment")),
                 Some(j) => i = j + 2,
             }
             continue;
@@ -153,7 +153,7 @@ pub fn scan(text: &str) -> Result<Vec<SqlToken>> {
                 i += 1;
             }
             if !closed {
-                return Err(syn(if quote == '\'' { "nicht abgeschlossener Stringliteral" } else { "nicht abgeschlossener Identifier" }));
+                return Err(syn(if quote == '\'' { "unterminated string literal" } else { "unterminated identifier" }));
             }
             out.push(tok(if quote == '\'' { TokKind::Str } else { TokKind::Ident }, Val::Str(parts), start));
             continue;
@@ -186,9 +186,9 @@ pub fn scan(text: &str) -> Result<Vec<SqlToken>> {
             }
             if j == i {
                 return Err(syn(if ch == ':' {
-                    format!("ungueltiger benannter Parameter an Position {start}")
+                    format!("invalid named parameter at position {start}")
                 } else {
-                    format!("ungueltiger Strukturbegriff an Position {start}")
+                    format!("invalid structural term at position {start}")
                 }));
             }
             let name: String = t[i..j].iter().collect();
@@ -222,7 +222,7 @@ pub fn scan(text: &str) -> Result<Vec<SqlToken>> {
                 break;
             }
             let raw: String = t[start..i].iter().collect();
-            let bad = || syn(format!("ungueltige Zahl {}", repr(&raw)));
+            let bad = || syn(format!("invalid number {}", repr(&raw)));
             let ascii = ascii_number(&t[start..i]).ok_or_else(bad)?;
             let value = if has_dot || has_exp {
                 Val::Float(py_float_literal(&ascii).ok_or_else(bad)?)
@@ -241,13 +241,13 @@ pub fn scan(text: &str) -> Result<Vec<SqlToken>> {
             out.push(tok(TokKind::Ident, Val::Str(t[start..i].iter().collect()), start));
             continue;
         }
-        return Err(syn(format!("unbekanntes Zeichen {} an Position {i}", repr(&ch.to_string()))));
+        return Err(syn(format!("unknown character {} at position {i}", repr(&ch.to_string()))));
     }
     out.push(tok(TokKind::Eof, Val::str(""), n));
     Ok(out)
 }
 
-/// Python `float()` für die vom Lexer erzeugten Formen (`1.`, `1e5`, `1.e-3`).
+/// Python `float()` for the forms produced by the lexer (`1.`, `1e5`, `1.e-3`).
 fn py_float_literal(s: &str) -> Option<f64> {
     let body = s.trim_start_matches(['+', '-']);
     let (mant, exp) = match body.find(['e', 'E']) {
@@ -264,7 +264,7 @@ fn py_float_literal(s: &str) -> Option<f64> {
         }
     }
     s.parse::<f64>().ok().or_else(|| {
-        // Rust akzeptiert "1." und "1.e5" nicht in jeder Form: Punkt ergänzen
+        // Rust does not accept "1." and "1.e5" in every form: append a zero after the point
         let fixed = s.replacen(".e", ".0e", 1).replacen(".E", ".0E", 1);
         let fixed = if fixed.ends_with('.') { format!("{fixed}0") } else { fixed };
         fixed.parse::<f64>().ok()
@@ -338,7 +338,7 @@ pub struct CompiledQuery {
 // Parser
 // ----------------------------------------------------------------------
 
-/// SQL-Parameter: Sequenz (`?`) oder Mapping (`:name`).
+/// SQL parameters: sequence (`?`) or mapping (`:name`).
 #[derive(Clone, Debug)]
 pub enum Params {
     None,
@@ -408,7 +408,7 @@ impl Parser<'_> {
     }
     fn expect_kw(&mut self, w: &str) -> Result<()> {
         if !self.match_kw(w) {
-            return Err(self.error(&format!("{w} erwartet"), None));
+            return Err(self.error(&format!("{w} expected"), None));
         }
         Ok(())
     }
@@ -426,12 +426,12 @@ impl Parser<'_> {
     }
     fn expect_sym(&mut self, s: &str) -> Result<()> {
         if !self.match_sym(s) {
-            return Err(self.error(&format!("{} erwartet", repr(s)), None));
+            return Err(self.error(&format!("{} expected", repr(s)), None));
         }
         Ok(())
     }
 
-    /// `_error`: Meldung mit Zeile, Spalte und `near`-Ausschnitt.
+    /// `_error`: message with line, column and `near` snippet.
     fn error(&self, msg: &str, t: Option<&SqlToken>) -> Error {
         let pos = t.unwrap_or(self.tok(0)).pos.min(self.chars.len());
         let before = &self.chars[..pos];
@@ -442,13 +442,13 @@ impl Parser<'_> {
         };
         let end = (pos + 32).min(self.chars.len());
         let near: String = self.chars[pos..end].iter().take_while(|&&c| c != '\n').collect();
-        syn(format!("{msg} (Zeile {line}, Spalte {col}, bei {})", repr(&near)))
+        syn(format!("{msg} (line {line}, column {col}, near {})", repr(&near)))
     }
 
     fn identifier(&mut self) -> Result<String> {
         let t = self.tok(0).clone();
         if t.kind != TokKind::Ident && t.kind != TokKind::Number {
-            return Err(self.error("Identifier erwartet", None));
+            return Err(self.error("identifier expected", None));
         }
         self.i += 1;
         Ok(tval(&t))
@@ -477,9 +477,9 @@ impl Parser<'_> {
             TokKind::Param => {
                 self.i += 1;
                 let idx = t.value.as_i64().unwrap_or(0) as usize;
-                let missing = || syn(format!("Wert fuer Parameter ?{} fehlt", idx + 1));
+                let missing = || syn(format!("value for parameter ?{} missing", idx + 1));
                 match self.params {
-                    Params::None | Params::Map(_) => Err(self.error("? Parameter braucht eine Sequenz von Werten", Some(&t))),
+                    Params::None | Params::Map(_) => Err(self.error("? parameter requires a sequence of values", Some(&t))),
                     Params::Seq(v) => v.get(idx).cloned().ok_or_else(missing),
                 }
             }
@@ -491,8 +491,8 @@ impl Parser<'_> {
                         .iter()
                         .find(|(k, _)| *k == name)
                         .map(|(_, v)| v.clone())
-                        .ok_or_else(|| syn(format!("Wert fuer Parameter :{name} fehlt"))),
-                    _ => Err(self.error(&format!(":{name} braucht ein Mapping von Parametern"), Some(&t))),
+                        .ok_or_else(|| syn(format!("value for parameter :{name} missing"))),
+                    _ => Err(self.error(&format!(":{name} requires a mapping of parameters"), Some(&t))),
                 }
             }
             TokKind::Ident => {
@@ -501,12 +501,12 @@ impl Parser<'_> {
                     "TRUE" => Val::Bool(true),
                     "FALSE" => Val::Bool(false),
                     "NULL" => Val::None,
-                    _ => return Err(self.error("Literal erwartet", None)),
+                    _ => return Err(self.error("literal expected", None)),
                 };
                 self.i += 1;
                 Ok(v)
             }
-            _ => Err(self.error("Literal erwartet", None)),
+            _ => Err(self.error("literal expected", None)),
         }
     }
 
@@ -531,7 +531,7 @@ impl Parser<'_> {
         }
         self.expect_kw("SELECT")?;
         if self.match_kw("DISTINCT") {
-            return Err(self.error("DISTINCT ist in NHySQL V0.27 noch nicht implementiert", None));
+            return Err(self.error("DISTINCT is not implemented in NHySQL", None));
         }
         let items = self.select_list()?;
         self.expect_kw("FROM")?;
@@ -555,7 +555,7 @@ impl Parser<'_> {
             }
         }
         if self.match_kw("HAVING") {
-            return Err(self.error("HAVING ist in NHySQL V0.27 noch nicht implementiert", None));
+            return Err(self.error("HAVING is not implemented in NHySQL", None));
         }
         let mut order_by = Vec::new();
         if self.match_kw("ORDER") {
@@ -584,15 +584,15 @@ impl Parser<'_> {
         };
         if self.match_kw("LIMIT") {
             let v = self.literal()?;
-            limit = Some(nonneg(&v).ok_or_else(|| self.error("LIMIT braucht einen nichtnegativen Integer", None))?);
+            limit = Some(nonneg(&v).ok_or_else(|| self.error("LIMIT requires a non-negative integer", None))?);
         }
         if self.match_kw("OFFSET") {
             let v = self.literal()?;
-            offset = nonneg(&v).ok_or_else(|| self.error("OFFSET braucht einen nichtnegativen Integer", None))?;
+            offset = nonneg(&v).ok_or_else(|| self.error("OFFSET requires a non-negative integer", None))?;
         }
         self.match_sym(";");
         if self.tok(0).kind != TokKind::Eof {
-            return Err(self.error("nur ein SELECT-Statement pro Aufruf ist erlaubt", None));
+            return Err(self.error("only one SELECT statement per call is allowed", None));
         }
         Ok(SelectStatement {
             source: self.source.clone(),
@@ -613,7 +613,7 @@ impl Parser<'_> {
         if self.match_sym(".") {
             parts.push(self.identifier()?);
             if self.match_sym(".") {
-                return Err(self.error("FROM unterstuetzt hoechstens realm.layout", None));
+                return Err(self.error("FROM supports at most realm.layout", None));
             }
         }
         Ok(parts)
@@ -627,7 +627,7 @@ impl Parser<'_> {
             } else {
                 let t = self.tok(0).clone();
                 if t.kind != TokKind::Ident {
-                    return Err(self.error("Feld, * oder Aggregat im SELECT erwartet", None));
+                    return Err(self.error("field, * or aggregate expected in SELECT", None));
                 }
                 let upper = unicode::upper(&tval(&t));
                 let next = self.tok(1);
@@ -725,12 +725,12 @@ impl Parser<'_> {
         let op = self.tok(0).clone();
         let sym = tval(&op);
         if op.kind != TokKind::Symbol || !["=", "!=", "<>", "<", "<=", ">", ">="].contains(&sym.as_str()) {
-            return Err(self.error("Vergleichsoperator, BETWEEN, IS NULL oder Textoperator erwartet", None));
+            return Err(self.error("comparison operator, BETWEEN, IS NULL or text operator expected", None));
         }
         self.i += 1;
         let value = self.literal()?;
         if value.is_none() {
-            return Err(self.error("NULL mit IS NULL / IS NOT NULL vergleichen", Some(&op)));
+            return Err(self.error("compare NULL with IS NULL / IS NOT NULL", Some(&op)));
         }
         let o = match sym.as_str() {
             "=" => "eq",
@@ -765,31 +765,31 @@ impl Parser<'_> {
             Ok(values[0].clone())
         };
         Ok(match func.as_str() {
-            "TOKEN" => r.tokens("token", one(self, "TOKEN(field, value) erwartet genau einen Wert")?),
+            "TOKEN" => r.tokens("token", one(self, "TOKEN(field, value) expects exactly one value")?),
             "TOKENS_ALL" => r.tokens("tokens_all", Val::List(values.clone())),
             "TOKENS_ANY" => r.tokens("tokens_any", Val::List(values.clone())),
-            "CONTAINS" => r.contains(one(self, "CONTAINS(field, value) erwartet genau einen Wert")?, false),
-            "ICONTAINS" => r.contains(one(self, "ICONTAINS(field, value) erwartet genau einen Wert")?, true),
-            "FULLTEXT" => r.fulltext(one(self, "FULLTEXT(field, query) erwartet genau einen Suchtext")?, "all"),
-            "FULLTEXT_ANY" => r.fulltext(one(self, "FULLTEXT_ANY(field, query) erwartet genau einen Suchtext")?, "any"),
-            "PHRASE" => r.phrase(one(self, "PHRASE(field, phrase) erwartet genau eine Phrase")?),
-            other => return Err(self.error(&format!("unbekannte Praedikatfunktion {other}"), None)),
+            "CONTAINS" => r.contains(one(self, "CONTAINS(field, value) expects exactly one value")?, false),
+            "ICONTAINS" => r.contains(one(self, "ICONTAINS(field, value) expects exactly one value")?, true),
+            "FULLTEXT" => r.fulltext(one(self, "FULLTEXT(field, query) expects exactly one search text")?, "all"),
+            "FULLTEXT_ANY" => r.fulltext(one(self, "FULLTEXT_ANY(field, query) expects exactly one search text")?, "any"),
+            "PHRASE" => r.phrase(one(self, "PHRASE(field, phrase) expects exactly one phrase")?),
+            other => return Err(self.error(&format!("unknown predicate function {other}"), None)),
         })
     }
 
-    /// `_ref`: `@name`, `STRUCT.name`, `qualifier.feld` oder `feld`.
+    /// `_ref`: `@name`, `STRUCT.name`, `qualifier.field` or `field`.
     fn reference(&self, raw: &str) -> Result<Ref> {
         let parts: Vec<&str> = raw.split('.').collect();
         if parts.len() == 1 && parts[0].starts_with('@') {
             let name = &parts[0][1..];
             if !STRUCT_NAMES.contains(&unicode::casefold(name).as_str()) {
-                return Err(self.error(&format!("unbekannter Strukturbegriff @{name}"), None));
+                return Err(self.error(&format!("unknown structural term @{name}"), None));
             }
             return Ok(Ref::Struct(canonical_struct_name(name)));
         }
         if parts.len() == 2 && unicode::casefold(parts[0]) == "struct" {
             if !STRUCT_NAMES.contains(&unicode::casefold(parts[1]).as_str()) {
-                return Err(self.error(&format!("unbekannter Strukturbegriff STRUCT.{}", parts[1]), None));
+                return Err(self.error(&format!("unknown structural term STRUCT.{}", parts[1]), None));
             }
             return Ok(Ref::Struct(canonical_struct_name(parts[1])));
         }
@@ -797,12 +797,12 @@ impl Parser<'_> {
             let q = unicode::casefold(parts[0]);
             let ok = self.source.iter().any(|s| unicode::casefold(s) == q) || self.source_alias.as_ref().is_some_and(|a| unicode::casefold(a) == q);
             if !ok {
-                return Err(self.error(&format!("unbekannter Tabellenalias/Qualifier {}", repr(parts[0])), None));
+                return Err(self.error(&format!("unknown table alias/qualifier {}", repr(parts[0])), None));
             }
             return Ok(Ref::Field(parts[1].to_string()));
         }
         if parts.len() > 2 {
-            return Err(self.error("Feldreferenz darf hoechstens qualifier.feld enthalten", None));
+            return Err(self.error("field reference may contain at most qualifier.field", None));
         }
         Ok(Ref::Field(raw.to_string()))
     }
@@ -825,7 +825,7 @@ pub fn parse_sql(text: &str, params: &Params) -> Result<SelectStatement> {
 }
 
 // ----------------------------------------------------------------------
-// Übersetzung (compile_sql)
+// Translation (compile_sql)
 // ----------------------------------------------------------------------
 
 fn accepted_qualifier(stmt: &SelectStatement, q: &str) -> bool {
@@ -840,16 +840,16 @@ fn unqualify(name: &str, stmt: &SelectStatement) -> Result<String> {
         1 => Ok(parts[0].to_string()),
         2 => {
             if !accepted_qualifier(stmt, parts[0]) {
-                return Err(syn(format!("unbekannter Tabellenalias/Qualifier {}", repr(parts[0]))));
+                return Err(syn(format!("unknown table alias/qualifier {}", repr(parts[0]))));
             }
             Ok(parts[1].to_string())
         }
-        _ => Err(syn(format!("ungueltige Feldreferenz {}", repr(name)))),
+        _ => Err(syn(format!("invalid field reference {}", repr(name)))),
     }
 }
 
 fn is_ascii_digits(s: &str) -> bool {
-    // Python `str.isdigit()` (Unicode-Ziffern eingeschlossen)
+    // Python `str.isdigit()` (including Unicode digits)
     !s.is_empty() && s.chars().all(unicode::is_digit)
 }
 
@@ -859,10 +859,10 @@ fn py_int_digits(s: &str) -> Result<BigInt> {
     ascii.parse::<BigInt>().map_err(|_| Error::Value(format!("invalid literal for int() with base 10: {}", repr(s))))
 }
 
-/// `_sql_resolve_source`: `layout` oder `realm.layout`; nur CLASSIC.
+/// `_sql_resolve_source`: `layout` or `realm.layout`; CLASSIC only.
 pub fn resolve_source<'d>(db: &'d Db, source: &[String]) -> Result<&'d LayoutDef> {
     if source.is_empty() || source.len() > 2 {
-        return Err(syn("FROM erwartet layout oder realm.layout"));
+        return Err(syn("FROM expects layout or realm.layout"));
     }
     let realm_id_for = |raw: &str| -> Result<Option<BigInt>> {
         let low = unicode::casefold(raw);
@@ -880,7 +880,7 @@ pub fn resolve_source<'d>(db: &'d Db, source: &[String]) -> Result<&'d LayoutDef
         match matches.len() {
             1 => Ok(Some(matches[0].to_bigint())),
             0 => Ok(None),
-            _ => Err(syn(format!("Realmname {} ist nicht eindeutig", repr(raw)))),
+            _ => Err(syn(format!("realm name {} is ambiguous", repr(raw)))),
         }
     };
     let mut realm_filter: Option<Nat> = None;
@@ -890,7 +890,7 @@ pub fn resolve_source<'d>(db: &'d Db, source: &[String]) -> Result<&'d LayoutDef
         let rn = rf.as_ref().and_then(Nat::from_bigint).filter(|n| db.realms.contains_key(n));
         match rn {
             Some(n) => realm_filter = Some(n),
-            None => return Err(syn(format!("Realm {} nicht gefunden", repr(&source[0])))),
+            None => return Err(syn(format!("realm {} not found", repr(&source[0])))),
         }
     }
     let low = unicode::casefold(layout_name);
@@ -911,19 +911,19 @@ pub fn resolve_source<'d>(db: &'d Db, source: &[String]) -> Result<&'d LayoutDef
         candidates.retain(|l| &l.realm_id == rf);
     }
     if candidates.is_empty() {
-        return Err(syn(format!("Layout/Tabelle {} nicht gefunden", repr(&source.join(".")))));
+        return Err(syn(format!("layout/table {} not found", repr(&source.join(".")))));
     }
     if candidates.len() > 1 {
-        return Err(syn(format!("Layoutname {} ist nicht eindeutig; realm.layout verwenden", repr(layout_name))));
+        return Err(syn(format!("layout name {} is ambiguous; use realm.layout", repr(layout_name))));
     }
     let lay = candidates[0];
     if lay.kind != LayoutKind::Classic {
-        return Err(syn("NHySQL V0.27 SELECT bildet Tabellen zunaechst auf CLASSIC-Layouts ab"));
+        return Err(syn("NHySQL SELECT currently maps tables to CLASSIC layouts only"));
     }
     Ok(lay)
 }
 
-/// `_sql_layout_fields`: BASE-Namen, dann Extension-Namen (ohne Duplikate).
+/// `_sql_layout_fields`: BASE names, then extension names (without duplicates).
 pub fn layout_fields(db: &Db, lay: &LayoutDef) -> Result<Vec<String>> {
     let info = db.get_layout(None, None, Some(&LayoutRef::Id(lay.layout_id)))?;
     let mut names: Vec<String> = Vec::new();
@@ -943,7 +943,7 @@ pub fn layout_fields(db: &Db, lay: &LayoutDef) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// `_sql_field_map`: casefold → Name; kollidierende Schreibweisen entfallen.
+/// `_sql_field_map`: casefold → name; colliding spellings are dropped.
 fn field_map(fields: &[String]) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
     let mut collisions = Vec::new();
@@ -967,7 +967,7 @@ fn resolve_field(raw: &str, stmt: &SelectStatement, fmap: &HashMap<String, Strin
     let name = unqualify(raw, stmt)?;
     fmap.get(&unicode::casefold(&name))
         .cloned()
-        .ok_or_else(|| syn(format!("Feld {} existiert im CLASSIC-Layout nicht", repr(&name))))
+        .ok_or_else(|| syn(format!("field {} does not exist in the CLASSIC layout", repr(&name))))
 }
 
 fn resolve_expr(e: &Expr, stmt: &SelectStatement, fmap: &HashMap<String, String>) -> Result<Expr> {
@@ -1001,7 +1001,7 @@ pub fn compile_sql(db: &Db, text: &str, params: &Params, lane: Lane) -> Result<C
                 if !item.name.is_empty() {
                     let q = item.name.strip_suffix(".*").unwrap_or(&item.name);
                     if !accepted_qualifier(&stmt, q) {
-                        return Err(syn(format!("unbekannter Tabellenalias/Qualifier {} fuer *", repr(q))));
+                        return Err(syn(format!("unknown table alias/qualifier {} for *", repr(q))));
                     }
                 }
                 resolved.extend(fields.iter().map(|f| SelectItem::new("field", f, "", None)));
@@ -1012,18 +1012,18 @@ pub fn compile_sql(db: &Db, text: &str, params: &Params, lane: Lane) -> Result<C
                 let name = if item.name == "*" { "*".to_string() } else { resolve_field(&item.name, &stmt, &fmap)? };
                 resolved.push(SelectItem::new("aggregate", &name, &item.op, item.alias.clone()));
             }
-            other => return Err(syn(format!("unbekanntes SELECT-Element {}", repr(other)))),
+            other => return Err(syn(format!("unknown SELECT item {}", repr(other)))),
         }
     }
     if resolved.is_empty() {
-        return Err(syn("SELECT-Liste ist leer"));
+        return Err(syn("SELECT list is empty"));
     }
     let mut aliases: Vec<(String, SelectItem)> = Vec::new();
     for item in &resolved {
         let on = out_name(item);
         let key = unicode::casefold(&on);
         if aliases.iter().any(|(k, _)| *k == key) {
-            return Err(syn(format!("doppelter Ausgabename/Alias {}", repr(&on))));
+            return Err(syn(format!("duplicate output name/alias {}", repr(&on))));
         }
         aliases.push((key, item.clone()));
     }
@@ -1043,15 +1043,15 @@ pub fn compile_sql(db: &Db, text: &str, params: &Params, lane: Lane) -> Result<C
     let has_agg = resolved.iter().any(|x| x.kind == "aggregate");
     if has_agg {
         if resolved.iter().any(|x| x.kind == "relevance") {
-            return Err(syn("relevance kann nicht mit SQL-Aggregaten gemischt werden"));
+            return Err(syn("relevance cannot be mixed with SQL aggregates"));
         }
         for item in &resolved {
             if item.kind == "field" && !group_by.contains(&item.name) {
-                return Err(syn(format!("nicht aggregiertes Feld {} muss in GROUP BY stehen", repr(&item.name))));
+                return Err(syn(format!("non-aggregated field {} must appear in GROUP BY", repr(&item.name))));
             }
         }
     } else if !group_by.is_empty() {
-        return Err(syn("GROUP BY braucht in NHySQL V0.27 mindestens ein Aggregat im SELECT"));
+        return Err(syn("GROUP BY requires at least one aggregate in SELECT"));
     }
     let mut aggregate = Val::map();
     if has_agg {
@@ -1077,13 +1077,13 @@ pub fn compile_sql(db: &Db, text: &str, params: &Params, lane: Lane) -> Result<C
     let ranked = resolved.iter().any(|x| x.kind == "relevance") || order_by.iter().any(|(k, _)| k == "relevance");
     if ranked {
         if has_agg {
-            return Err(syn("FULLTEXT relevance und Aggregate koennen nicht im selben SELECT gerankt werden"));
+            return Err(syn("FULLTEXT relevance and aggregates cannot be ranked in the same SELECT"));
         }
         if order_by.iter().any(|(k, _)| k != "relevance") {
-            return Err(syn("ranked FULLTEXT unterstuetzt in V0.27 nur ORDER BY relevance DESC"));
+            return Err(syn("ranked FULLTEXT only supports ORDER BY relevance DESC"));
         }
         if order_by.iter().any(|(_, d)| d != "desc") {
-            return Err(syn("relevance kann nur DESC sortiert werden"));
+            return Err(syn("relevance can only be sorted DESC"));
         }
         order_by.clear();
     }
@@ -1210,7 +1210,7 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
         "rows" => Val::List(rows), "matched" => matched,
         "optimizer" => engine_res.get("optimizer").cloned().unwrap_or_else(|| Val::str(query::OPTIMIZER)),
     };
-    // Schlüsselreihenfolge wie Python: columns, rows, returned, matched, optimizer
+    // Key order: columns, rows, returned, matched, optimizer
     let returned = result.remove("returned").unwrap();
     let matched = result.remove("matched").unwrap();
     let optimizer = result.remove("optimizer").unwrap();
@@ -1238,12 +1238,12 @@ mod tests {
         assert!(t.iter().any(|x| x.kind == TokKind::Number && x.value == Val::Float(-1500.0)));
         assert!(t.iter().any(|x| x.kind == TokKind::Param && x.value == Val::Int(0)));
         assert_eq!(scan("x = ٣").unwrap()[2].value, Val::Int(3));
-        assert!(matches!(scan("x = ①"), Err(Error::SqlSyntax(m)) if m == "ungueltige Zahl '①'"));
+        assert!(matches!(scan("x = ①"), Err(Error::SqlSyntax(m)) if m == "invalid number '①'"));
         assert_eq!(py_float_literal("1."), Some(1.0));
         assert_eq!(py_float_literal("1.e2"), Some(100.0));
         assert_eq!(py_float_literal("1e"), None);
         let e = parse_sql("SELECT id\nFROM records WHERE", &Params::None).unwrap_err().to_string();
-        assert_eq!(e, "Identifier erwartet (Zeile 2, Spalte 19, bei '')");
+        assert_eq!(e, "identifier expected (line 2, column 19, near '')");
         let s = parse_sql("SELECT COUNT(*), r.id x FROM main.records AS r WHERE NOT r.a = 1 OR @u BETWEEN 1 AND 3 LIMIT 5", &Params::None).unwrap();
         assert_eq!(s.select_items[0].alias.as_deref(), Some("count_all"));
         assert_eq!(s.source, vec!["main".to_string(), "records".to_string()]);

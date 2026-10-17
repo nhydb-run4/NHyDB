@@ -1,13 +1,13 @@
-//! Laufzeit-Plugins für CUSTOM-Layouts.
+//! Runtime plugins for CUSTOM layouts.
 //!
-//! In v0.14 persistiert ein CUSTOM-Layout nur seine Plugin-ID; die
-//! Adressabbildung liefert ein zur Laufzeit registriertes Objekt mit den
-//! optionalen Methoden `logical_address`, `describe`, `type_of`, `spacemap`
-//! und `occupied_addresses`. Fehlt eine Methode, greift die Engine – wie
-//! v0.14 mit `hasattr` – auf das dokumentierte Fallback-Verhalten zurück.
+//! A CUSTOM layout persists only its plugin ID; the address mapping is
+//! provided by an object registered at runtime with the optional methods
+//! `logical_address`, `describe`, `type_of`, `spacemap` and
+//! `occupied_addresses`. If a method is missing, the engine falls back to
+//! the documented default behaviour (checked like Python's `hasattr`).
 //!
-//! Native Rust-Plugins implementieren dieses Trait direkt; die PyO3-Schicht
-//! stellt eine Brücke für Python-Objekte bereit (isolierter Sonderweg).
+//! Native Rust plugins implement this trait directly; the PyO3 layer
+//! provides a bridge for Python objects (an isolated special path).
 
 use crate::address::Lane;
 use crate::db::Db;
@@ -26,21 +26,21 @@ pub enum PluginMethod {
 }
 
 pub trait LayoutPlugin: Send + Sync {
-    /// Entspricht `hasattr(plugin, name)`.
+    /// Equivalent to `hasattr(plugin, name)`.
     fn has(&self, method: PluginMethod) -> bool;
 
-    /// Liefert `{"realm","u","v","lane"}` (dict), `[u, v]` oder `[r, u, v, lane]`.
+    /// Returns `{"realm","u","v","lane"}` (dict), `[u, v]` or `[r, u, v, lane]`.
     fn logical_address(&self, lay: &LayoutDef, object_id: &Nat, field: &Val, lane: Lane) -> Result<Val>;
 
-    /// Interpretation einer Adresse (dict mit u. a. `record`, `field`, `anchor`).
+    /// Interpretation of an address (dict with e.g. `record`, `field`, `anchor`).
     fn describe(&self, lay: &LayoutDef, address: &Val) -> Result<Val>;
 
-    /// Typname (str) oder None.
+    /// Type name (str) or None.
     fn type_of(&self, lay: &LayoutDef, address: &Val) -> Result<Val>;
 
-    /// Effektive SpaceMap (muss dict sein).
+    /// Effective SpaceMap (must be a dict).
     fn spacemap(&self, lay: &LayoutDef) -> Result<Val>;
 
-    /// Belegte Adressen eines Objekts (`"N…"`, dict oder `[u, v]`).
+    /// Occupied addresses of an object (`"N…"`, dict or `[u, v]`).
     fn occupied_addresses(&self, db: &Db, lay: &LayoutDef, object_id: &Nat, lane: Lane) -> Result<Vec<Val>>;
 }

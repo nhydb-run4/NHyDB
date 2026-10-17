@@ -1,9 +1,9 @@
-//! Datei-I/O: Append-Puffer, positionsbasiertes Lesen, fsync.
+//! File I/O: append buffer, positional reads, fsync.
 //!
-//! Entspricht dem gepufferten `r+b`-Dateiobjekt der v0.14: Appends landen
-//! zunächst in einem Puffer (`pending`) und werden spätestens beim Commit
-//! geschrieben. Leseoperationen sehen auch noch ungeschriebene Bytes
-//! (wie Pythons BufferedRandom), ohne den Puffer zu leeren.
+//! Behaves like a buffered `r+b` file object: appends first go into a buffer
+//! (`pending`) and are written at the latest on commit. Reads also see bytes
+//! not yet written (like Python's BufferedRandom) without flushing the
+//! buffer.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -13,13 +13,13 @@ use crate::platform::{self, read_exact_at, write_all_at};
 
 const FLUSH_THRESHOLD: usize = 8 << 20;
 
-/// Dauerhaftigkeitsmodus (historischer Name; siehe [`platform::Durability`]).
+/// Durability mode (legacy name; see [`platform::Durability`]).
 pub type SyncMode = platform::Durability;
 
 pub struct Storage {
     file: File,
     pending: Vec<u8>,
-    /// Dateioffset von `pending[0]` == Länge der geschriebenen Datei.
+    /// File offset of `pending[0]` == length of the written file.
     pending_start: u64,
     pub sync_mode: SyncMode,
 }
@@ -36,7 +36,7 @@ impl Storage {
         Ok(File::open(path)?)
     }
 
-    /// Logische Dateilänge inklusive ungeschriebener Bytes.
+    /// Logical file length including unwritten bytes.
     #[inline]
     pub fn len(&self) -> u64 {
         self.pending_start + self.pending.len() as u64
@@ -46,7 +46,7 @@ impl Storage {
         self.len() == 0
     }
 
-    /// Hängt Bytes an das Dateiende an.
+    /// Appends bytes to the end of the file.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         if self.pending.len() + data.len() > FLUSH_THRESHOLD {
             self.flush()?;
@@ -81,19 +81,19 @@ impl Storage {
         platform::sync_file(&self.file, self.sync_mode)
     }
 
-    /// Positionsbasiertes Schreiben außerhalb des Append-Bereichs
-    /// (Superblöcke). Der Bereich darf nicht im Append-Puffer liegen.
+    /// Positional write outside the append region (superblocks). The range
+    /// must not overlap the append buffer.
     pub fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
         debug_assert!(off + data.len() as u64 <= self.pending_start);
         write_all_at(&self.file, data, off)?;
         Ok(())
     }
 
-    /// Liest exakt `buf.len()` Bytes ab `off` (inkl. ungeschriebener Bytes).
+    /// Reads exactly `buf.len()` bytes from `off` (including unwritten bytes).
     pub fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
         let end = off.saturating_add(buf.len() as u64);
         if end > self.len() {
-            return Err(Error::Corruption(format!("Lesezugriff {off}..{end} hinter Dateiende {}", self.len())));
+            return Err(Error::Corruption(format!("read {off}..{end} beyond end of file {}", self.len())));
         }
         if off >= self.pending_start {
             let s = (off - self.pending_start) as usize;
@@ -112,20 +112,20 @@ impl Storage {
     pub fn read_vec(&self, off: u64, len: usize) -> Result<Vec<u8>> {
         match off.checked_add(len as u64) {
             Some(end) if end <= self.len() => {}
-            _ => return Err(Error::Corruption(format!("Lesezugriff ab {off} (Laenge {len}) hinter Dateiende {}", self.len()))),
+            _ => return Err(Error::Corruption(format!("read at {off} (length {len}) beyond end of file {}", self.len()))),
         }
         let mut v = vec![0u8; len];
         self.read_exact_at(off, &mut v)?;
         Ok(v)
     }
 
-    /// Liest bis zu `len` Bytes (kürzer am Dateiende).
+    /// Reads up to `len` bytes (fewer at end of file).
     pub fn read_upto(&self, off: u64, len: usize) -> Result<Vec<u8>> {
         let avail = self.len().saturating_sub(off).min(len as u64) as usize;
         self.read_vec(off, avail)
     }
 
-    /// Verwirft alle Bytes ab `len` (Rücknahme eines fehlgeschlagenen Appends).
+    /// Discards all bytes from `len` on (rollback of a failed append).
     pub fn rollback_to(&mut self, len: u64) -> Result<()> {
         if len >= self.pending_start {
             self.pending.truncate((len - self.pending_start) as usize);

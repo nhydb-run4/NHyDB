@@ -1,18 +1,18 @@
-//! Speicherschonende Cursor für große Ergebnismengen.
+//! Memory-efficient cursors for large result sets.
 //!
-//! Python-v0.14/v0.27 liefern `range`, `select`, `find` und
-//! `iter_materialized_sparse_points` als Generatoren. Die Cursor hier halten
-//! keinen Borrow auf die Datenbank, sondern nur ihre Position; jeder Aufruf
-//! von `next_batch` liefert höchstens `max` Elemente. Damit bleibt der
-//! Speicherbedarf unabhängig von der Ergebnisgröße.
+//! `range`, `select`, `find` and `iter_materialized_sparse_points` are
+//! exposed as generators. The cursors here hold
+//! no borrow on the database, only their position; each call
+//! of `next_batch` returns at most `max` elements, so memory use
+//! stays independent of the result size.
 //!
-//! * `RangeCursor` (`range`/`select`): überspringt u-Bereiche ohne
-//!   Dense-Segment (Python iteriert jedes u einzeln).
-//! * `FindCursor`: u-Liste aus den Postings (wie Python materialisiert),
-//!   Datensätze werden erst beim Abruf gelesen.
-//! * `SparsePointCursor`: k-Wege-Merge über die Sparse-Blöcke je
-//!   (Realm, Lane); Ausgabe sortiert nach (Realm, Lane, u, v) wie Python,
-//!   Speicher O(Anzahl Blöcke + eine u-Gruppe).
+//! * `RangeCursor` (`range`/`select`): skips u ranges without a
+//!   dense segment instead of iterating every u individually.
+//! * `FindCursor`: u list from the postings (materialized),
+//!   records are read only when fetched.
+//! * `SparsePointCursor`: k-way merge over the sparse blocks per
+//!   (realm, lane); output sorted by (realm, lane, u, v),
+//!   memory O(number of blocks + one u group).
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
@@ -26,12 +26,12 @@ use crate::val::Val;
 use super::sparse::MaterializedPoint;
 use super::{Db, SVal, SparseCellMeta, SparseSegment};
 
-/// Was ein `RangeCursor` je u liefert.
+/// What a `RangeCursor` returns per u.
 #[derive(Clone, Debug)]
 pub enum RangeMode {
-    /// `range(...)`: Datensatz wie `get`.
+    /// `range(...)`: record as returned by `get`.
     Get { dyn_mode: Option<String>, dyn_v: Option<Nat>, include_extensions: bool },
-    /// `select(...)`: Spaltenprojektion.
+    /// `select(...)`: column projection.
     Select { columns: Vec<Val> },
 }
 
@@ -51,7 +51,7 @@ impl RangeCursor {
         RangeCursor { realm, lane, next: from, to, mode, done: false }
     }
 
-    /// Nächstes u ≥ `self.next` mit einem Dense-Segment (oder None).
+    /// Next u ≥ `self.next` with a dense segment (or None).
     fn next_candidate(&self, db: &Db) -> Option<Nat> {
         let idx = db.dense.get(&(self.realm.clone(), self.lane))?;
         let mut best: Option<Nat> = None;
@@ -126,7 +126,7 @@ impl FindCursor {
 
 type BlockIndex = Arc<Vec<(Nat, u64, u32)>>;
 
-/// k-Wege-Merge über die Sparse-Blöcke.
+/// k-way merge over the sparse blocks.
 pub struct SparsePointCursor {
     keys: Vec<(Nat, Lane)>,
     ki: usize,
@@ -191,7 +191,7 @@ impl SparsePointCursor {
                 self.heap.pop();
                 members.push(si);
             }
-            members.sort(); // aufsteigende Block-ID: spätere überschreiben frühere
+            members.sort(); // ascending block ID: later ones overwrite earlier ones
             let (rid, ln) = self.keys[self.ki].clone();
             let mut latest: BTreeMap<Nat, SparseCellMeta> = BTreeMap::new();
             for si in members {
@@ -238,7 +238,7 @@ impl SparsePointCursor {
     }
 }
 
-/// `select_us(realm, us, columns)`: explizite, sortierte Kandidaten.
+/// `select_us(realm, us, columns)`: explicit, sorted candidates.
 #[derive(Clone, Debug)]
 pub struct SelectUsCursor {
     realm: Nat,
@@ -265,17 +265,17 @@ impl SelectUsCursor {
 }
 
 impl Db {
-    /// `select_us` (v0.27): Zeilen für explizite u (nur mit Dense-Datensatz,
-    /// nicht gelöscht). Werte inklusive Sparse-Überschreibungen der
-    /// BASE-Felder (Korrektur S7, konsistent zu `get`).
+    /// `select_us`: rows for explicit u (only with a dense record,
+    /// not deleted). Values include sparse overrides of the
+    /// BASE fields (consistent with `get`).
     pub fn select_us(&self, realm: &Nat, us: &[Nat], columns: &[Val], lane: Lane) -> Result<Vec<Val>> {
         self.select_us_ext(realm, us, columns, lane, false)
     }
 
-    /// `select_us` mit optionaler Aufnahme reiner Sparse-Records (u ohne
-    /// lebenden Dense-Record, aber mit lebenden Sparse-Zellen). Die
-    /// Abfrageschicht nutzt diese logische Sicht (Fix S9), damit Kandidaten
-    /// eines Index nicht still aus Zeilen/Aggregaten verschwinden.
+    /// `select_us` with optional inclusion of pure sparse records (u without
+    /// a live dense record, but with live sparse cells). The
+    /// query layer uses this logical view so that candidates
+    /// of an index do not silently disappear from rows/aggregates.
     pub fn select_us_ext(&self, realm: &Nat, us: &[Nat], columns: &[Val], lane: Lane, sparse_only: bool) -> Result<Vec<Val>> {
         let mut resolved = Vec::with_capacity(columns.len());
         for col in columns {
@@ -323,7 +323,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Ein Zeilenobjekt von `select` (nur u mit Dense-Datensatz).
+    /// A row object of `select` (only u with a dense record).
     pub fn select_row(&self, realm: &Nat, u: &Nat, columns: &[Val], lane: Lane) -> Result<Option<Val>> {
         Ok(self.select(realm, u, u, columns, lane)?.into_iter().next())
     }

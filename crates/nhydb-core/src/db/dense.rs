@@ -1,10 +1,10 @@
-//! Dichte BASE-Records (`DATA_DENSE`, Tag `D10D`).
+//! Dense BASE records (`DATA_DENSE`, tag `D10D`).
 //!
-//! Blockaufbau (unverändert v0.14):
+//! Block layout:
 //! `D10D | vu realm | vu shape | vu u_start | vu count | u32le[count+1] offsets | records`
-//! Ein Record ist die Folge der BASE-Feldwerte in Shape-Reihenfolge,
-//! optional gefolgt vom EXT-Bereich (`0xEA`, nur Lesen; v0.14 schreibt
-//! Extensions als Sparse-Blöcke).
+//! A record is the sequence of BASE field values in shape order,
+//! optionally followed by the EXT area (`0xEA`, read only; extensions
+//! are written as sparse blocks).
 
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ use crate::vmap;
 use super::sparse::CellInput;
 use super::{Db, DenseSegment, SVal};
 
-/// Typisierte Spalte für Batch-Schreibvorgänge (z. B. NumPy-Arrays).
+/// Typed column for batch writes (e.g. NumPy arrays).
 #[derive(Clone, Debug)]
 pub enum ColData<'a> {
     U8(&'a [u8]),
@@ -35,11 +35,11 @@ pub enum ColData<'a> {
     I64(&'a [i64]),
     F32(&'a [f32]),
     F64(&'a [f64]),
-    /// NumPy-bool (1 Byte je Wert)
+    /// NumPy bool (1 byte per value)
     Bool(&'a [u8]),
-    /// Variable Länge: Zeile i = `data[offsets[i]..offsets[i+1]]`
+    /// Variable length: row i = `data[offsets[i]..offsets[i+1]]`
     Var { offsets: &'a [u64], data: &'a [u8], utf8: bool },
-    /// Beliebige Werte (Fallback, z. B. Enum-Labels, BigInts)
+    /// Arbitrary values (fallback, e.g. enum labels, BigInts)
     Vals(&'a [Val]),
 }
 
@@ -66,7 +66,7 @@ impl ColData<'_> {
         self.len() == 0
     }
 
-    /// Wert als Val (für den Fallback-Pfad).
+    /// Value as Val (for the fallback path).
     pub fn get_val(&self, i: usize) -> Val {
         match self {
             ColData::U8(a) => Val::Int(a[i] as i64),
@@ -92,7 +92,7 @@ impl ColData<'_> {
         }
     }
 
-    /// Ganzzahlsicht ohne Allokation (None für nicht-ganzzahlige Spalten).
+    /// Integer view without allocation (None for non-integer columns).
     #[inline]
     fn get_i128(&self, i: usize) -> Option<i128> {
         Some(match self {
@@ -110,15 +110,15 @@ impl ColData<'_> {
     }
 }
 
-/// Eingabezeilen für `put_dense_batch`.
+/// Input rows for `put_dense_batch`.
 pub enum DenseRows<'a> {
-    /// Positionsbezogene Zeilen (Werte in Shape-Feldreihenfolge).
+    /// Positional rows (values in shape field order).
     Tuples(&'a [Vec<Val>]),
-    /// dict-Zeilen (`Val::Map` Feldname → Wert).
+    /// dict rows (`Val::Map` field name → value).
     Dicts(&'a [Val]),
-    /// Zeilenweise flach: `vals[row * width + col]`; `width` = Werte je Zeile.
+    /// Row-major flat: `vals[row * width + col]`; `width` = values per row.
     Flat { vals: &'a [Val], width: usize },
-    /// Spalten in Shape-Feldreihenfolge, alle mit `count` Zeilen.
+    /// Columns in shape field order, all with `count` rows.
     Columns { cols: &'a [ColData<'a>], count: usize },
 }
 
@@ -137,14 +137,14 @@ impl DenseRows<'_> {
     }
 }
 
-/// Dekodierter Dense-Record (`get_internal`).
+/// Decoded dense record (`get_internal`).
 #[derive(Clone, Debug)]
 pub struct DenseRecord {
     pub realm: Nat,
     pub shape_id: u64,
     pub u: Nat,
     pub lane: Lane,
-    /// Feldname → Wert (Shape-Reihenfolge)
+    /// Field name → value (shape order)
     pub values: Vec<(String, Val)>,
     pub base_by_v: BTreeMap<Nat, Val>,
     pub extensions_by_v: BTreeMap<Nat, Val>,
@@ -175,14 +175,14 @@ impl DenseRecord {
 }
 
 fn fit_err(f: &FieldDef, v: impl std::fmt::Display) -> Error {
-    Error::Value(format!("{}: {v} passt nicht in {}", f.name, f.typ.name()))
+    Error::Value(format!("{}: {v} does not fit into {}", f.name, f.typ.name()))
 }
 
-/// Schnellpfad: Spaltenwert direkt kodieren; `Ok(false)` → Fallback nötig.
+/// Fast path: encode the column value directly; `Ok(false)` → fallback needed.
 #[inline]
 fn encode_col_fast(f: &FieldDef, col: &ColData, i: usize, out: &mut Vec<u8>) -> Result<bool> {
     if f.enum_map.is_some() {
-        // Enum mit Ganzzahlspalte: roher Code
+        // enum with integer column: raw code
         if col.get_i128(i).is_none() {
             return Ok(false);
         }
@@ -191,7 +191,7 @@ fn encode_col_fast(f: &FieldDef, col: &ColData, i: usize, out: &mut Vec<u8>) -> 
         match f.typ {
             TypeCode::VarUInt => {
                 if x < 0 {
-                    return Err(Error::Value("varuint erwartet n>=0".into()));
+                    return Err(Error::Value("varuint expects n>=0".into()));
                 }
                 put_vu64(out, x as u64);
             }
@@ -254,7 +254,7 @@ fn encode_col_fast(f: &FieldDef, col: &ColData, i: usize, out: &mut Vec<u8>) -> 
 }
 
 impl Db {
-    /// Kodiert Zeilen gemäß Shape. Rückgabe: (Recordbereich, Offsets).
+    /// Encodes rows according to the shape. Returns: (record area, offsets).
     pub(crate) fn encode_dense_rows(shape: &ShapeDef, rows: &DenseRows) -> Result<(Vec<u8>, Vec<u32>)> {
         let n = rows.len();
         let nf = shape.fields.len();
@@ -263,7 +263,7 @@ impl Db {
         offsets.push(0);
         let check = |out: &Vec<u8>, offsets: &mut Vec<u32>| -> Result<()> {
             if out.len() > u32::MAX as usize {
-                return Err(Error::Value("ein DATA-Batch darf maximal 4 GiB Recorddaten haben".into()));
+                return Err(Error::Value("a DATA batch may contain at most 4 GiB of record data".into()));
             }
             offsets.push(out.len() as u32);
             Ok(())
@@ -272,7 +272,7 @@ impl Db {
             DenseRows::Tuples(rs) => {
                 for row in rs.iter() {
                     if row.len() != nf {
-                        return Err(Error::Schema(format!("Shape {} erwartet {} Werte", shape.shape_id, nf)));
+                        return Err(Error::Schema(format!("Shape {} expects {} values", shape.shape_id, nf)));
                     }
                     for (f, v) in shape.fields.iter().zip(row.iter()) {
                         encode_value(f, v, &mut out)?;
@@ -283,7 +283,7 @@ impl Db {
             DenseRows::Dicts(rs) => {
                 for row in rs.iter() {
                     for f in &shape.fields {
-                        let v = row.get(&f.name).ok_or_else(|| Error::Schema(format!("Pflichtfeld '{}' fehlt", f.name)))?;
+                        let v = row.get(&f.name).ok_or_else(|| Error::Schema(format!("Required field '{}' missing", f.name)))?;
                         encode_value(f, v, &mut out)?;
                     }
                     check(&out, &mut offsets)?;
@@ -291,7 +291,7 @@ impl Db {
             }
             DenseRows::Flat { vals, width } => {
                 if *width != nf {
-                    return Err(Error::Schema(format!("Shape {} erwartet {} Werte", shape.shape_id, nf)));
+                    return Err(Error::Schema(format!("Shape {} expects {} values", shape.shape_id, nf)));
                 }
                 for row in vals.chunks_exact(nf.max(1)) {
                     for (f, v) in shape.fields.iter().zip(row.iter()) {
@@ -302,12 +302,12 @@ impl Db {
             }
             DenseRows::Columns { cols, count } => {
                 if cols.len() != nf {
-                    return Err(Error::Schema(format!("Shape {} erwartet {} Werte", shape.shape_id, nf)));
+                    return Err(Error::Schema(format!("Shape {} expects {} values", shape.shape_id, nf)));
                 }
                 for (f, c) in shape.fields.iter().zip(cols.iter()) {
                     if c.len() != *count {
                         return Err(Error::Value(format!(
-                            "Spalte '{}' hat {} Werte, erwartet {}",
+                            "Column '{}' has {} values, expected {}",
                             f.name,
                             c.len(),
                             count
@@ -327,8 +327,8 @@ impl Db {
         Ok((out, offsets))
     }
 
-    /// Schreibt einen Batch zusammenhängender BASE-Records ab `u_start`
-    /// (`put_dense_batch`). `extensions_by_u`: u → Liste (Schlüssel, Wert).
+    /// Writes a batch of contiguous BASE records starting at `u_start`
+    /// (`put_dense_batch`). `extensions_by_u`: u → list of (key, value).
     #[allow(clippy::too_many_arguments)]
     pub fn put_dense_batch(
         &mut self,
@@ -344,17 +344,17 @@ impl Db {
             return Ok(vmap! {"records" => 0i64, "block_offset" => Val::None});
         }
         if u_start.is_zero() {
-            return Err(Error::Value("u_start muss >0 sein".into()));
+            return Err(Error::Value("u_start must be >0".into()));
         }
         let r = self.require_realm(realm)?;
-        let sid = shape_id.or(r.default_shape_id).ok_or_else(|| Error::Schema("kein Shape angegeben/default".into()))?;
+        let sid = shape_id.or(r.default_shape_id).ok_or_else(|| Error::Schema("no shape given/default".into()))?;
         let shape = match self.shapes.get(&sid) {
             Some(s) if &s.realm_id == realm => s,
-            _ => return Err(Error::Schema("Shape fehlt/passt nicht".into())),
+            _ => return Err(Error::Schema("Shape missing/does not match".into())),
         };
         let count = rows.len();
         let (record_area, offsets) = Self::encode_dense_rows(shape, rows)?;
-        // Extensions vollständig validieren/kodieren, bevor geschrieben wird.
+        // Fully validate/encode extensions before anything is written.
         let mut sparse_enc = None;
         if !extensions_by_u.is_empty() {
             let mut by_u: BTreeMap<Nat, Vec<CellInput>> = BTreeMap::new();
@@ -420,8 +420,8 @@ impl Db {
         })
     }
 
-    /// Einzelner BASE-Record (`put`).
-    #[allow(clippy::too_many_arguments)] // bildet die Python-Signatur (Keyword-Argumente) nach
+    /// Single BASE record (`put`).
+    #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     pub fn put(
         &mut self,
         realm: &Nat,
@@ -445,16 +445,16 @@ impl Db {
                 let rows = [l];
                 self.put_dense_batch(realm, u, &DenseRows::Tuples(&rows), shape_id, &ext, lane, commit)
             }
-            _ => Err(Error::Type("values muss Liste/Tupel oder dict sein".into())),
+            _ => Err(Error::Type("values must be a list/tuple or dict".into())),
         }
     }
 
     // ------------------------------------------------------------------
-    // Lesen
+    // Reading
     // ------------------------------------------------------------------
 
-    /// Gültiges Dense-Segment für `(realm, u, lane)` (`_resolve_segment`):
-    /// das Segment mit der höchsten Block-ID, sofern nicht später gelöscht.
+    /// Valid dense segment for `(realm, u, lane)` (`_resolve_segment`):
+    /// the segment with the highest block ID, unless deleted later.
     pub fn resolve_segment(&self, realm: &Nat, u: &Nat, lane: Lane) -> Option<&DenseSegment> {
         let idx = self.dense.get(&(realm.clone(), lane))?;
         let mut hits = Vec::new();
@@ -470,7 +470,7 @@ impl Db {
         Some(best)
     }
 
-    /// Rohbytes eines Records innerhalb des (gecachten) Block-Payloads.
+    /// Raw bytes of a record within the (cached) block payload.
     pub(crate) fn with_record_bytes<T>(&self, seg: &DenseSegment, u: &Nat, f: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
         let idx = u.checked_sub(&seg.u_start).and_then(|d| d.as_u64()).filter(|d| *d < seg.count);
         let Some(idx) = idx else {
@@ -479,16 +479,16 @@ impl Db {
         let payload = self.block_payload(seg.block_offset)?;
         let t = (seg.offsets_offset - seg.payload_offset) as usize + idx as usize * 4;
         if t + 8 > payload.len() {
-            return Err(Error::Corruption("DATA Offsettabelle unvollstaendig".into()));
+            return Err(Error::Corruption("DATA offset table incomplete".into()));
         }
         let start = u32::from_le_bytes(payload[t..t + 4].try_into().unwrap()) as usize;
         let end = u32::from_le_bytes(payload[t + 4..t + 8].try_into().unwrap()) as usize;
         if end < start {
-            return Err(Error::Corruption("DATA Recordoffsets rueckwaerts".into()));
+            return Err(Error::Corruption("DATA record offsets go backwards".into()));
         }
         let rbase = (seg.records_offset - seg.payload_offset) as usize;
         if rbase + end > payload.len() {
-            return Err(Error::Corruption("DATA Record unvollstaendig".into()));
+            return Err(Error::Corruption("DATA record incomplete".into()));
         }
         f(&payload[rbase + start..rbase + end])
     }
@@ -498,7 +498,7 @@ impl Db {
         let shape = self
             .shapes
             .get(&seg.shape_id)
-            .ok_or_else(|| Error::Corruption("Shape des DATA-Segments fehlt".into()))?;
+            .ok_or_else(|| Error::Corruption("Shape of the DATA segment missing".into()))?;
         let mut p = 0usize;
         let mut values = Vec::with_capacity(shape.fields.len());
         let mut base_by_v = BTreeMap::new();
@@ -509,7 +509,7 @@ impl Db {
         }
         let (ext, p) = self.decode_extensions(&seg.realm_id, payload, p)?;
         if p != payload.len() {
-            return Err(Error::Corruption("Dense Record Restbytes".into()));
+            return Err(Error::Corruption("Dense record trailing bytes".into()));
         }
         Ok(DenseRecord {
             realm: seg.realm_id.clone(),
@@ -522,7 +522,7 @@ impl Db {
         })
     }
 
-    /// Record inkl. Sparse-Overlays (`get_internal`).
+    /// Record including sparse overlays (`get_internal`).
     pub fn get_internal(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<Option<DenseRecord>> {
         let Some(seg) = self.resolve_segment(realm, u, lane) else {
             return Ok(None);
@@ -560,8 +560,8 @@ impl Db {
         Ok(Some(rec))
     }
 
-    /// Extensions eines bestehenden Records setzen (`put_extensions`).
-    /// `merge=false` löscht nicht genannte, lebende Extension-Zellen.
+    /// Sets the extensions of an existing record (`put_extensions`).
+    /// `merge=false` deletes live extension cells that are not listed.
     pub fn put_extensions(
         &mut self,
         realm: &Nat,
@@ -572,7 +572,7 @@ impl Db {
         commit: bool,
     ) -> Result<Val> {
         if self.resolve_segment(realm, u, lane).is_none() {
-            return Err(Error::Key(format!("u{u}/{} existiert nicht", lane_name(lane))));
+            return Err(Error::Key(format!("u{u}/{} does not exist", lane_name(lane))));
         }
         let norm = self.normalize_extensions(realm, items)?;
         if !merge {
@@ -592,7 +592,7 @@ impl Db {
         self.put_points(realm, cells, lane, commit, 10_000)
     }
 
-    /// Löscht einen BASE-Record logisch (`delete`). Rückgabe: ob vorhanden.
+    /// Logically deletes a BASE record (`delete`). Returns whether it existed.
     pub fn delete(&mut self, realm: &Nat, u: &Nat, lane: Lane, commit: bool) -> Result<bool> {
         if self.get_internal(realm, u, lane)?.is_none() {
             return Ok(false);

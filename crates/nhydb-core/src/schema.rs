@@ -1,7 +1,7 @@
-//! Schema-Objekte (v0.14-Dataclasses `FieldDef` … `IndexDef`).
+//! Schema objects (`FieldDef` … `IndexDef`).
 //!
-//! `to_val`/`from_val` entsprechen exakt `to_dict`/`from_dict` der
-//! Referenz, damit die JSON-Metadatenblöcke identisch sind.
+//! `to_val`/`from_val` correspond exactly to the Python `to_dict`/`from_dict`
+//! so that the JSON metadata blocks are identical.
 
 use crate::address::{require_positive, validate_local_v};
 use crate::codec::{enum_from_val, enum_to_val, int_like, val_to_nat, FieldDef, TypeCode};
@@ -17,13 +17,13 @@ fn req<'a>(d: &'a Val, k: &str) -> Result<&'a Val> {
 }
 
 fn req_nat(d: &Val, k: &str) -> Result<Nat> {
-    val_to_nat(req(d, k)?).ok_or_else(|| Error::Value(format!("{k}: positive Ganzzahl erwartet")))
+    val_to_nat(req(d, k)?).ok_or_else(|| Error::Value(format!("{k}: positive integer expected")))
 }
 
 fn req_u64(d: &Val, k: &str) -> Result<u64> {
     int_like(req(d, k)?)
         .and_then(|b| b.to_u64())
-        .ok_or_else(|| Error::Value(format!("{k}: Ganzzahl im Bereich 0..2^64 erwartet")))
+        .ok_or_else(|| Error::Value(format!("{k}: integer in range 0..2^64 expected")))
 }
 
 fn opt_str(d: &Val, k: &str) -> String {
@@ -48,7 +48,7 @@ pub fn field_to_val(f: &FieldDef) -> Val {
     d
 }
 
-/// Python-`repr` eines `FieldDef` (für Fehlermeldungen wie v0.14).
+/// Python `repr` of a `FieldDef` (for error messages).
 pub fn field_repr(v: &Nat, name: &str, typ: &str, enum_map: &Option<crate::codec::EnumMap>, description: &str) -> String {
     use crate::val::py_str_repr;
     let en = match enum_map {
@@ -63,8 +63,8 @@ pub fn field_repr(v: &Nat, name: &str, typ: &str, enum_map: &Option<crate::codec
     )
 }
 
-/// `FieldDef.from_dict`; unbekannte Typen werden als SchemaError gemeldet
-/// (in v0.14 durch `ShapeDef.__post_init__`).
+/// `FieldDef.from_dict`; unknown types are reported as SchemaError
+/// (the same error `ShapeDef` validation raises).
 pub fn field_from_val(d: &Val) -> Result<FieldDef> {
     let v = req_nat(d, "v")?;
     let name = req(d, "name")?.py_str();
@@ -73,7 +73,7 @@ pub fn field_from_val(d: &Val) -> Result<FieldDef> {
     let description = opt_str(d, "description");
     let typ = TypeCode::from_name(&tname).ok_or_else(|| {
         Error::Schema(format!(
-            "ungueltiges Feld {}; lokales v muss in 1..10^100 liegen",
+            "invalid field {}; local v must be in 1..10^100",
             field_repr(&v, &name, &tname, &enum_map, &description)
         ))
     })?;
@@ -89,7 +89,7 @@ pub struct ShapeDef {
     pub shape_id: u64,
     pub realm_id: Nat,
     pub name: String,
-    /// sortiert nach v
+    /// sorted by v
     pub fields: Vec<FieldDef>,
     pub description: String,
 }
@@ -99,18 +99,18 @@ impl ShapeDef {
         fields.sort_by(|a, b| a.v.cmp(&b.v));
         for w in fields.windows(2) {
             if w[0].v == w[1].v {
-                return Err(Error::Schema("doppeltes v im Shape".into()));
+                return Err(Error::Schema("duplicate v in shape".into()));
             }
         }
         let mut names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         names.sort();
         if names.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Error::Schema("doppelter Feldname im Shape".into()));
+            return Err(Error::Schema("duplicate field name in shape".into()));
         }
         for f in &fields {
             if f.v.is_zero() || validate_local_v(&f.v, None).is_err() {
                 return Err(Error::Schema(format!(
-                    "ungueltiges Feld {}; lokales v muss in 1..10^100 liegen",
+                    "invalid field {}; local v must be in 1..10^100",
                     field_repr(&f.v, &f.name, f.typ.name(), &f.enum_map, &f.description)
                 )));
             }
@@ -119,7 +119,7 @@ impl ShapeDef {
     }
 
     pub fn by_v(&self, v: &Nat) -> Option<&FieldDef> {
-        // Felder sind nach v sortiert; BASE-Shapes sind dicht ab v1.
+        // Fields are sorted by v; BASE shapes are dense from v1.
         if let Nat::S(x) = v {
             if *x >= 1 && (*x as usize) <= self.fields.len() && self.fields[*x as usize - 1].v == *v {
                 return Some(&self.fields[*x as usize - 1]);
@@ -143,7 +143,7 @@ impl ShapeDef {
     pub fn from_val(d: &Val) -> Result<Self> {
         let fields = match req(d, "fields")? {
             Val::List(l) => l.iter().map(field_from_val).collect::<Result<Vec<_>>>()?,
-            _ => return Err(Error::Schema("fields muss eine Liste sein".into())),
+            _ => return Err(Error::Schema("fields must be a list".into())),
         };
         ShapeDef::new(req_u64(d, "shape_id")?, req_nat(d, "realm_id")?, req(d, "name")?.py_str(), fields, opt_str(d, "description"))
     }
@@ -203,7 +203,7 @@ pub struct ExtensionDef {
     pub name: String,
     pub enum_map: Option<crate::codec::EnumMap>,
     pub description: String,
-    /// Vorberechnete Feldsicht (vermeidet Allokationen im Schreib-/Lesepfad).
+    /// Precomputed field view (avoids allocations on the write/read path).
     pub field: FieldDef,
 }
 
@@ -211,7 +211,7 @@ impl ExtensionDef {
     pub fn new(realm_id: Nat, v: Nat, typ: &str, name: String, enum_val: &Val, description: String) -> Result<Self> {
         require_positive("realm_id", &realm_id)?;
         validate_local_v(&v, Some(&realm_id))?;
-        let typ = TypeCode::from_name(typ).ok_or_else(|| Error::Schema(format!("unbekannter Extension-Typ '{typ}'")))?;
+        let typ = TypeCode::from_name(typ).ok_or_else(|| Error::Schema(format!("unknown extension type '{typ}'")))?;
         let enum_map = enum_from_val(enum_val)?;
         let field = FieldDef {
             v: v.clone(),
@@ -285,7 +285,7 @@ impl LayoutKind {
             "COLUMN" => Ok(LayoutKind::Column),
             "PACKED" => Ok(LayoutKind::Packed),
             "CUSTOM" => Ok(LayoutKind::Custom),
-            other => Err(Error::Schema(format!("unbekannter Layout-Typ '{other}'"))),
+            other => Err(Error::Schema(format!("unknown layout type '{other}'"))),
         }
     }
 
@@ -313,7 +313,7 @@ pub struct LayoutDef {
     pub description: String,
 }
 
-/// Feldbeschreibung eines COLUMN/PACKED/CUSTOM-Layouts (aus `params.fields`).
+/// Field description of a COLUMN/PACKED/CUSTOM layout (from `params.fields`).
 #[derive(Clone, Debug)]
 pub struct LayoutField<'a> {
     pub raw: &'a Val,
@@ -342,17 +342,17 @@ impl<'a> LayoutField<'a> {
         let v = self.raw.get("u").ok_or_else(|| Error::Key("'u'".into()))?;
         int_like(v)
             .map(|b| if b.sign() == num_bigint::Sign::Minus { Nat::ZERO } else { Nat::from(b.magnitude().clone()) })
-            .ok_or_else(|| Error::Value(format!("COLUMN u ungueltig: {}", v.py_repr())))
+            .ok_or_else(|| Error::Value(format!("invalid COLUMN u: {}", v.py_repr())))
     }
     pub fn u_raw(&self) -> Result<num_bigint::BigInt> {
         let v = self.raw.get("u").ok_or_else(|| Error::Key("'u'".into()))?;
-        int_like(v).ok_or_else(|| Error::Value(format!("COLUMN u ungueltig: {}", v.py_repr())))
+        int_like(v).ok_or_else(|| Error::Value(format!("invalid COLUMN u: {}", v.py_repr())))
     }
-    /// `int(f.get("offset", 0))` (kann negativ sein)
+    /// `int(f.get("offset", 0))` (may be negative)
     pub fn offset(&self) -> Result<num_bigint::BigInt> {
         match self.raw.get("offset") {
             None => Ok(num_bigint::BigInt::from(0)),
-            Some(v) => int_like(v).ok_or_else(|| Error::Value(format!("offset ungueltig: {}", v.py_repr()))),
+            Some(v) => int_like(v).ok_or_else(|| Error::Value(format!("invalid offset: {}", v.py_repr()))),
         }
     }
     pub fn enum_val(&self) -> &Val {
@@ -361,10 +361,10 @@ impl<'a> LayoutField<'a> {
     pub fn description(&self) -> String {
         opt_str(self.raw, "description")
     }
-    /// Feld als FieldDef mit gegebenem v und Namen.
+    /// Field as FieldDef with the given v and name.
     pub fn to_field(&self, v: Nat, name: String) -> Result<FieldDef> {
         let tname = self.type_name();
-        let typ = TypeCode::from_name(&tname).ok_or_else(|| Error::Schema(format!("unbekannter Datentyp '{tname}'")))?;
+        let typ = TypeCode::from_name(&tname).ok_or_else(|| Error::Schema(format!("unknown data type '{tname}'")))?;
         Ok(FieldDef { v, name, typ, enum_map: enum_from_val(self.enum_val())?, description: self.description() })
     }
 }
@@ -387,7 +387,7 @@ impl LayoutDef {
         description: String,
     ) -> Result<Self> {
         if layout_id == 0 {
-            return Err(Error::Value("layout_id muss > 0 sein".into()));
+            return Err(Error::Value("layout_id must be > 0".into()));
         }
         require_positive("realm_id", &realm_id)?;
         let kind = LayoutKind::parse(kind)?;
@@ -395,7 +395,7 @@ impl LayoutDef {
         if let Some(e) = &u_end {
             require_positive("u_end", e)?;
             if e < &u_start {
-                return Err(Error::Schema("u_end muss >= u_start sein".into()));
+                return Err(Error::Schema("u_end must be >= u_start".into()));
             }
         }
         if !base_reserve_to.is_zero() {
@@ -446,7 +446,7 @@ impl LayoutDef {
         self.param_nat("u").filter(|s| !s.is_zero()).ok_or_else(|| Error::Key("'u'".into()))
     }
 
-    /// Breite für die Gewinnerregel (`u_end-u_start` oder 10^200).
+    /// Width for the winner rule (`u_end-u_start` or 10^200).
     pub fn width(&self) -> Nat {
         match &self.u_end {
             Some(e) => e.checked_sub(&self.u_start).unwrap_or_default(),
@@ -500,7 +500,7 @@ impl LayoutDef {
         )
     }
 
-    /// Sortierschlüssel `(priority, -width, layout_id)`; größer gewinnt.
+    /// Sort key `(priority, -width, layout_id)`; larger wins.
     pub fn sort_cmp(a: &LayoutDef, b: &LayoutDef) -> std::cmp::Ordering {
         a.priority
             .cmp(&b.priority)
@@ -518,23 +518,23 @@ pub struct IndexDef {
     pub index_id: u64,
     pub realm_id: Nat,
     pub name: String,
-    /// Historisches Feld `v`: Quellfeld bei VALUE, sonst 0 (Schutz alter Leser).
+    /// Legacy field `v`: source field for VALUE, otherwise 0 (protects older readers).
     pub v: Nat,
     pub description: String,
     pub kind: IndexKind,
-    /// Quellfeld der Nicht-VALUE-Familien.
+    /// Source field of the non-VALUE families.
     pub source_v: Option<Nat>,
-    /// Normalisierte, persistierte Familienoptionen.
+    /// Normalized, persisted family options.
     pub options: Val,
 }
 
 impl IndexDef {
-    /// Logisches Quellfeld (`field_v`).
+    /// Logical source field (`field_v`).
     pub fn field_v(&self) -> &Nat {
         self.source_v.as_ref().unwrap_or(&self.v)
     }
 
-    /// `IndexDef.to_dict()` der v0.27 inkl. Vorwärtsschutz für FULLTEXT.
+    /// `IndexDef.to_dict()` including forward-compatibility protection for FULLTEXT.
     pub fn to_val(&self) -> Val {
         if self.kind == IndexKind::Fulltext {
             let compat = vmap! {

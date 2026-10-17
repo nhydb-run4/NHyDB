@@ -1,4 +1,4 @@
-"""NumPy-Ergänzungen der v0.27: put_math_numpy und Abfrageergebnisse als Spalten."""
+"""NumPy extensions: put_math_numpy and query results as columns."""
 import numpy as np
 import pytest
 
@@ -42,7 +42,7 @@ def test_put_math_numpy_payload_types_and_errors(tmp_path):
         db.put_math_numpy(1, [np.arange(3), np.arange(2)], np.zeros(3))
     with pytest.raises(nhydb.MathCellConflictError):
         db.put_math_numpy(1, np.array([[1, 1], [9, 1]]), np.array([9.0, 9.0]))
-    assert db.get_math(1, (9, 1)) is None  # Batch vollständig zurückgerollt
+    assert db.get_math(1, (9, 1)) is None  # batch fully rolled back
     with pytest.raises(nhydb.MathDomainError):
         db.put_math_numpy(1, np.array([[-500, 0]]), np.array([1.0]))
     t = _math_db(tmp_path / "t.nhydb", payload_type="utf8")

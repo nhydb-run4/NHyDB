@@ -1,19 +1,21 @@
-//! Portable Betriebssystem-Schnittstelle.
+//! Portable operating-system interface.
 //!
-//! Einzige Stelle mit betriebssystemspezifischem Code: positionsbasiertes
-//! Lesen/Schreiben, Dauerhaftigkeit (`fsync`/`full`), Verzeichnis-Sync,
-//! atomarer Dateiaustausch und Dateisperren. Zielplattformen: macOS, Linux,
-//! Windows.
+//! The only place with OS-specific code: positional read/write, durability
+//! (`fsync`/`full`), directory sync, atomic file replacement and file locks.
+//! Target platforms: macOS, Linux, Windows.
 //!
-//! Garantien der Durability-Modi (siehe `docs/PLATFORM.md`):
+//! System calls used by the durability modes:
 //!
-//! | Modus | macOS | Linux | Windows |
+//! | Mode | macOS | Linux | Windows |
 //! |---|---|---|---|
 //! | `fsync` | `fsync(2)` | `fsync(2)` | `FlushFileBuffers` |
-//! | `full`  | `fcntl(F_FULLFSYNC)` | `fsync(2)` (leert den Gerätecache) | `FlushFileBuffers` (leert den Gerätecache) |
+//! | `full`  | `fcntl(F_FULLFSYNC)` | `fsync(2)` (relies on the kernel flushing the device cache) | `FlushFileBuffers` (flushes the device cache) |
 //!
-//! Kann ein Modus nicht garantiert werden, wird ein Fehler gemeldet; es gibt
-//! keinen stillen Rückfall auf eine schwächere Garantie.
+//! If `full` is requested on a platform without a known cache-flushing call,
+//! or `F_FULLFSYNC` fails on macOS, an error is returned instead of silently
+//! falling back to plain `fsync(2)`. On Linux and Windows `full` issues the
+//! same call as `fsync`. On Windows, directory sync is a no-op in both modes
+//! (see [`sync_dir`]).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,13 +23,13 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-/// Dauerhaftigkeitsmodus für Commit/Sync.
+/// Durability mode for commit/sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Durability {
-    /// Normale Betriebssystem-Synchronisation (Python `os.fsync`).
+    /// Plain OS synchronization (`fsync(2)`; `FlushFileBuffers` on Windows).
     #[default]
     Fsync,
-    /// Zusätzlich Leeren des Laufwerks-Caches (stärkste Garantie).
+    /// Additionally flush the drive cache (strongest guarantee).
     Full,
 }
 
@@ -36,7 +38,7 @@ impl Durability {
         match s.to_ascii_lowercase().as_str() {
             "fsync" | "default" | "normal" => Ok(Durability::Fsync),
             "full" | "fullfsync" => Ok(Durability::Full),
-            _ => Err(Error::Value("durability muss 'fsync' oder 'full' sein".into())),
+            _ => Err(Error::Value("durability must be 'fsync' or 'full'".into())),
         }
     }
     pub fn name(self) -> &'static str {
@@ -45,11 +47,11 @@ impl Durability {
             Durability::Full => "full",
         }
     }
-    /// Prüft, ob die Plattform den Modus garantieren kann.
+    /// Checks whether the platform can guarantee the mode.
     pub fn check_supported(self) -> Result<()> {
         if self == Durability::Full && !FULL_SUPPORTED {
             return Err(Error::Value(format!(
-                "durability='full' wird auf dieser Plattform ({}) nicht garantiert",
+                "durability='full' is not guaranteed on this platform ({})",
                 std::env::consts::OS
             )));
         }
@@ -60,7 +62,7 @@ impl Durability {
 const FULL_SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android", windows));
 
 // ----------------------------------------------------------------------
-// Positionsbasiertes I/O
+// Positional I/O
 // ----------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -80,7 +82,7 @@ pub fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Res
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match f.seek_read(buf, off) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Dateiende erreicht")),
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "end of file reached")),
             Ok(n) => {
                 buf = &mut buf[n..];
                 off += n as u64;
@@ -97,7 +99,7 @@ pub fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<(
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match f.seek_write(buf, off) {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "Schreiben fehlgeschlagen")),
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write failed")),
             Ok(n) => {
                 buf = &buf[n..];
                 off += n as u64;
@@ -110,10 +112,10 @@ pub fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<(
 }
 
 // ----------------------------------------------------------------------
-// Dauerhaftigkeit
+// Durability
 // ----------------------------------------------------------------------
 
-/// Synchronisiert Inhalt und Metadaten einer Datei gemäß `mode`.
+/// Synchronizes a file's data and metadata according to `mode`.
 pub fn sync_file(f: &File, mode: Durability) -> Result<()> {
     match mode {
         Durability::Fsync => plain_sync(f),
@@ -121,8 +123,8 @@ pub fn sync_file(f: &File, mode: Durability) -> Result<()> {
     }
 }
 
-/// `fsync(2)` direkt. Achtung: Rusts `File::sync_all` ruft auf Apple-
-/// Plattformen `F_FULLFSYNC` auf und wäre damit bereits der Modus `full`.
+/// Calls `fsync(2)` directly. Note: Rust's `File::sync_all` uses
+/// `F_FULLFSYNC` on Apple platforms and would therefore already be mode `full`.
 #[cfg(unix)]
 fn plain_sync(f: &File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -146,7 +148,7 @@ fn full_sync(f: &File) -> Result<()> {
         let e = std::io::Error::last_os_error();
         return Err(Error::Io(std::io::Error::new(
             e.kind(),
-            format!("F_FULLFSYNC fehlgeschlagen (durability='full' auf diesem Dateisystem nicht garantiert): {e}"),
+            format!("F_FULLFSYNC failed (durability='full' not guaranteed on this file system): {e}"),
         )));
     }
     Ok(())
@@ -154,18 +156,18 @@ fn full_sync(f: &File) -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 fn full_sync(f: &File) -> Result<()> {
-    // Linux: fsync(2) leert laut Kernel-Vertrag auch den flüchtigen
-    // Gerätecache (Write-Barrier/FUA). Windows: FlushFileBuffers ebenso.
+    // Linux: per the kernel contract, fsync(2) also flushes the volatile
+    // device cache (write barrier/FUA). Windows: FlushFileBuffers likewise.
     f.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android", windows)))]
 fn full_sync(_f: &File) -> Result<()> {
-    Err(Error::Value("durability='full' wird auf dieser Plattform nicht garantiert".into()))
+    Err(Error::Value("durability='full' is not guaranteed on this platform".into()))
 }
 
-/// Macht Verzeichniseinträge (Anlegen/Umbenennen) dauerhaft.
+/// Makes directory entries (create/rename) durable.
 #[cfg(unix)]
 pub fn sync_dir(dir: &Path, mode: Durability) -> Result<()> {
     let d = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
@@ -173,8 +175,8 @@ pub fn sync_dir(dir: &Path, mode: Durability) -> Result<()> {
     sync_file(&f, mode)
 }
 
-/// Windows: Verzeichnis-Metadaten sind über das NTFS-Journal geschützt;
-/// Umbenennungen erfolgen mit `MOVEFILE_WRITE_THROUGH` (siehe
+/// Windows: no-op for both modes. Directory metadata is protected by the
+/// NTFS journal; renames use `MOVEFILE_WRITE_THROUGH` (see
 /// [`atomic_replace`]).
 #[cfg(windows)]
 pub fn sync_dir(_dir: &Path, _mode: Durability) -> Result<()> {
@@ -188,8 +190,8 @@ pub fn parent_dir(p: &Path) -> PathBuf {
     }
 }
 
-/// Ersetzt `dst` atomar durch `src` (gleiches Verzeichnis/Dateisystem) und
-/// macht den Austausch dauerhaft.
+/// Atomically replaces `dst` with `src` (same directory/file system) and
+/// makes the replacement durable.
 #[cfg(unix)]
 pub fn atomic_replace(src: &Path, dst: &Path, mode: Durability) -> Result<()> {
     std::fs::rename(src, dst)?;
@@ -209,7 +211,7 @@ pub fn atomic_replace(src: &Path, dst: &Path, _mode: Durability) -> Result<()> {
     Ok(())
 }
 
-/// Setzt die Zugriffsrechte einer geheimen Datei auf „nur Besitzer“.
+/// Restricts the permissions of a secret file to "owner only".
 #[cfg(unix)]
 pub fn restrict_to_owner(f: &File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -217,15 +219,15 @@ pub fn restrict_to_owner(f: &File) -> Result<()> {
     Ok(())
 }
 
-/// Windows: Dateien im Benutzerprofil erben die Besitzer-ACL; keine
-/// zusätzliche Einschränkung über Standardmittel.
+/// Windows: files in the user profile inherit the owner ACL; no additional
+/// restriction is applied with standard means.
 #[cfg(windows)]
 pub fn restrict_to_owner(_f: &File) -> Result<()> {
     Ok(())
 }
 
-/// Legt eine neue Datei exklusiv an (Fehler, falls vorhanden); bei `secret`
-/// mit Besitzer-Rechten.
+/// Creates a new file exclusively (error if it exists); with owner-only
+/// permissions if `secret`.
 pub fn create_new(path: &Path, secret: bool) -> Result<File> {
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -248,7 +250,7 @@ pub fn create_new(path: &Path, secret: bool) -> Result<File> {
 }
 
 // ----------------------------------------------------------------------
-// Lokale Zeit (Backup-Namen wie Pythons `time.strftime("%Y%m%d_%H%M%S")`)
+// Local time (backup names, format like Python's `time.strftime("%Y%m%d_%H%M%S")`)
 // ----------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -276,14 +278,14 @@ pub fn local_timestamp() -> String {
 }
 
 // ----------------------------------------------------------------------
-// Dateisperren
+// File locks
 // ----------------------------------------------------------------------
 
-/// Sperrverhalten (aus `nhydb_config.toml`, Abschnitt `[lock]`).
+/// Locking behaviour (from `nhydb_config.toml`, section `[lock]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockConfig {
     pub enabled: bool,
-    /// 0 = sofort fehlschlagen, sonst maximale Wartezeit.
+    /// 0 = fail immediately, otherwise maximum wait time.
     pub timeout_ms: u64,
 }
 
@@ -293,9 +295,9 @@ impl Default for LockConfig {
     }
 }
 
-/// Gehaltene Prozess-Sperre auf `<db>.lock`. Die Sperrdatei liegt neben der
-/// DB und bleibt bestehen; dadurch gilt die Sperre auch über einen atomaren
-/// Austausch der DB-Datei hinweg. Freigabe beim Drop.
+/// Held process lock on `<db>.lock`. The lock file lives next to the DB and
+/// is never removed, so the lock stays valid across an atomic replacement of
+/// the DB file. Released on drop.
 #[derive(Debug)]
 pub struct DbLock {
     file: Option<File>,
@@ -309,7 +311,7 @@ impl DbLock {
         PathBuf::from(s)
     }
 
-    /// Keine Sperre (deaktiviert oder intern bereits gehalten).
+    /// No lock (disabled or already held internally).
     pub fn none(db_path: &Path) -> DbLock {
         DbLock { file: None, path: Self::lock_path(db_path) }
     }
@@ -318,7 +320,7 @@ impl DbLock {
         self.file.is_some()
     }
 
-    /// Erwirbt eine exklusive Schreibsperre gemäß `cfg`.
+    /// Acquires an exclusive write lock according to `cfg`.
     pub fn acquire(db_path: &Path, cfg: LockConfig) -> Result<DbLock> {
         if !cfg.enabled {
             return Ok(Self::none(db_path));
@@ -332,7 +334,7 @@ impl DbLock {
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if Instant::now() >= deadline {
                         return Err(Error::Locked(format!(
-                            "Datenbank wird bereits von einem anderen Prozess geschrieben (Sperre {} nach {} ms nicht erhalten)",
+                            "database is already being written by another process (lock {} not acquired after {} ms)",
                             path.display(),
                             cfg.timeout_ms
                         )));

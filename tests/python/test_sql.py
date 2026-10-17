@@ -1,4 +1,4 @@
-"""Differenztests NHySQL-0.24 gegen Python-v0.27 (Lexer, Parser, Compiler, Ausführung)."""
+"""Differential tests of NHySQL (lexer, parser, compiler, execution) against an external reference implementation (not included)."""
 import importlib
 import random
 
@@ -248,7 +248,7 @@ def test_execute_sql_identical(tmp_path):
 
 
 def test_query_cli_sql(tmp_path):
-    """`python -m nhydb.query` (CLI wie nhydb_query_v027) mit --sql und --params."""
+    """`python -m nhydb.query` with --sql and --params."""
     import json
     import subprocess
     import sys

@@ -1,11 +1,11 @@
-//! zlib-Kompression über die System-`libz` (identisch zu Pythons
-//! `zlib.compress(data, level)`, damit Indexblöcke bytegleich zur v0.14
-//! entstehen). Dekompression erfolgt formatstandardkonform über miniz_oxide.
+//! zlib compression via the system `libz` (identical to Python's
+//! `zlib.compress(data, level)`, so index blocks are byte-identical to those
+//! produced by CPython). Decompression uses miniz_oxide (standard zlib format).
 //!
-//! Plattformen ohne System-`libz` (Windows) komprimieren mit miniz_oxide.
-//! Das Ergebnis ist ein gültiger zlib-Strom (überall lesbar), die
-//! komprimierten Bytes können sich aber von CPython unterscheiden; das
-//! Dateiformat verlangt keine Byte-Identität der komprimierten Postings.
+//! Platforms without a system `libz` (Windows) compress with miniz_oxide.
+//! The result is a valid zlib stream (readable everywhere), but the
+//! compressed bytes may differ from CPython; the file format does not
+//! require byte identity of the compressed postings.
 
 #[cfg(unix)]
 use std::os::raw::{c_int, c_ulong};

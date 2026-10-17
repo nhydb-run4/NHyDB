@@ -1,12 +1,12 @@
-//! MATH-Realmplaner (Python `nhydb_layout_v027`): exklusive physische
-//! Realms für MATH-Layouts. Keine Datei-I/O, kein DB-Zustand.
+//! MATH realm planner: exclusive physical realms for MATH layouts.
+//! No file I/O, no database state.
 //!
-//! * bestehende logisch→physisch-Abbildungen sind unveränderlich,
-//! * neue Abbildungen nur append-only und nur für tatsächlich benötigte
-//!   logische Realms,
-//! * jedes fehlende zusammenhängende logische Extent kommt in den ersten
-//!   freien physischen Lauf, der es ganz aufnimmt,
-//! * Budget `realm_auto_limit` je MATH-Layout.
+//! * existing logical→physical mappings are immutable,
+//! * new mappings are append-only and only for logical realms that are
+//!   actually needed,
+//! * each missing contiguous logical extent goes into the first free
+//!   physical run that holds it completely,
+//! * budget `realm_auto_limit` per MATH layout.
 
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive};
@@ -21,7 +21,7 @@ fn state_err(m: impl Into<String>) -> Error {
 
 fn pos(v: &BigInt, name: &str) -> Result<()> {
     if !v.is_positive() {
-        return Err(state_err(format!("{name} muss ein positiver Integer sein")));
+        return Err(state_err(format!("{name} must be a positive integer")));
     }
     Ok(())
 }
@@ -42,7 +42,7 @@ impl OwnedRealmExtent {
             return Err(state_err("OwnedRealmExtent: end < start"));
         }
         if crate::unicode::strip(owner_kind).is_empty() {
-            return Err(state_err("owner_kind darf nicht leer sein"));
+            return Err(state_err("owner_kind must not be empty"));
         }
         pos(&owner_id, "owner_id")?;
         Ok(OwnedRealmExtent { start, end, owner_kind: owner_kind.into(), owner_id })
@@ -82,7 +82,7 @@ impl MathRealmExtent {
             return Err(state_err("MathRealmExtent: physical_end < physical_start"));
         }
         if &le - &ls != &pe - &ps {
-            return Err(state_err("MathRealmExtent: logische/physische Laenge muss identisch sein"));
+            return Err(state_err("MathRealmExtent: logical and physical length must be identical"));
         }
         Ok(MathRealmExtent { logical_start: ls, logical_end: le, physical_start: ps, physical_end: pe })
     }
@@ -118,7 +118,7 @@ fn validate_math_extents(mut xs: Vec<MathRealmExtent>) -> Result<Vec<MathRealmEx
     let mut phys: Vec<(BigInt, BigInt)> = Vec::new();
     for e in &xs {
         if e.logical_start <= last {
-            return Err(state_err("Math RealmMap hat ueberlappende logische Extents"));
+            return Err(state_err("Math RealmMap has overlapping logical extents"));
         }
         last = e.logical_end.clone();
         phys.push((e.physical_start.clone(), e.physical_end.clone()));
@@ -127,7 +127,7 @@ fn validate_math_extents(mut xs: Vec<MathRealmExtent>) -> Result<Vec<MathRealmEx
     let mut prev = BigInt::from(0);
     for (a, b) in phys {
         if a <= prev {
-            return Err(state_err("Math RealmMap hat ueberlappende physische Extents"));
+            return Err(state_err("Math RealmMap has overlapping physical extents"));
         }
         prev = b;
     }
@@ -162,10 +162,10 @@ impl MathRealmMap {
     pub fn new(layout_id: BigInt, fingerprint: &str, extents: Vec<MathRealmExtent>, realm_auto_limit: BigInt) -> Result<Self> {
         pos(&layout_id, "layout_id")?;
         if crate::unicode::strip(fingerprint).is_empty() {
-            return Err(state_err("mapping_fingerprint darf nicht leer sein"));
+            return Err(state_err("mapping_fingerprint must not be empty"));
         }
         if !realm_auto_limit.is_positive() {
-            return Err(state_err("realm_auto_limit muss > 0 sein"));
+            return Err(state_err("realm_auto_limit must be > 0"));
         }
         Ok(MathRealmMap { layout_id, mapping_fingerprint: fingerprint.into(), extents: coalesce_math_extents(extents)?, realm_auto_limit })
     }
@@ -192,19 +192,19 @@ impl MathRealmMap {
             "extents" => Val::List(self.extents.iter().map(|e| e.to_val()).collect()),
         }
     }
-    /// SHA-256 über `json.dumps(to_dict, sort_keys, separators)` (ASCII).
+    /// SHA-256 over `json.dumps(to_dict, sort_keys, separators)` (ASCII).
     pub fn state_fingerprint(&self) -> String {
         crate::crypto::sha256_hex(self.to_val().to_json_ascii().expect("JSON").as_bytes())
     }
     pub fn from_val(raw: &Val) -> Result<Self> {
         if raw.get("contract").map(|v| v.py_str()).as_deref() != Some(REALMMAP_CONTRACT) {
-            return Err(state_err("unbekannter Math RealmMap Contract"));
+            return Err(state_err("unknown Math RealmMap contract"));
         }
         let lid = raw.get("layout_id").and_then(|v| v.as_bigint()).ok_or_else(|| Error::Key("'layout_id'".into()))?;
         let fp = raw.get("mapping_fingerprint").ok_or_else(|| Error::Key("'mapping_fingerprint'".into()))?.py_str();
         let lim = match raw.get("realm_auto_limit") {
             None => BigInt::from(crate::config::DEFAULT_REALM_AUTO_LIMIT),
-            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("realm_auto_limit ungueltig".into()))?,
+            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("invalid realm_auto_limit".into()))?,
         };
         let mut ex = Vec::new();
         for e in raw.get("extents").and_then(|v| v.as_list()).into_iter().flatten() {
@@ -223,13 +223,13 @@ pub struct CoreLayoutSnapshot {
 impl CoreLayoutSnapshot {
     pub fn new(revision: BigInt, mut occupied: Vec<OwnedRealmExtent>) -> Result<Self> {
         if revision.is_negative() {
-            return Err(state_err("revision muss >= 0 sein"));
+            return Err(state_err("revision must be >= 0"));
         }
         occupied.sort_by(|a, b| (&a.start, &a.end).cmp(&(&b.start, &b.end)));
         let mut prev = BigInt::from(0);
         for e in &occupied {
             if e.start <= prev {
-                return Err(state_err("Core-Snapshot hat ueberlappende Realm-Belegungen"));
+                return Err(state_err("core snapshot has overlapping realm allocations"));
             }
             prev = e.end.clone();
         }
@@ -266,7 +266,7 @@ fn coalesce_owned(mut xs: Vec<OwnedRealmExtent>) -> Result<Vec<OwnedRealmExtent>
     for e in xs {
         if let Some(p) = out.last_mut() {
             if e.start <= p.end {
-                return Err(state_err("ueberlappende Realm-Belegung beim Commit"));
+                return Err(state_err("overlapping realm allocation on commit"));
             }
             if e.start == &p.end + 1 && e.owner_kind == p.owner_kind && e.owner_id == p.owner_id {
                 *p = OwnedRealmExtent::new(p.start.clone(), e.end, &p.owner_kind.clone(), p.owner_id.clone())?;
@@ -285,10 +285,10 @@ pub fn validate_map_against_snapshot(snapshot: &CoreLayoutSnapshot, map: &MathRe
         while cursor <= m.physical_end {
             let owner = snapshot
                 .owner_at(&cursor)?
-                .ok_or_else(|| state_err(format!("persistierter MATH Realm {cursor} fehlt in Core-Belegung")))?;
+                .ok_or_else(|| state_err(format!("persisted MATH realm {cursor} is missing from the core allocation")))?;
             if crate::unicode::upper(&owner.owner_kind) != "MATH" || owner.owner_id != map.layout_id {
                 return Err(state_err(format!(
-                    "persistierter MATH Realm {cursor} gehoert {}:{}, nicht MATH:{}",
+                    "persisted MATH realm {cursor} belongs to {}:{}, not MATH:{}",
                     owner.owner_kind, owner.owner_id, map.layout_id
                 )));
             }
@@ -363,7 +363,7 @@ pub fn plan_math_realms(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, neede
     let resulting = &existing + &new_count;
     if resulting > map.realm_auto_limit {
         let reason = format!(
-            "MATH Realm Auto-Limit ueberschritten: bestehend={existing}, neu={new_count}, resultierend={resulting}, limit={}",
+            "MATH realm auto limit exceeded: existing={existing}, new={new_count}, resulting={resulting}, limit={}",
             map.realm_auto_limit
         );
         return Ok(MathAllocationPlan {
@@ -416,25 +416,25 @@ pub fn plan_math_realms(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, neede
     })
 }
 
-/// `validate_plan`: letzte Core-Prüfung, keine stille Neuplanung.
+/// `validate_plan`: final core check, no silent re-planning.
 pub fn validate_plan(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, plan: &MathAllocationPlan) -> Result<()> {
     if !plan.allowed {
         return Err(Error::RealmBudget(plan.reason.clone()));
     }
     if snapshot.revision != plan.base_revision {
         return Err(Error::StalePlan(format!(
-            "Core-Revision geaendert: Plan={}, aktuell={}",
+            "core revision changed: plan={}, current={}",
             plan.base_revision, snapshot.revision
         )));
     }
     if map.state_fingerprint() != plan.base_map_fingerprint {
-        return Err(Error::StalePlan("persistierte Math RealmMap hat sich seit Planung geaendert".into()));
+        return Err(Error::StalePlan("persisted Math RealmMap has changed since planning".into()));
     }
     if map.layout_id != plan.layout_id {
-        return Err(Error::StalePlan("Layout-ID passt nicht zum Plan".into()));
+        return Err(Error::StalePlan("layout ID does not match the plan".into()));
     }
     if map.mapping_fingerprint != plan.mapping_fingerprint {
-        return Err(Error::StalePlan("Mapping-Fingerprint passt nicht zum Plan".into()));
+        return Err(Error::StalePlan("mapping fingerprint does not match the plan".into()));
     }
     validate_map_against_snapshot(snapshot, map)?;
     if plan.resulting_count > map.realm_auto_limit {
@@ -443,14 +443,14 @@ pub fn validate_plan(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, plan: &M
     for e in &plan.proposed_extents {
         if !snapshot.is_free(&e.physical_start, &e.physical_end)? {
             return Err(Error::AllocationConflict(format!(
-                "physische Realms {}..{} sind nicht mehr frei",
+                "physical realms {}..{} are no longer free",
                 e.physical_start, e.physical_end
             )));
         }
         let mut l = e.logical_start.clone();
         while l <= e.logical_end {
             if map.resolve(&l)?.is_some() {
-                return Err(Error::AllocationConflict(format!("logical Realm {l} wurde zwischenzeitlich bereits gemappt")));
+                return Err(Error::AllocationConflict(format!("logical realm {l} has been mapped in the meantime")));
             }
             l += 1;
         }
@@ -458,12 +458,12 @@ pub fn validate_plan(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, plan: &M
     let mut all = map.extents.clone();
     all.extend(plan.proposed_extents.iter().cloned());
     if coalesce_math_extents(all)? != plan.resulting_extents {
-        return Err(state_err("Plan-resulting_extents stimmen nicht mit aktuellem Zustand ueberein"));
+        return Err(state_err("plan resulting_extents do not match the current state"));
     }
     Ok(())
 }
 
-/// `commit_plan_simulated` (Test-Helfer).
+/// `commit_plan_simulated` (test helper).
 pub fn commit_plan_simulated(snapshot: &CoreLayoutSnapshot, map: &MathRealmMap, plan: &MathAllocationPlan) -> Result<(CoreLayoutSnapshot, MathRealmMap)> {
     validate_plan(snapshot, map, plan)?;
     let mut occ = snapshot.occupied.clone();
@@ -484,12 +484,12 @@ pub struct ResolvedMathCell {
     pub side: i64,
 }
 
-/// `resolve_math_target`: liest nur die persistierte RealmMap.
+/// `resolve_math_target`: reads only the persisted RealmMap.
 pub fn resolve_math_target(map: &MathRealmMap, t: &crate::mathexpr::MathMapTarget) -> Result<ResolvedMathCell> {
     pos(&t.logical_realm, "logical_realm")?;
     let physical = map
         .resolve(&t.logical_realm)?
-        .ok_or_else(|| state_err(format!("logical Realm {} ist fuer MATH Layout {} nicht gemappt", t.logical_realm, map.layout_id)))?;
+        .ok_or_else(|| state_err(format!("logical realm {} is not mapped for MATH layout {}", t.logical_realm, map.layout_id)))?;
     pos(&t.u, "u")?;
     pos(&t.v_local, "v_local")?;
     Ok(ResolvedMathCell { physical_realm: physical, u: t.u.clone(), v_local: t.v_local.clone(), side: t.side })

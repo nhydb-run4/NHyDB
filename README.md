@@ -84,6 +84,25 @@ Operational settings (size limit, durability, lock, MATH limits, paths) can be
 set via an optional `nhydb_config.toml`; see
 [`config/nhydb_config.example.toml`](config/nhydb_config.example.toml).
 
+## Known limitations
+
+* **One writer at a time.** A writing process holds an exclusive lock
+  (`<db>.lock`); there are no multi-process transactions.
+* **Key file required.** Without the matching `*.layout.key` file a database
+  cannot be opened (fail closed); there is no recovery of a lost key.
+* **NHySQL is read-only** (`SELECT` only); data is written through the API.
+* **File format:** only files with the identifier `NHYDB016` are read; there
+  is no converter for older format revisions.
+* **Durability `full`:** macOS uses `F_FULLFSYNC` and reports an error if the
+  file system does not support it (no silent fallback); Linux uses `fsync(2)`,
+  Windows `FlushFileBuffers`.
+* **Configuration:** the `[cache]` keys are accepted but not yet used by the
+  engine.
+* **Platforms:** developed and tested primarily on macOS (Apple Silicon);
+  Linux and Windows wheels are built and tested by CI.
+* **Documentation:** the complete technical reference is currently available
+  in German only.
+
 ## Documentation
 
 * [`docs/de/`](docs/de/) – technical reference documentation (German)

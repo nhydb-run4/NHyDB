@@ -1,10 +1,10 @@
-//! Sparse-Zellspeicher (`SPARSE_CELLS`, Tag `SP10`).
+//! Sparse cell store (`SPARSE_CELLS`, tag `SP10`).
 //!
-//! Blockaufbau (unverändert v0.14):
+//! Block layout:
 //! `SP10 | vu realm | vu u_start | vu u_end | vu groups | vu cells | stream`
-//! stream je u-Gruppe: `vu u_delta | vu rec_len | record`
+//! stream per u group: `vu u_delta | vu rec_len | record`
 //! record: `vu count | (vu (v_delta<<3 | flags) [typecode] [value])*`
-//! flags: 1 = Tombstone, 2 = selbsttypisiert, 4 = Null.
+//! flags: 1 = tombstone, 2 = self-typed, 4 = null.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -21,18 +21,18 @@ use crate::vmap;
 
 use super::{Db, SVal, SparseCellMeta, SparseMap, SparseSegment};
 
-/// Größere dekodierte/zusammengeführte u-Gruppen werden nicht gecacht
-/// (sonst mehrere GB bei COLUMN/PACKED; gezielte Zugriffe laufen über
+/// Larger decoded/merged u groups are not cached
+/// (otherwise several GB with COLUMN/PACKED; targeted accesses go through
 /// `vindex.rs`).
 const SPARSE_CACHE_MAX_CELLS: usize = 65_536;
 
-/// Eine zu schreibende Sparse-Zelle.
+/// A sparse cell to be written.
 #[derive(Clone, Debug)]
 pub struct CellInput {
     pub u: Nat,
     pub v: Nat,
     pub value: Val,
-    /// expliziter Typ (`type=...`) → selbsttypisierte Zelle
+    /// explicit type (`type=...`) → self-typed cell
     pub typ: Option<TypeCode>,
     pub tomb: bool,
 }
@@ -49,7 +49,7 @@ impl CellInput {
     }
 }
 
-/// Fertig kodierter, noch nicht geschriebener Sparse-Block.
+/// Fully encoded sparse block that has not been written yet.
 pub(crate) struct EncodedSparse {
     pub payload: Vec<u8>,
     pub prefix_len: usize,
@@ -57,11 +57,11 @@ pub(crate) struct EncodedSparse {
     pub u_end: Nat,
     pub group_count: u64,
     pub cell_count: u64,
-    /// (u, relativer Offset im Stream, Länge)
+    /// (u, relative offset in the stream, length)
     pub local_index: Vec<(Nat, u64, u32)>,
 }
 
-/// Ein materialisierter Punkt (`iter_materialized_sparse_points`).
+/// A materialized point (`iter_materialized_sparse_points`).
 #[derive(Clone, Debug)]
 pub struct MaterializedPoint {
     pub realm: Nat,
@@ -90,11 +90,11 @@ enum Declared<'a> {
 }
 
 
-/// Gemeinsamer Block-Payload und Lage `(Start, Länge)` einer u-Gruppe darin.
+/// Shared block payload and position `(start, length)` of a u group in it.
 pub(crate) type RecordSlice = (Arc<Vec<u8>>, usize, usize);
 
 impl Db {
-    /// Kodiert alle Zellen einer u-Gruppe (`_encode_sparse_record`).
+    /// Encodes all cells of a u group (`_encode_sparse_record`).
     fn encode_sparse_record(&self, realm: &Nat, u: &Nat, cells: &mut [CellInput], out: &mut Vec<u8>) -> Result<()> {
         if cells.is_empty() {
             return Ok(());
@@ -128,7 +128,7 @@ impl Db {
                     for f in l.fields() {
                         let off = f.offset()?;
                         let nm = f.name_or(|| format!("offset_{off}"));
-                        // spätere Einträge überschreiben frühere (dict-Semantik)
+                        // later entries overwrite earlier ones (dict semantics)
                         pf.retain(|(o, _): &(num_bigint::BigInt, FieldDef)| *o != off);
                         pf.push((off, f.to_field(Nat::ONE, nm)?));
                     }
@@ -142,7 +142,7 @@ impl Db {
         for c in cells.iter() {
             let delta = match c.v.checked_sub(&prev) {
                 Some(d) if !d.is_zero() => d,
-                _ => return Err(Error::Schema("Sparse-v muss pro u streng aufsteigend sein".into())),
+                _ => return Err(Error::Schema("Sparse v must be strictly ascending per u".into())),
             };
             let rk = realm.clone();
             let declared: Option<Cow<'_, FieldDef>> = match &mode {
@@ -164,7 +164,7 @@ impl Db {
             let typ = c.typ.or(declared.as_ref().map(|d| d.typ));
             if !c.tomb && typ.is_none() {
                 return Err(Error::Schema(format!(
-                    "R{realm},u{u},v{}: kein Datentyp ableitbar; type=... angeben",
+                    "R{realm},u{u},v{}: cannot derive a data type; specify type=...",
                     c.v
                 )));
             }
@@ -190,7 +190,7 @@ impl Db {
         Ok(())
     }
 
-    /// Kodiert einen Sparse-Block für mehrere u-Gruppen.
+    /// Encodes a sparse block for several u groups.
     pub(crate) fn encode_sparse_segment(
         &self,
         realm: &Nat,
@@ -239,7 +239,7 @@ impl Db {
         Ok(Some(EncodedSparse { payload, prefix_len, u_start, u_end, group_count, cell_count, local_index }))
     }
 
-    /// Schreibt einen kodierten Sparse-Block und registriert ihn.
+    /// Writes an encoded sparse block and registers it.
     pub(crate) fn write_sparse_segment(&mut self, realm: &Nat, enc: EncodedSparse, lane: Lane) -> Result<Val> {
         let (off, bid) = self.append_block(BT_SPARSE_CELLS, &enc.payload, lane_flags(lane))?;
         let payload_off = off + BLOCK_HEADER_SIZE as u64;
@@ -279,7 +279,7 @@ impl Db {
         })
     }
 
-    /// Validiert und gruppiert Zellen nach u-Fenstern (Teil von `put_points`).
+    /// Validates cells and groups them by u windows (part of `put_points`).
     pub(crate) fn group_points(
         &self,
         realm: &Nat,
@@ -300,15 +300,15 @@ impl Db {
         Ok(groups)
     }
 
-    /// Schreibt einzelne Zellen (`put_points`). Alle Zellen werden vor dem
-    /// ersten Append vollständig validiert und kodiert.
+    /// Writes individual cells (`put_points`). All cells are fully validated
+    /// and encoded before the first append.
     pub fn put_points(&mut self, realm: &Nat, cells: Vec<CellInput>, lane: Lane, commit: bool, u_window: u64) -> Result<Val> {
         self.put_points_as(realm, cells, lane, commit, u_window, None)
     }
 
-    /// `put_points(..., _math_layout_id=…)`: Exklusive MATH-Realms nehmen nur
-    /// Schreibzugriffe ihres eigenen MATH-Layouts (oder der internen
-    /// Kompaktierungskopie) an.
+    /// `put_points(..., _math_layout_id=…)`: exclusive MATH realms accept only
+    /// writes of their own MATH layout (or of the internal
+    /// compaction copy).
     pub(crate) fn put_points_as(
         &mut self,
         realm: &Nat,
@@ -322,7 +322,7 @@ impl Db {
         if let Some(owner) = self.math_owner_of_realm(realm) {
             if !self.internal_math_writes && math_layout_id != Some(owner) {
                 return Err(Error::Schema(format!(
-                    "Realm {realm} gehoert exklusiv MATH Layout {owner}; direkte put_points gesperrt"
+                    "Realm {realm} belongs exclusively to MATH layout {owner}; direct put_points blocked"
                 )));
             }
         }
@@ -358,7 +358,7 @@ impl Db {
         })
     }
 
-    /// Markiert eine Zelle als gelöscht (Tombstone, `delete_point`).
+    /// Marks a cell as deleted (tombstone, `delete_point`).
     pub fn delete_point(&mut self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane, commit: bool) -> Result<Val> {
         self.require_realm(realm)?;
         require_positive("u", u)?;
@@ -377,10 +377,10 @@ impl Db {
     }
 
     // ------------------------------------------------------------------
-    // Lesen
+    // Reading
     // ------------------------------------------------------------------
 
-    /// u → (absoluter Offset, Länge) eines Sparse-Blocks (`_ensure_sparse_block_index`).
+    /// u → (absolute offset, length) of a sparse block (`_ensure_sparse_block_index`).
     pub(crate) fn sparse_block_index(&self, seg: &SparseSegment) -> Result<Arc<Vec<(Nat, u64, u32)>>> {
         if let Some(c) = self.cache().sparse_block_index.get(&seg.block_id) {
             return Ok(c.clone());
@@ -395,32 +395,32 @@ impl Db {
         for i in 0..seg.group_count {
             let delta = get_vu(mv, &mut p)?;
             if i == 0 && !delta.is_zero() {
-                return Err(Error::Corruption(format!("SPARSE Block {bid}: erster u-Delta muss 0 sein")));
+                return Err(Error::Corruption(format!("SPARSE block {bid}: first u delta must be 0")));
             }
             if i > 0 && delta.is_zero() {
-                return Err(Error::Corruption(format!("SPARSE Block {bid}: u-Delta muss >0 sein")));
+                return Err(Error::Corruption(format!("SPARSE block {bid}: u delta must be >0")));
             }
             let u = if i == 0 { seg.u_start.clone() } else { prev_u.add(&delta) };
             let rec_len = get_vu_u64(mv, &mut p, "SPARSE rec_len")? as usize;
             if rec_len == 0 || p + rec_len > mv.len() {
-                return Err(Error::Corruption(format!("SPARSE Block {bid}: Recordlaenge ungueltig")));
+                return Err(Error::Corruption(format!("SPARSE block {bid}: record length invalid")));
             }
             out.push((u.clone(), seg.entries_offset + p as u64, rec_len as u32));
             p += rec_len;
             prev_u = u;
         }
         if p != mv.len() {
-            return Err(Error::Corruption(format!("SPARSE Block {bid}: Restbytes")));
+            return Err(Error::Corruption(format!("SPARSE block {bid}: trailing bytes")));
         }
         if out.is_empty() || out[0].0 != seg.u_start || out[out.len() - 1].0 != seg.u_end {
-            return Err(Error::Corruption(format!("SPARSE Block {bid}: u-Bereich widerspricht Stream")));
+            return Err(Error::Corruption(format!("SPARSE block {bid}: u range contradicts stream")));
         }
         let arc = Arc::new(out);
         self.cache().sparse_block_index.insert(bid, arc.clone());
         Ok(arc)
     }
 
-    /// Rohbytes einer u-Gruppe in einem Sparse-Block (leer, falls fehlt).
+    /// Raw bytes of a u group in a sparse block (empty if missing).
     pub(crate) fn read_sparse_record_bytes(&self, seg: &SparseSegment, u: &Nat) -> Result<Option<RecordSlice>> {
         let idx = self.sparse_block_index(seg)?;
         let Ok(i) = idx.binary_search_by(|(x, _, _)| x.cmp(u)) else {
@@ -457,7 +457,7 @@ impl Db {
         Ok(arc)
     }
 
-    /// Zusammengeführter Sparse-Zustand einer u-Gruppe (`_sparse_updates_for_u`).
+    /// Merged sparse state of a u group (`_sparse_updates_for_u`).
     pub fn sparse_updates_for_u(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<Arc<SparseMap>> {
         let mk = (realm.clone(), lane, u.clone());
         if let Some(m) = self.cache().sparse_merged.get(&mk) {
@@ -488,7 +488,7 @@ impl Db {
         Ok(arc)
     }
 
-    /// Zustände im v-Bereich `[lo, hi]` (`_sparse_updates_for_u_range`).
+    /// States in the v range `[lo, hi]` (`_sparse_updates_for_u_range`).
     pub fn sparse_updates_for_u_range(&self, realm: &Nat, u: &Nat, lo: &Nat, hi: &Nat, lane: Lane) -> Result<Vec<(Nat, SVal)>> {
         if hi < lo {
             return Ok(Vec::new());
@@ -496,7 +496,7 @@ impl Db {
         Ok(self.sparse_range(realm, u, lo, hi, lane)?.into_iter().collect())
     }
 
-    /// Alle lebenden Sparse-Punkte im neuesten Zustand, sortiert.
+    /// All live sparse points in their newest state, sorted.
     pub fn iter_materialized_sparse_points(&self, realm: Option<&Nat>, lane: Option<Lane>) -> Result<Vec<MaterializedPoint>> {
         let mut latest: BTreeMap<(Nat, Lane, Nat, Nat), SparseCellMeta> = BTreeMap::new();
         let mut keys: Vec<&(Nat, Lane)> = self.sparse.keys().collect();
@@ -535,7 +535,7 @@ impl Db {
             .collect())
     }
 
-    /// Alle Sparse-Zustände inkl. Tombstones im neuesten Stand (Kompaktierung).
+    /// All sparse states incl. tombstones in their newest state (compaction).
     pub(crate) fn latest_sparse_states(&self) -> Result<BTreeMap<(Nat, Lane, Nat, Nat), SparseCellMeta>> {
         let mut latest = BTreeMap::new();
         for ((rid, ln), idx) in &self.sparse {

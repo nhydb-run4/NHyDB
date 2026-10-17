@@ -1,13 +1,12 @@
-//! NumPy-/Buffer-Ein- und Ausgabe ohne `numpy`-Crate.
+//! NumPy/buffer input and output without the `numpy` crate.
 //!
-//! Eingabe: Objekte mit Buffer-Protokoll (NumPy-Arrays, `array.array`,
-//! `memoryview`) werden anhand ihres Formatcodes typisiert und als
-//! zusammenhängender Rust-Vektor übernommen (kontrollierte Kopie; Arrays mit
-//! Fremd-Endianness oder Strides werden dabei korrekt umgesetzt). Alle
-//! übrigen Objekte (Listen, Objekt-/String-Arrays) werden elementweise in
-//! Werte konvertiert.
+//! Input: objects supporting the buffer protocol (NumPy arrays, `array.array`,
+//! `memoryview`) are typed by their format code and taken over as a
+//! contiguous Rust vector (controlled copy; arrays with foreign endianness
+//! or strides are converted correctly). All other objects (lists,
+//! object/string arrays) are converted element by element into values.
 //!
-//! Ausgabe: `numpy.frombuffer(bytes, dtype)` (kein Python-Loop).
+//! Output: `numpy.frombuffer(bytes, dtype)` (no Python loop).
 
 use pyo3::buffer::{PyBuffer, PyUntypedBuffer};
 use pyo3::prelude::*;
@@ -18,7 +17,7 @@ use nhydb_core::{ColData, Nat, Val};
 
 use crate::conv::{from_val, to_nat, to_val};
 
-/// Eigentümer-Spalte (Daten aus Python kopiert).
+/// Owned column (data copied from Python).
 pub enum OwnedCol {
     U8(Vec<u8>),
     U16(Vec<u16>),
@@ -56,9 +55,9 @@ impl OwnedCol {
         self.as_col().len()
     }
 
-    /// Werte als natürliche Zahlen (für u/v/object_id-Arrays).
+    /// Values as natural numbers (for u/v/object_id arrays).
     pub fn to_nats(&self, what: &str) -> PyResult<Vec<Nat>> {
-        let neg = || pyo3::exceptions::PyValueError::new_err(format!("{what}: negative Werte sind unzulaessig"));
+        let neg = || pyo3::exceptions::PyValueError::new_err(format!("{what}: negative values are not allowed"));
         Ok(match self {
             OwnedCol::U8(v) => v.iter().map(|x| Nat::S(*x as u64)).collect(),
             OwnedCol::U16(v) => v.iter().map(|x| Nat::S(*x as u64)).collect(),
@@ -70,15 +69,15 @@ impl OwnedCol {
             OwnedCol::I64(v) => v.iter().map(|x| u64::try_from(*x).map(Nat::S).map_err(|_| neg())).collect::<PyResult<_>>()?,
             OwnedCol::Vals(v) => v
                 .iter()
-                .map(|x| x.as_nat().ok_or_else(|| pyo3::exceptions::PyTypeError::new_err(format!("{what}: Ganzzahlen erwartet"))))
+                .map(|x| x.as_nat().ok_or_else(|| pyo3::exceptions::PyTypeError::new_err(format!("{what}: integers expected"))))
                 .collect::<PyResult<_>>()?,
-            _ => return Err(pyo3::exceptions::PyTypeError::new_err(format!("{what}: Ganzzahl-Array erwartet"))),
+            _ => return Err(pyo3::exceptions::PyTypeError::new_err(format!("{what}: integer array expected"))),
         })
     }
 }
 
 impl OwnedCol {
-    /// Zeilenwerte als `Val` (Ganzzahlen exakt, Floats als float, bool als bool).
+    /// Row values as `Val` (integers exact, floats as float, bool as bool).
     pub fn to_vals(&self) -> Vec<Val> {
         match self {
             OwnedCol::U8(v) => v.iter().map(|x| Val::Int(*x as i64)).collect(),
@@ -97,9 +96,9 @@ impl OwnedCol {
     }
 }
 
-/// Werte einer Ergebnisspalte → kompakteste exakte NumPy-Darstellung:
-/// nur bool ⇒ bool, nur i64 ⇒ int64, i64/float gemischt ohne Verlust ⇒
-/// float64, sonst (None, Text, große Zahlen …) ⇒ object.
+/// Values of a result column → most compact exact NumPy representation:
+/// only bool ⇒ bool, only i64 ⇒ int64, mixed i64/float without loss ⇒
+/// float64, otherwise (None, text, big numbers …) ⇒ object.
 pub fn vals_to_out(v: Vec<Val>) -> OutCol {
     if !v.is_empty() && v.iter().all(|x| matches!(x, Val::Bool(_))) {
         return OutCol::Bool(v.iter().map(|x| matches!(x, Val::Bool(true)) as u8).collect());
@@ -127,7 +126,7 @@ fn typed<T: pyo3::buffer::Element + Copy>(py: Python<'_>, obj: &Bound<'_, PyAny>
     b.to_vec(py)
 }
 
-/// Beliebiges Python-Objekt → Spalte.
+/// Arbitrary Python object → column.
 pub fn col_from_py(obj: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
     let py = obj.py();
     if let Ok(ub) = PyUntypedBuffer::get(obj) {
@@ -158,7 +157,7 @@ pub fn col_from_py(obj: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
                 return Ok(c);
             }
         }
-        // Fremd-Endianness o. ä.: über NumPy in native Darstellung bringen
+        // foreign endianness etc.: convert to native representation via NumPy
         if obj.hasattr("dtype")? && obj.getattr("dtype")?.getattr("kind")?.extract::<String>()? != "O" {
             let kind: String = obj.getattr("dtype")?.getattr("kind")?.extract()?;
             if matches!(kind.as_str(), "i" | "u" | "f" | "b") {
@@ -169,7 +168,7 @@ pub fn col_from_py(obj: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
             }
         }
     }
-    // Listen, Objekt-/String-Arrays
+    // lists, object/string arrays
     let src = if obj.hasattr("tolist")? { obj.call_method0("tolist")? } else { obj.clone() };
     let mut vals = Vec::new();
     for x in src.try_iter()? {
@@ -178,7 +177,7 @@ pub fn col_from_py(obj: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
     Ok(OwnedCol::Vals(vals))
 }
 
-/// Skalar oder Array → Vektor natürlicher Zahlen der Länge `n`.
+/// Scalar or array → vector of natural numbers of length `n`.
 pub fn nats_from_py(obj: &Bound<'_, PyAny>, n: Option<usize>, what: &str) -> PyResult<Vec<Nat>> {
     if obj.is_instance_of::<pyo3::types::PyInt>() {
         let v = to_nat(obj)?;
@@ -187,7 +186,7 @@ pub fn nats_from_py(obj: &Bound<'_, PyAny>, n: Option<usize>, what: &str) -> PyR
     col_from_py(obj)?.to_nats(what)
 }
 
-/// Ausgabespalte → NumPy-Array.
+/// Output column → NumPy array.
 pub fn out_to_numpy(py: Python<'_>, col: &OutCol) -> PyResult<Py<PyAny>> {
     let np = py.import("numpy")?;
     fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
@@ -209,7 +208,7 @@ pub fn out_to_numpy(py: Python<'_>, col: &OutCol) -> PyResult<Py<PyAny>> {
         }
     };
     let b = PyBytes::new(py, raw);
-    // frombuffer liefert eine schreibgeschützte Sicht → copy() für ein normales Array
+    // frombuffer returns a read-only view → copy() for a regular array
     Ok(np.call_method1("frombuffer", (b, dtype))?.call_method0("copy")?.unbind())
 }
 

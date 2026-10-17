@@ -1,19 +1,19 @@
-//! MATH_MAP-Ausdruckssprache (Python `nhydb_math_v027`: `MathExpression`,
-//! `_Validator`, `_SafeEvaluator`, `MathMap`, `MathMapLayoutSpec`, `dry_run`).
+//! MATH_MAP expression language (`MathExpression`, `_Validator`,
+//! `_SafeEvaluator`, `MathMap`, `MathMapLayoutSpec`, `dry_run`).
 //!
-//! Die Referenz parst mit `ast.parse(mode="eval")` (nach `^ → **`) und
-//! prüft den Baum gegen eine Whitelist. Dieser Parser bildet die Python-
-//! Grammatik für Ausdrücke nach (Rangfolge, Rechtsassoziativität von `**`,
-//! `-2**2 = -4`, Vergleichsketten, Literale `0x/0o/0b/_`) und vergibt für
-//! nicht erlaubte Konstrukte die Python-Knotennamen (`Attribute`,
-//! `Subscript`, `Div`, …), damit Validierungsfehler gleich lauten.
-//! Arithmetik über beliebig große Ganzzahlen mit Python-Semantik
-//! (Floor-Division/-Modulo, `**` mit negativem Exponenten ⇒ Fehler „muss
-//! Integer liefern“, `bool` in Arithmetik verboten).
+//! Expressions follow Python's expression grammar (after `^ → **`) and the
+//! syntax tree is checked against a whitelist. This parser reproduces the
+//! Python grammar for expressions (precedence, right associativity of `**`,
+//! `-2**2 = -4`, comparison chains, literals `0x/0o/0b/_`) and reports
+//! disallowed constructs with the Python AST node names (`Attribute`,
+//! `Subscript`, `Div`, …), so validation errors read the same way.
+//! Arithmetic on arbitrarily large integers with Python semantics
+//! (floor division/modulo, `**` with a negative exponent ⇒ error "must
+//! yield an integer", `bool` forbidden in arithmetic).
 //!
-//! Schutzgrenze (Vorgabe F5): Kein Zwischenergebnis darf mehr als
-//! `max_bits` Bit haben (Standard 2^20). Teure Operationen (`*`, `**`,
-//! `lcm`) werden **vor** der Berechnung abgeschätzt.
+//! Safety limit: no intermediate result may exceed `max_bits` bits
+//! (default 2^20). Expensive operations (`*`, `**`, `lcm`) are estimated
+//! **before** they are computed.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,7 @@ pub const MAP_CONTRACT: &str = "NHYDB_MATH_MAP_V015";
 
 static MAX_BITS: AtomicU64 = AtomicU64::new(crate::config::DEFAULT_MATH_MAX_INTERMEDIATE_BITS);
 
-/// Prozessweite Standardgrenze für Zwischenergebnisse (Bit).
+/// Process-wide default limit for intermediate results (bits).
 pub fn default_max_bits() -> u64 {
     MAX_BITS.load(Ordering::Relaxed)
 }
@@ -53,15 +53,15 @@ fn dom(m: impl Into<String>) -> Error {
 const SAFE_FUNCTIONS: [&str; 6] = ["abs", "gcd", "lcm", "isqrt", "min", "max"];
 
 // ----------------------------------------------------------------------
-// Syntaxbaum (Python-Knotentypen)
+// Syntax tree (Python node types)
 // ----------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Const {
     Int(BigInt),
     Bool(bool),
-    /// float, complex, str, bytes, None, Ellipsis – erlaubt im Baum, beim
-    /// Auswerten aber kein Integer.
+    /// float, complex, str, bytes, None, Ellipsis – allowed in the tree, but
+    /// not an integer when evaluated.
     Other,
 }
 
@@ -168,12 +168,12 @@ pub enum Node {
     Or(Vec<Node>),
     Cmp(Box<Node>, Vec<(CmpK, Node)>),
     Call { func: Box<Node>, args: Vec<Node>, keywords: usize },
-    /// Nicht erlaubter Knoten mit Python-Klassennamen.
+    /// Disallowed node with its Python class name.
     Other(&'static str),
 }
 
 // ----------------------------------------------------------------------
-// Lexer (Python-Token für Ausdrücke)
+// Lexer (Python tokens for expressions)
 // ----------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,7 +219,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
         if c == '\n' || c == '\r' {
-            // Zeilenende außerhalb von Klammern beendet den Ausdruck
+            // end of line outside brackets terminates the expression
             if cs[i..].iter().all(|x| x.is_whitespace()) {
                 break;
             }
@@ -231,7 +231,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             }
             continue;
         }
-        // Zahlen
+        // numbers
         if c.is_ascii_digit() || (c == '.' && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let start = i;
             let mut is_int = true;
@@ -303,7 +303,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             }
             continue;
         }
-        // Namen und String-Präfixe
+        // names and string prefixes
         if c == '_' || unicode::is_identifier(&c.to_string()) {
             let start = i;
             i += 1;
@@ -320,7 +320,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             }
             if unicode::identifier_needs_nfkc(&name) {
                 return Err(syn(format!(
-                    "Bezeichner {} ist nicht NFKC-normalisiert (Python normalisiert Bezeichner; bitte normalisierte Form verwenden)",
+                    "identifier {} is not NFKC-normalized (Python normalizes identifiers; please use the normalized form)",
                     Val::str(name.as_str()).py_repr()
                 )));
             }
@@ -381,7 +381,7 @@ fn skip_string(cs: &[char], mut i: usize) -> Result<usize> {
 }
 
 // ----------------------------------------------------------------------
-// Parser (Python-Ausdrucksgrammatik)
+// Parser (Python expression grammar)
 // ----------------------------------------------------------------------
 
 struct Parser {
@@ -629,7 +629,7 @@ impl Parser {
         Ok((args, keywords))
     }
 
-    /// Überspringt bis zur passenden schließenden Klammer (inklusive).
+    /// Skips up to and including the matching closing bracket.
     fn skip_until_close(&mut self, close: &str) -> Result<()> {
         let mut depth = 1;
         loop {
@@ -769,7 +769,7 @@ fn parse(source: &str) -> Result<Node> {
     let node = p.expression()?;
     if !matches!(p.peek(), Tok::End) {
         if p.is_op(",") {
-            // Tupel auf oberster Ebene: `1, 2`
+            // top-level tuple: `1, 2`
             return Ok(Node::Other("Tuple"));
         }
         return Err(invalid());
@@ -778,16 +778,16 @@ fn parse(source: &str) -> Result<Node> {
 }
 
 // ----------------------------------------------------------------------
-// Validierung (`_Validator`): Reihenfolge wie ast.NodeVisitor
+// Validation (`_Validator`): same order as ast.NodeVisitor
 // ----------------------------------------------------------------------
 
 fn validate(n: &Node, params: &HashSet<String>) -> Result<()> {
-    let not_allowed = |name: &str| syn(format!("Syntaxelement {name} ist nicht erlaubt"));
+    let not_allowed = |name: &str| syn(format!("syntax element {name} is not allowed"));
     match n {
         Node::Const(_) => Ok(()),
         Node::Name(id) => {
             if !params.contains(id) && !SAFE_FUNCTIONS.contains(&id.as_str()) {
-                return Err(syn(format!("unbekannter Name {}", Val::str(id.as_str()).py_repr())));
+                return Err(syn(format!("unknown name {}", Val::str(id.as_str()).py_repr())));
             }
             Ok(())
         }
@@ -817,10 +817,10 @@ fn validate(n: &Node, params: &HashSet<String>) -> Result<()> {
         Node::Call { func, args, keywords } => {
             match func.as_ref() {
                 Node::Name(f) if SAFE_FUNCTIONS.contains(&f.as_str()) => {}
-                _ => return Err(syn("nur freigegebene mathematische Funktionen sind erlaubt")),
+                _ => return Err(syn("only approved mathematical functions are allowed")),
             }
             if *keywords > 0 {
-                return Err(syn("Keyword-Argumente sind nicht erlaubt"));
+                return Err(syn("keyword arguments are not allowed"));
             }
             args.iter().try_for_each(|x| validate(x, params))
         }
@@ -829,10 +829,10 @@ fn validate(n: &Node, params: &HashSet<String>) -> Result<()> {
 }
 
 // ----------------------------------------------------------------------
-// Auswertung (`_SafeEvaluator`)
+// Evaluation (`_SafeEvaluator`)
 // ----------------------------------------------------------------------
 
-/// Wert eines Teilausdrucks: Python `int` oder `bool`.
+/// Value of a subexpression: Python `int` or `bool`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MV {
     Int(BigInt),
@@ -870,7 +870,7 @@ impl Eval<'_> {
     fn guard(&self, est: u64) -> Result<()> {
         if est > self.max_bits {
             return Err(dom(format!(
-                "Zwischenergebnis ueberschreitet math_max_intermediate_bits={} (geschaetzt {est} Bit)",
+                "intermediate result exceeds math_max_intermediate_bits={} (estimated {est} bits)",
                 self.max_bits
             )));
         }
@@ -881,19 +881,19 @@ impl Eval<'_> {
         match n {
             Node::Const(Const::Int(i)) => Ok(MV::Int(i.clone())),
             Node::Const(Const::Bool(b)) => Ok(MV::Bool(*b)),
-            Node::Const(Const::Other) => Err(syn("nur ganzzahlige Konstanten sind erlaubt")),
+            Node::Const(Const::Other) => Err(syn("only integer constants are allowed")),
             Node::Name(id) => match self.vars.get(id) {
                 Some(v) => Ok(MV::Int(v.clone())),
-                None => Err(dom(format!("Variable {} hat keinen Wert", Val::str(id.as_str()).py_repr()))),
+                None => Err(dom(format!("variable {} has no value", Val::str(id.as_str()).py_repr()))),
             },
             Node::Bin(l, k, r) => {
                 if !k.allowed() {
-                    return Err(syn(format!("Operator {} ist nicht erlaubt", k.name())));
+                    return Err(syn(format!("operator {} is not allowed", k.name())));
                 }
                 let a = self.visit(l)?;
                 let b = self.visit(r)?;
                 if a.is_bool() || b.is_bool() {
-                    return Err(dom("boolesche Werte sind in Arithmetik nicht erlaubt"));
+                    return Err(dom("boolean values are not allowed in arithmetic"));
                 }
                 let (a, b) = (a.as_int(), b.as_int());
                 let res = match k {
@@ -923,7 +923,7 @@ impl Eval<'_> {
                     UnK::UAdd => MV::Int(v.as_int()),
                     UnK::USub => MV::Int(-v.as_int()),
                     UnK::Not => MV::Bool(!v.truthy()),
-                    UnK::Invert => return Err(syn("Unary-Operator Invert ist nicht erlaubt")),
+                    UnK::Invert => return Err(syn("unary operator Invert is not allowed")),
                 })
             }
             Node::And(v) => {
@@ -953,7 +953,7 @@ impl Eval<'_> {
                         CmpK::LtE => l <= r,
                         CmpK::Gt => l > r,
                         CmpK::GtE => l >= r,
-                        other => return Err(syn(format!("Vergleich {} ist nicht erlaubt", other.name()))),
+                        other => return Err(syn(format!("comparison {} is not allowed", other.name()))),
                     };
                     if !ok {
                         return Ok(MV::Bool(false));
@@ -964,13 +964,13 @@ impl Eval<'_> {
             }
             Node::Call { func, args, .. } => {
                 let Node::Name(f) = func.as_ref() else {
-                    return Err(syn("nur direkte mathematische Funktionsnamen sind erlaubt"));
+                    return Err(syn("only direct mathematical function names are allowed"));
                 };
                 let mut xs = Vec::with_capacity(args.len());
                 for a in args {
                     let v = self.visit(a)?;
                     if v.is_bool() {
-                        return Err(dom(format!("Funktion {f} erwartet Integer")));
+                        return Err(dom(format!("function {f} expects integers")));
                     }
                     xs.push(v.as_int());
                 }
@@ -978,7 +978,7 @@ impl Eval<'_> {
                 self.guard(bits(&res))?;
                 Ok(MV::Int(res))
             }
-            Node::Other(name) => Err(syn(format!("nicht unterstuetztes Syntaxelement: {name}"))),
+            Node::Other(name) => Err(syn(format!("unsupported syntax element: {name}"))),
         }
     }
 
@@ -987,8 +987,8 @@ impl Eval<'_> {
             if a.is_zero() {
                 return Err(dom("zero to a negative power"));
             }
-            // Python liefert hier float (bzw. ±1 bei |a| = 1 ebenfalls float)
-            return Err(dom("arithmetischer Ausdruck muss Integer liefern"));
+            // Python yields a float here (also for |a| = 1, where the result is ±1.0)
+            return Err(dom("arithmetic expression must yield an integer"));
         }
         if a.is_zero() || a.is_one() || b.is_zero() {
             return Ok(if b.is_zero() { BigInt::one() } else { a.clone() });
@@ -997,7 +997,7 @@ impl Eval<'_> {
             return Ok(if b.is_even() { BigInt::one() } else { a.clone() });
         }
         let lg = (a.abs().bits() as f64 - 1.0).max(0.0) + {
-            // Nachkommaanteil von log2|a| aus den führenden Bits
+            // fractional part of log2|a| from the leading bits
             let top = a.abs() >> (a.abs().bits().saturating_sub(53) as usize);
             let t = top.to_f64().unwrap_or(1.0);
             t.log2() - (top.bits() as f64 - 1.0)
@@ -1006,12 +1006,12 @@ impl Eval<'_> {
         let est = (e * lg).floor() + 1.0;
         if !est.is_finite() || est > self.max_bits as f64 {
             return Err(dom(format!(
-                "Zwischenergebnis ueberschreitet math_max_intermediate_bits={} (geschaetzt {} Bit)",
+                "intermediate result exceeds math_max_intermediate_bits={} (estimated {} bits)",
                 self.max_bits,
-                if est.is_finite() { format!("{est:.0}") } else { "unbegrenzt".into() }
+                if est.is_finite() { format!("{est:.0}") } else { "unbounded".into() }
             )));
         }
-        let exp = b.to_u32().ok_or_else(|| dom("Exponent zu gross"))?;
+        let exp = b.to_u32().ok_or_else(|| dom("exponent too large"))?;
         Ok(num_traits::pow(a.clone(), exp as usize))
     }
 
@@ -1051,12 +1051,12 @@ impl Eval<'_> {
             }
             "min" | "max" => {
                 if xs.is_empty() {
-                    return Err(dom(format!("{f}() erwartet mindestens ein Argument")));
+                    return Err(dom(format!("{f}() expects at least one argument")));
                 }
                 let it = xs.iter();
                 if f == "min" { it.min().unwrap().clone() } else { it.max().unwrap().clone() }
             }
-            other => return Err(syn(format!("Funktion {} ist nicht erlaubt", Val::str(other).py_repr()))),
+            other => return Err(syn(format!("function {} is not allowed", Val::str(other).py_repr()))),
         })
     }
 }
@@ -1070,23 +1070,23 @@ pub struct MathExpression {
     pub source: String,
     pub parameters: Vec<String>,
     tree: Node,
-    /// Slot-indizierte Form für den i64-Schnellpfad.
+    /// Slot-indexed form for the i64 fast path.
     fast: FNode,
 }
 
 // ----------------------------------------------------------------------
-// i64-Schnellpfad
+// i64 fast path
 // ----------------------------------------------------------------------
 //
-// Gleiche Semantik wie `Eval`, aber auf i64 mit Überlaufprüfung und
-// Variablen per Index. Jeder Überlauf, jeder Fehlerfall und jedes nicht
-// abgedeckte Konstrukt liefert `None`; der Aufrufer wertet dann exakt über
-// BigInt aus (Fehlertexte entstehen ausschließlich dort).
+// Same semantics as `Eval`, but on i64 with overflow checks and
+// variables by index. Every overflow, every error case and every
+// unsupported construct yields `None`; the caller then evaluates exactly
+// via BigInt (error messages are produced only there).
 
 #[derive(Clone, Debug)]
 enum FNode {
     Int(i64),
-    /// gefaltete Konstante außerhalb i64 (Bitgrenze wird bei der Auswertung geprüft)
+    /// folded constant outside i64 (the bit limit is checked during evaluation)
     BigConst(BigInt),
     Bool(bool),
     Var(usize),
@@ -1110,7 +1110,7 @@ enum FFun {
     Max,
 }
 
-/// Hybrider Wert des Schnellpfads: kleine Ganzzahlen ohne Allokation.
+/// Hybrid value of the fast path: small integers without allocation.
 #[derive(Clone, Debug, PartialEq)]
 enum F64v {
     Int(i64),
@@ -1169,8 +1169,8 @@ fn to_fast(n: &Node, params: &[String]) -> FNode {
                 return FNode::Unsupported;
             }
             let node = FNode::Bin(b(l), *k, b(r));
-            // Konstantenfaltung (z. B. 10**100) mit großzügiger Faltgrenze; die
-            // Laufzeit-Bitgrenze prüft `fast_eval` am gefalteten Wert erneut.
+            // constant folding (e.g. 10**100) with a generous folding limit; the
+            // runtime bit limit is checked again by `fast_eval` on the folded value.
             if let FNode::Bin(fl, _, fr) = &node {
                 let is_const = |x: &FNode| matches!(x, FNode::Int(_) | FNode::BigConst(_));
                 if is_const(fl) && is_const(fr) {
@@ -1215,7 +1215,7 @@ fn to_fast(n: &Node, params: &[String]) -> FNode {
     }
 }
 
-/// Obergrenze für zur Kompilierzeit gefaltete Konstanten (Bit).
+/// Upper limit for constants folded at compile time (bits).
 const FOLD_MAX_BITS: u64 = 1 << 16;
 
 fn floor_div(a: i64, b: i64) -> Option<i64> {
@@ -1239,7 +1239,7 @@ fn isqrt_u64(x: u64) -> u64 {
     r
 }
 
-/// Schnellauswertung mit Bitgrenze `max_bits` (>= 128, siehe Aufrufer).
+/// Fast evaluation with bit limit `max_bits` (>= 128, see caller).
 fn fast_eval(n: &FNode, vars: &[i64], max_bits: u64) -> Option<F64v> {
     let guard = |est: u64| if est > max_bits { None } else { Some(()) };
     Some(match n {
@@ -1418,18 +1418,18 @@ impl PartialEq for MathExpression {
 
 pub fn check_parameters(params: &[String]) -> Result<()> {
     if params.is_empty() {
-        return Err(syn("mindestens ein Parameter ist erforderlich"));
+        return Err(syn("at least one parameter is required"));
     }
     let set: HashSet<&String> = params.iter().collect();
     if set.len() != params.len() {
-        return Err(syn("Parameter muessen eindeutig sein"));
+        return Err(syn("parameters must be unique"));
     }
     for name in params {
         if !unicode::is_identifier(name) || name.starts_with('_') {
-            return Err(syn(format!("ungueltiger Parametername {}", Val::str(name.as_str()).py_repr())));
+            return Err(syn(format!("invalid parameter name {}", Val::str(name.as_str()).py_repr())));
         }
         if SAFE_FUNCTIONS.contains(&name.as_str()) {
-            return Err(syn(format!("Parametername {} kollidiert mit Math-Funktion", Val::str(name.as_str()).py_repr())));
+            return Err(syn(format!("parameter name {} collides with a math function", Val::str(name.as_str()).py_repr())));
         }
     }
     Ok(())
@@ -1441,7 +1441,7 @@ impl MathExpression {
         let source = unicode::strip(source).to_string();
         let params: Vec<String> = parameters.iter().map(|p| unicode::strip(p).to_string()).collect();
         if source.is_empty() {
-            return Err(syn("leerer mathematischer Ausdruck"));
+            return Err(syn("empty mathematical expression"));
         }
         check_parameters(&params)?;
         let normalized = source.replace('^', "**");
@@ -1452,7 +1452,7 @@ impl MathExpression {
         Ok(MathExpression { source, parameters: params, tree, fast })
     }
 
-    /// i64-Schnellpfad (Werte in Parameterreihenfolge); `None` ⇒ exakter Pfad.
+    /// i64 fast path (values in parameter order); `None` ⇒ exact path.
     fn evaluate_fast(&self, vars: &[i64], max_bits: u64) -> Option<F64v> {
         fast_eval(&self.fast, vars, max_bits)
     }
@@ -1461,12 +1461,12 @@ impl MathExpression {
     pub fn evaluate(&self, variables: &HashMap<String, BigInt>, max_bits: u64) -> Result<MV> {
         let missing: Vec<&str> = self.parameters.iter().filter(|p| !variables.contains_key(*p)).map(|s| s.as_str()).collect();
         if !missing.is_empty() {
-            return Err(dom(format!("fehlende Variablen: {}", missing.join(", "))));
+            return Err(dom(format!("missing variables: {}", missing.join(", "))));
         }
         let mut extra: Vec<&str> = variables.keys().filter(|k| !self.parameters.contains(k)).map(|s| s.as_str()).collect();
         if !extra.is_empty() {
             extra.sort();
-            return Err(dom(format!("unbekannte Variablen: {}", extra.join(", "))));
+            return Err(dom(format!("unknown variables: {}", extra.join(", "))));
         }
         Eval { vars: variables, max_bits }.visit(&self.tree)
     }
@@ -1490,17 +1490,17 @@ pub fn normalize_side(v: &Val) -> Result<i64> {
         Val::Int(1) => Ok(NR),
         Val::Float(f) if *f == 0.0 => Ok(NL),
         Val::Float(f) if *f == 1.0 => Ok(NR),
-        _ => Err(dom("side muss NL/NR bzw. 0/1 sein")),
+        _ => Err(dom("side must be NL/NR or 0/1")),
     }
 }
 
-/// `split_global_v(V, realm_span)` → (logischer Realm, lokales v).
+/// `split_global_v(V, realm_span)` → (logical realm, local v).
 pub fn split_global_v(v: &BigInt, span: &BigInt) -> Result<(BigInt, BigInt)> {
     if !v.is_positive() {
-        return Err(dom("V muss > 0 sein"));
+        return Err(dom("V must be > 0"));
     }
     if !span.is_positive() {
-        return Err(dom("realm_span muss ein positiver Integer sein"));
+        return Err(dom("realm_span must be a positive integer"));
     }
     let (q, r) = (v - BigInt::one()).div_mod_floor(span);
     Ok((q + 1, r + 1))
@@ -1509,15 +1509,15 @@ pub fn split_global_v(v: &BigInt, span: &BigInt) -> Result<(BigInt, BigInt)> {
 /// `join_global_v(logical_realm, v_local, realm_span)`
 pub fn join_global_v(realm: &BigInt, v_local: &BigInt, span: &BigInt) -> Result<BigInt> {
     if !realm.is_positive() {
-        return Err(dom("logical_realm muss >= 1 sein"));
+        return Err(dom("logical_realm must be >= 1"));
     }
     if !v_local.is_positive() || v_local > span {
-        return Err(dom("v_local liegt ausserhalb des Realms"));
+        return Err(dom("v_local is outside the realm"));
     }
     Ok((realm - BigInt::one()) * span + v_local)
 }
 
-/// Logischer Zellschlüssel `(logical_realm, u, v_local, side)`.
+/// Logical cell key `(logical_realm, u, v_local, side)`.
 pub type LogicalCellKey = (BigInt, BigInt, BigInt, i64);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1558,7 +1558,7 @@ impl MathMap {
         let name = unicode::strip(name).to_string();
         let params: Vec<String> = parameters.iter().map(|p| unicode::strip(p).to_string()).collect();
         if name.is_empty() || !unicode::is_identifier(&name) || name.starts_with('_') {
-            return Err(syn(format!("ungueltiger Mappingname {}", Val::str(name.as_str()).py_repr())));
+            return Err(syn(format!("invalid mapping name {}", Val::str(name.as_str()).py_repr())));
         }
         let ue = MathExpression::compile(u, &params)?;
         let ve = MathExpression::compile(v, &params)?;
@@ -1575,13 +1575,13 @@ impl MathMap {
     pub fn target(&self, inputs: &[Val], max_bits: u64) -> Result<MathMapTarget> {
         if inputs.len() != self.parameters.len() {
             return Err(dom(format!(
-                "{} erwartet {} Argument(e), erhalten: {}",
+                "{} expects {} argument(s), got: {}",
                 self.name,
                 self.parameters.len(),
                 inputs.len()
             )));
         }
-        // Schnellpfad: alle Eingaben i64 und Bitgrenze über jeder i64-Schätzung
+        // fast path: all inputs i64 and bit limit above any i64 estimate
         if max_bits >= 128 {
             let small: Option<Vec<i64>> = inputs.iter().map(|v| if let Val::Int(i) = v { Some(*i) } else { None }).collect();
             if let Some(xs) = small {
@@ -1596,7 +1596,7 @@ impl MathMap {
             let i = match val {
                 Val::Int(i) => BigInt::from(*i),
                 Val::Big(b) => b.clone(),
-                _ => return Err(dom(format!("Input {} muss Integer sein", Val::str(name.as_str()).py_repr()))),
+                _ => return Err(dom(format!("input {} must be an integer", Val::str(name.as_str()).py_repr()))),
             };
             ins.push(i.clone());
             vars.insert(name.clone(), i);
@@ -1604,8 +1604,8 @@ impl MathMap {
         self.target_ints(ins, &vars, max_bits)
     }
 
-    /// i64-Schnellpfad von `target`; `None`, wenn ein Wert nicht in i64 passt
-    /// oder ein Fehlerfall vorliegt (dann exakt über BigInt).
+    /// i64 fast path of `target`; `None` if a value does not fit into i64
+    /// or an error occurs (then evaluated exactly via BigInt).
     fn target_fast(&self, xs: &[i64], max_bits: u64) -> Option<MathMapTarget> {
         let pos = |v: F64v| -> Option<BigInt> {
             match v {
@@ -1634,11 +1634,11 @@ impl MathMap {
         let v = self.v.evaluate(vars, max_bits)?;
         let u = match u {
             MV::Int(i) if i.is_positive() => i,
-            _ => return Err(dom("u muss ein positiver Integer sein")),
+            _ => return Err(dom("u must be a positive integer")),
         };
         let v = match v {
             MV::Int(i) if i.is_positive() => i,
-            _ => return Err(dom("V muss ein positiver Integer sein")),
+            _ => return Err(dom("V must be a positive integer")),
         };
         let side = match &self.side {
             Side::Fixed(s) => *s,
@@ -1646,7 +1646,7 @@ impl MathMap {
                 MV::Bool(b) => b as i64,
                 MV::Int(i) if i.is_zero() => NL,
                 MV::Int(i) if i.is_one() => NR,
-                _ => return Err(dom("side muss NL/NR bzw. 0/1 sein")),
+                _ => return Err(dom("side must be NL/NR or 0/1")),
             },
         };
         let (realm, local) = split_global_v(&v, &self.realm_span)?;
@@ -1667,10 +1667,10 @@ impl MathMap {
         }
     }
 
-    /// SHA-256 über `json.dumps(canonical_dict, sort_keys=True,
-    /// separators=(",",":"))` (Python-Standard `ensure_ascii=True`).
+    /// SHA-256 over `json.dumps(canonical_dict, sort_keys=True,
+    /// separators=(",",":"))` (Python default `ensure_ascii=True`).
     pub fn fingerprint(&self) -> String {
-        let j = self.canonical_dict().to_json_ascii().expect("kanonisches JSON");
+        let j = self.canonical_dict().to_json_ascii().expect("canonical JSON");
         crate::crypto::sha256_hex(j.as_bytes())
     }
 
@@ -1682,7 +1682,7 @@ impl MathMap {
 
     pub fn from_val(raw: &Val) -> Result<MathMap> {
         if raw.get("contract").map(|v| v.py_str()) != Some(MAP_CONTRACT.into()) {
-            return Err(dom("unbekannter MATH_MAP Contract"));
+            return Err(dom("unknown MATH_MAP contract"));
         }
         let get = |k: &str| raw.get(k).cloned().ok_or_else(|| Error::Key(Val::str(k).py_repr()));
         let side = if raw.get("side_is_expression").map(|v| v.is_truthy()).unwrap_or(false) {
@@ -1694,16 +1694,16 @@ impl MathMap {
         let params: Vec<String> = match get("parameters")? {
             Val::List(l) => l.iter().map(|x| x.py_str()).collect(),
             Val::Str(s) => s.chars().map(|c| c.to_string()).collect(),
-            other => return Err(Error::Type(format!("parameters ungueltig: {}", other.py_repr()))),
+            other => return Err(Error::Type(format!("invalid parameters: {}", other.py_repr()))),
         };
         let span = match raw.get("realm_span") {
             None => crate::address::realm_span().to_bigint(),
-            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("realm_span ungueltig".into()))?,
+            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("invalid realm_span".into()))?,
         };
         let m = MathMap::compile(&get("name")?.py_str(), &params, &get("u")?.py_str(), &get("V")?.py_str(), &side, &span)?;
         if let Some(fp) = raw.get("fingerprint").filter(|v| !v.is_none()) {
             if fp.py_str() != m.fingerprint() {
-                return Err(dom("MATH_MAP Fingerprint stimmt nicht"));
+                return Err(dom("MATH_MAP fingerprint does not match"));
             }
         }
         Ok(m)
@@ -1725,10 +1725,10 @@ pub struct MathMapLayoutSpec {
 impl MathMapLayoutSpec {
     pub fn new(layout_name: &str, mapping: MathMap, realm_auto_limit: BigInt, description: &str) -> Result<Self> {
         if layout_name.is_empty() {
-            return Err(dom("layout_name darf nicht leer sein"));
+            return Err(dom("layout_name must not be empty"));
         }
         if !realm_auto_limit.is_positive() {
-            return Err(dom("realm_auto_limit muss > 0 sein"));
+            return Err(dom("realm_auto_limit must be > 0"));
         }
         Ok(MathMapLayoutSpec { layout_name: layout_name.into(), mapping, realm_auto_limit, description: description.into() })
     }
@@ -1747,12 +1747,12 @@ impl MathMapLayoutSpec {
 
     pub fn from_val(raw: &Val) -> Result<Self> {
         if unicode::upper(&raw.get("kind").map(|v| v.py_str()).unwrap_or_default()) != "MATH" {
-            return Err(dom("kein MATH LayoutSpec"));
+            return Err(dom("not a MATH LayoutSpec"));
         }
         let mapping = MathMap::from_val(raw.get("mapping").ok_or_else(|| Error::Key("'mapping'".into()))?)?;
         let limit = match raw.get("realm_auto_limit") {
             None => BigInt::from(crate::config::DEFAULT_REALM_AUTO_LIMIT),
-            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("realm_auto_limit ungueltig".into()))?,
+            Some(v) => v.as_bigint().ok_or_else(|| Error::Value("invalid realm_auto_limit".into()))?,
         };
         let name = raw.get("layout_name").ok_or_else(|| Error::Key("'layout_name'".into()))?.py_str();
         let desc = raw.get("description").map(|v| v.py_str()).unwrap_or_default();
@@ -1783,7 +1783,7 @@ pub struct DryRunReport {
     pub invalid_examples: Vec<(Vec<Val>, String)>,
 }
 
-/// Sammelt `dry_run` schrittweise (Zeilen kommen aus Python-Iteratoren).
+/// Collects `dry_run` incrementally (rows come from Python iterators).
 pub struct DryRun {
     pub report: DryRunReport,
     seen: Option<HashSet<(BigInt, BigInt, BigInt, i64)>>,
@@ -1911,14 +1911,14 @@ mod tests {
         assert_eq!(eval("0x1F + 0o7 + 0b11 + 1_000", 0).unwrap(), MV::Int(BigInt::from(31 + 7 + 3 + 1000)));
         assert_eq!(eval("gcd() + lcm()", 0).unwrap(), MV::Int(BigInt::from(1)));
         assert_eq!(eval("isqrt(10**40)", 0).unwrap(), MV::Int(BigInt::from(10u64).pow(20)));
-        assert!(matches!(eval("x / 2", 1), Err(Error::MathSyntax(m)) if m == "Syntaxelement Div ist nicht erlaubt"));
-        assert!(matches!(eval("x.real", 1), Err(Error::MathSyntax(m)) if m == "Syntaxelement Attribute ist nicht erlaubt"));
-        assert!(matches!(eval("__import__('os')", 1), Err(Error::MathSyntax(m)) if m == "nur freigegebene mathematische Funktionen sind erlaubt"));
-        assert!(matches!(eval("y + 1", 1), Err(Error::MathSyntax(m)) if m == "unbekannter Name 'y'"));
-        assert!(matches!(eval("1.5", 1), Err(Error::MathSyntax(m)) if m == "nur ganzzahlige Konstanten sind erlaubt"));
-        assert!(matches!(eval("2**-1", 1), Err(Error::MathDomain(m)) if m == "arithmetischer Ausdruck muss Integer liefern"));
+        assert!(matches!(eval("x / 2", 1), Err(Error::MathSyntax(m)) if m == "syntax element Div is not allowed"));
+        assert!(matches!(eval("x.real", 1), Err(Error::MathSyntax(m)) if m == "syntax element Attribute is not allowed"));
+        assert!(matches!(eval("__import__('os')", 1), Err(Error::MathSyntax(m)) if m == "only approved mathematical functions are allowed"));
+        assert!(matches!(eval("y + 1", 1), Err(Error::MathSyntax(m)) if m == "unknown name 'y'"));
+        assert!(matches!(eval("1.5", 1), Err(Error::MathSyntax(m)) if m == "only integer constants are allowed"));
+        assert!(matches!(eval("2**-1", 1), Err(Error::MathDomain(m)) if m == "arithmetic expression must yield an integer"));
         assert!(matches!(eval("x + True", 1), Err(Error::MathDomain(_))));
-        assert!(matches!(eval("abs + 1", 1), Err(Error::MathDomain(m)) if m == "Variable 'abs' hat keinen Wert"));
+        assert!(matches!(eval("abs + 1", 1), Err(Error::MathDomain(m)) if m == "variable 'abs' has no value"));
         assert!(matches!(eval("min()", 1), Err(Error::MathDomain(_))));
     }
 
