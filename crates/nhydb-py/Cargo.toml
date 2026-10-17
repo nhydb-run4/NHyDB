@@ -1,0 +1,18 @@
+[package]
+name = "nhydb-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "PyO3 bindings for the NHyDB native engine"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+nhydb-core = { path = "../nhydb-core" }
+num-bigint.workspace = true
+num-traits.workspace = true
+pyo3 = { workspace = true, features = ["num-bigint"] }

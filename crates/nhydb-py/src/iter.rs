@@ -1,0 +1,103 @@
+//! Python-Iteratoren über die speicherschonenden Cursor des Kerns.
+//!
+//! Wie die Generatoren der Python-Referenz starten sie erst beim ersten
+//! `next()` (auch Fehler wie `StaleIndexError` erscheinen dort) und lesen
+//! danach blockweise (256 Elemente je Schritt). Schreibzugriffe auf die
+//! Datenbank zwischen zwei Schritten sind erlaubt; der Iterator sieht dann
+//! den jeweils aktuellen Zustand.
+
+use std::collections::VecDeque;
+
+use pyo3::prelude::*;
+
+use nhydb_core::db::cursor::{FindCursor, RangeCursor, RangeMode, SelectUsCursor, SparsePointCursor};
+use nhydb_core::db::materialize::{MaterializedCellCursor, RecordNCursor};
+use nhydb_core::{Cond, Lane, Nat, Val};
+
+use crate::conv::{from_val, IntoPy};
+use crate::NHyDB;
+
+const BATCH: usize = 256;
+
+pub(crate) enum Pending {
+    Range { realm: Nat, lane: Lane, from: Nat, to: Nat, mode: RangeMode },
+    Find { realm: Nat, lane: Lane, filters: Vec<(String, Cond)>, u_from: Option<Nat>, u_to: Option<Nat>, dyn_mode: Option<String>, dyn_v: Option<Nat> },
+    Sparse { realm: Option<Nat>, lane: Option<Lane> },
+    SelectUs { realm: Nat, lane: Lane, us: Vec<Nat>, columns: Vec<Val> },
+    Cells { realm: Option<Nat>, lane: Option<Lane> },
+    RecordNs { realm: Option<Nat>, lane: Option<Lane> },
+}
+
+enum State {
+    Pending(Pending),
+    Range(RangeCursor),
+    Find(FindCursor),
+    Sparse(SparsePointCursor),
+    SelectUs(SelectUsCursor),
+    Cells(Box<MaterializedCellCursor>),
+    RecordNs(Box<RecordNCursor>),
+    Done,
+}
+
+#[pyclass(name = "ResultIterator", module = "nhydb")]
+pub struct ResultIterator {
+    db: Py<NHyDB>,
+    state: State,
+    buf: VecDeque<Val>,
+}
+
+impl ResultIterator {
+    pub(crate) fn new(db: Py<NHyDB>, p: Pending) -> ResultIterator {
+        ResultIterator { db, state: State::Pending(p), buf: VecDeque::new() }
+    }
+
+    fn fill(&mut self, py: Python<'_>) -> PyResult<()> {
+        let dbref = self.db.borrow(py);
+        let db = &dbref.db;
+        if let State::Pending(_) = &self.state {
+            let State::Pending(p) = std::mem::replace(&mut self.state, State::Done) else { unreachable!() };
+            self.state = match p {
+                Pending::Range { realm, lane, from, to, mode } => State::Range(RangeCursor::new(realm, lane, from, to, mode)),
+                Pending::Find { realm, lane, filters, u_from, u_to, dyn_mode, dyn_v } => {
+                    let us = db.find_u(&realm, &filters, lane, u_from.as_ref(), u_to.as_ref()).py()?;
+                    State::Find(FindCursor::new(realm, lane, us, dyn_mode, dyn_v))
+                }
+                Pending::Sparse { realm, lane } => State::Sparse(SparsePointCursor::new(db, realm.as_ref(), lane)),
+                Pending::SelectUs { realm, lane, us, columns } => State::SelectUs(SelectUsCursor::new(realm, lane, us, columns)),
+                Pending::Cells { realm, lane } => State::Cells(Box::new(MaterializedCellCursor::new(db, realm.as_ref(), lane))),
+                Pending::RecordNs { realm, lane } => State::RecordNs(Box::new(RecordNCursor::new(db, realm.as_ref(), lane))),
+            };
+        }
+        let batch: Vec<Val> = match &mut self.state {
+            State::Range(c) => c.next_batch(db, BATCH).py()?,
+            State::Find(c) => c.next_batch(db, BATCH).py()?,
+            State::SelectUs(c) => c.next_batch(db, BATCH).py()?,
+            State::Sparse(c) => c.next_batch(db, BATCH).py()?.iter().map(|p| p.to_val()).collect(),
+            State::Cells(c) => c.next_batch(db, BATCH).py()?,
+            State::RecordNs(c) => c.next_batch(db, BATCH).py()?.into_iter().map(Val::Str).collect(),
+            _ => Vec::new(),
+        };
+        if batch.is_empty() {
+            self.state = State::Done;
+        }
+        self.buf.extend(batch);
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl ResultIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if self.buf.is_empty() && !matches!(self.state, State::Done) {
+            self.fill(py)?;
+        }
+        match self.buf.pop_front() {
+            Some(v) => Ok(Some(from_val(py, &v)?)),
+            None => Ok(None),
+        }
+    }
+}

@@ -1,0 +1,39 @@
+# Tests on every push and pull request: Rust core and Python package
+# (the Python tests run against the installed wheel, as a user would).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust tests
+        run: cargo test --workspace --release
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist
+      - name: Install wheel and run Python tests
+        shell: bash
+        run: |
+          python -m pip install numpy pytest cryptography
+          python -m pip install --no-index --find-links dist nhydb
+          python -m pytest -q tests/python

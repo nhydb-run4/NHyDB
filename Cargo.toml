@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/nhydb-core", "crates/nhydb-py"]
+
+[workspace.package]
+version = "0.27.0"
+edition = "2024"
+authors = ["Achim Meissner <achim.meissner@nhydb.de>"]
+license-file = "LICENSE"
+publish = false
+
+[workspace.dependencies]
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+crc32fast = "1.4"
+miniz_oxide = "0.8"
+libc = "0.2"
+pyo3 = "0.29"
+aes-gcm = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
+getrandom = "0.4"
+toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = false
+
+[profile.bench]
+inherits = "release"

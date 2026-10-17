@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nhydb"
+description = "NHyDB – general-purpose database with mathematical cell addressing (R, u, v, lane); native Rust engine with Python bindings"
+readme = "README.md"
+license-files = ["LICENSE"]
+authors = [{ name = "Achim Meissner", email = "achim.meissner@nhydb.de" }]
+requires-python = ">=3.9"
+keywords = ["database", "storage-engine", "rust", "numpy", "append-only"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database :: Database Engines/Servers",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.22"]
+test = ["pytest>=7", "numpy>=1.22", "cryptography"]
+
+[project.scripts]
+nhydb = "nhydb.cli:main"
+
+[tool.maturin]
+manifest-path = "crates/nhydb-py/Cargo.toml"
+python-source = "python"
+module-name = "nhydb._native"
+features = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

@@ -1,0 +1,29 @@
+# Build output
+/target/
+/dist/
+*.so
+*.pyd
+*.dylib
+
+# Python
+/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Local cargo home (optional, see BUILDING.md)
+/.cargo-home/
+
+# Test and scratch databases
+*.nhydb
+*.nhydb.*
+*.dnhydb
+*.dnhydb.*
+*.dnhydb-index
+/scratch/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

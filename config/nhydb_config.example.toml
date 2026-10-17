@@ -1,0 +1,34 @@
+# NHyDB – central operational configuration (example with the default values).
+#
+# Lookup order: API parameter config=  >  environment variable NHYDB_CONFIG
+#               >  nhydb_config.toml in the database directory
+#               >  built-in defaults.
+#
+# Settings stored inside a database (database size limit, realm budget of a
+# MATH layout) are NOT overridden by this file when the database is opened
+# again. REALM_SPAN (10**100), NL (0) and NR (1) are fixed system values and
+# cannot be configured. Never put secret keys into this file – only paths.
+
+[database]
+db_max_size_bytes = 53687091200   # 50 GiB; initial value for NEW databases
+durability = "fsync"              # "fsync" | "full"
+
+[math]
+realm_auto_limit = 4096           # initial value for NEW MATH layouts
+math_max_intermediate_bits = 1048576   # 2^20 bits per intermediate result
+
+[lock]
+enabled = true                    # exclusive write lock (lock file <db>.lock)
+timeout_ms = 0                    # 0 = fail immediately, otherwise wait time in ms
+
+[paths]
+# Optional path templates; {db} = file name of the database, relative paths
+# are resolved against the directory of the database.
+# layout_path = "{db}.layout.enc"
+# key_path    = "/secure/location/{db}.layout.key"
+
+[cache]
+# Note: the [cache] keys are accepted but not yet used by the engine.
+block_cache_bytes = 67108864      # block cache (64 MiB)
+vindex_max_marks = 4000000        # budget of the v-index (COLUMN/PACKED)
+vindex_max_indexes = 4096

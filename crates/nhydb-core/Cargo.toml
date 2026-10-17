@@ -1,0 +1,30 @@
+[package]
+name = "nhydb-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "NHyDB native storage engine (pure Rust core)"
+
+[lib]
+name = "nhydb_core"
+
+[dependencies]
+num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+crc32fast.workspace = true
+miniz_oxide.workspace = true
+aes-gcm.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+toml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_SystemInformation"] }
