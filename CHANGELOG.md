@@ -7,7 +7,8 @@ The project uses [Semantic Versioning](https://semver.org/).
 
 ## [0.27.0] – 2026-10-17
 
-First public release.
+First public release under the NHyDB / dNHyDB Experimental Software License 1.0
+(source-available, non-production use only; see `LICENSE.md`).
 
 * Native Rust storage engine (`nhydb-core`) with cell identity
   `(R, u, v, lane)`; `N` is computed arithmetically, never stored as a key.

@@ -10,7 +10,7 @@
 | Engine version (`ENGINE_VERSION`) | `0.27.0` |
 | File identifier | `NHYDB016` (format revision 16, `FILE_FORMAT_VERSION = "0.16"`) – internal identifier of the file format; it changes only when the on-disk format changes and is independent of the product version |
 | Platforms | macOS, Linux, Windows |
-| License | see file `LICENSE` (custom license; the license terms have not yet been published) |
+| License | NHyDB / dNHyDB Experimental Software License 1.0, see file `LICENSE.md` (source-available, not an open-source license; no production use) |
 | Contact | achim.meissner@nhydb.de |
 
 ---
@@ -2167,9 +2167,13 @@ is missing; `test_sql.py` skips the NumPy output test without `numpy`.
 
 ### 18.4 License
 
-See file `LICENSE`. NHyDB is subject to a custom license whose
-terms have not yet been published; inquiries to
-achim.meissner@nhydb.de.
+See file `LICENSE.md`. NHyDB is licensed under the "NHyDB / dNHyDB
+Experimental Software License", version 1.0. The source code is available
+for inspection, but this is not an open-source license: free use is limited
+to non-production purposes (unlimited for private individuals,
+time-limited for teaching, research and businesses),
+and any production use requires a separate written license. The license
+text alone is authoritative. Inquiries to achim.meissner@nhydb.de.
 
 ### 18.5 Benchmarks
 

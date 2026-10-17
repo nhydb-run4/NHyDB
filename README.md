@@ -12,7 +12,7 @@ binds it via PyO3 and offers single operations as well as NumPy batch
 operations.
 
 Version: **0.27.0** · Platforms: macOS, Linux, Windows · License: see
-[`LICENSE`](LICENSE)
+[`LICENSE.md`](LICENSE.md)
 
 ## Features
 
@@ -132,6 +132,15 @@ config/             example configuration
 docs/               documentation (de, en)
 .github/workflows/  CI: tests and wheels for Linux, macOS, Windows
 ```
+
+## License
+
+NHyDB is licensed under the **NHyDB / dNHyDB Experimental Software License 1.0**
+([`LICENSE.md`](LICENSE.md)). The source code is available, but this is
+**not an open-source license**: free use is limited to non-production
+purposes (unlimited for private individuals, time-limited for teaching,
+research and businesses), and **production use is not permitted** without a separate written license. Please read the
+license text before using the software.
 
 ## Contact
 
