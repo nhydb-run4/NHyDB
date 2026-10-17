@@ -138,8 +138,11 @@ docs/               documentation (de, en)
 The mathematical foundations and database architecture are described in:
 
 Das Dynadron als mathematisches Datenbankprinzip
+
 https://doi.org/10.5281/zenodo.22549415
+
 https://doi.org/10.5281/zenodo.23438748
+
 https://doi.org/10.5281/zenodo.22694525
 
 ## License
