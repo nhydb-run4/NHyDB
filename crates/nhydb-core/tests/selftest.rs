@@ -354,12 +354,14 @@ fn corrupt_payload_detected() {
         db.close(true).unwrap();
     }
     {
-        use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new().write(true).read(true).open(&p).unwrap();
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).read(true).open(&p).unwrap();
         let mut b = [0u8; 1];
-        f.read_exact_at(&mut b, off + 70).unwrap();
+        f.seek(SeekFrom::Start(off + 70)).unwrap();
+        f.read_exact(&mut b).unwrap();
         b[0] ^= 0xFF;
-        f.write_all_at(&b, off + 70).unwrap();
+        f.seek(SeekFrom::Start(off + 70)).unwrap();
+        f.write_all(&b).unwrap();
     }
     let db = Db::open(&p).unwrap();
     let v = db.verify(false).unwrap();
