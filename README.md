@@ -133,6 +133,14 @@ docs/               documentation (de, en)
 .github/workflows/  CI: tests and wheels for Linux, macOS, Windows
 ```
 
+## Scientific Background
+
+The mathematical foundations and database architecture are described in:
+
+Das Dynadron als mathematisches Datenbankprinzip
+
+https://doi.org/10.5281/zenodo.23438748
+
 ## License
 
 NHyDB is licensed under the **NHyDB / dNHyDB Experimental Software License 1.0**
