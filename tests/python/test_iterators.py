@@ -54,20 +54,3 @@ def test_writes_between_steps(tmp_path):
     assert us[-1] == 5000 and len(us) == 600
 
 
-def test_sparse_points_order_and_overlays(tmp_path, ref):
-    out = {}
-    for name, mod in (("rust", nhydb), ("py", ref)):
-        db = mod.NHyDB.create(tmp_path / f"{name}.nhydb")
-        db.create_realm(1, "r")
-        db.create_realm(2, "q")
-        db.put_points(2, [(5, 1, 1, "u8"), (3, 9, "z", "utf8")])
-        db.put_points(1, [(7, 2, 1.5, "f64"), (7, 1, b"\x00", "bytes"), (1, 1, 3, "u8")])
-        db.put_points(1, [(7, 2, 2.5, "f64")], lane=1)
-        db.put_points(1, [(7, 1, None, "bytes")])  # overwrite with NULL
-        db.delete_point(1, 1, 1)                   # Tombstone
-        db.put_points(1, [(2, 4, 9, "u8")])
-        out[name] = list(db.iter_materialized_sparse_points())
-        out[name + "_r1"] = list(db.iter_materialized_sparse_points(1, lane="NR"))
-        db.close()
-    assert out["rust"] == out["py"]
-    assert out["rust_r1"] == out["py_r1"]

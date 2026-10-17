@@ -117,9 +117,8 @@ pip install ".[test]"
 python -m pytest tests/python           # Python package (against the installed wheel)
 ```
 
-Some differential tests compare the engine against an external reference
-implementation that is not part of this repository; they are skipped
-automatically.
+The Python tests cover the single-item and NumPy APIs, address mathematics,
+indexes, QueryEngine, NHySQL, MATH_MAP, maintenance and the system layer.
 
 ## Repository layout
 

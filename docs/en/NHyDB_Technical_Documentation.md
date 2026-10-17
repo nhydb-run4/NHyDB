@@ -542,9 +542,8 @@ missing, the same value applies.
 | `address.rs::exhaustive_small_range` | all `N` in `[1, 200,000)`: either GZ/N0 or exactly invertible; > 199,000 valid cells |
 | `address.rs::parse_refs` | text forms of N references |
 | `nat.rs` (unit tests) | VarUInt/VarInt incl. `i64::MIN`, truncated inputs |
-| `tests/python/test_math.py` | rejection of GZ/N0 numbers, worked example `(23, 14, 744)`; additionally differential tests (3,000 random addresses up to `10^40`, all `N < 50,000`, error texts) against an external reference implementation; they are skipped automatically without it |
+| `tests/python/test_math.py` | rejection of GZ/N0 numbers, worked example `(23, 14, 744)` |
 | `crates/nhydb-core/tests/sparse_access.rs` | sparse access with `u = 2^70` and `v ≥ 10^40` against an independent model |
-| `tests/python/test_maintenance.py` | postings with `u > 2^64` (VarUInt codec 0); differential test, skipped without an external reference implementation |
 
 ---
 
@@ -2121,12 +2120,10 @@ UTF-8 JSON) and the layout plan are platform-neutral.
 2. **Python tests** (`python -m pytest tests/python`) via the installed
    package `nhydb`.
 3. **Exhaustive tests** (all Unicode code points, address ranges).
-4. **System and crash window tests** (locks, manipulation,
-   configuration, durability, repair, compaction).
-5. **Differential tests** against an external reference implementation (same
-   operation sequences, comparison of results, plans, error classes and
-   error texts). This reference is not part of the repository; the
-   affected tests are skipped automatically without it (`pytest.skip`).
+4. **System and maintenance tests** (locks, manipulation, configuration,
+   durability, repair, compaction).
+5. **Functional tests per area** (indexes, QueryEngine, NHySQL, MATH_MAP)
+   with expected results computed independently from the test data.
 
 ### 18.2 Test Inventory
 
@@ -2139,27 +2136,24 @@ Rust (`cargo test --workspace --release`): 44 unit tests in
 | `crates/nhydb-core/src/**` (unit) | address mathematics, Nat/VarUInt, format, codec, crypto (NIST GCM, RFC 4231, SHA KATs), R0 chain, platform (lock, sync, atomic replacement), configuration, set operations, text index, MATH, SQL lexer |
 | `crates/nhydb-core/tests/selftest.rs` | end-to-end in the core |
 | `crates/nhydb-core/tests/sparse_access.rs` | sparse point/range access against an independent model and full merge (12 seeds, `u = 2^70`, `v ≥ 10^40`) |
-| `tests/python/test_math.py` | address mathematics: rejection of GZ/N0, worked example `(23, 14, 744)`; differential tests (random addresses, text forms, error texts) |
-| `tests/python/test_math_map.py` | MATH expressions, MathMap, realm planner; bit limit, rollback of `put_math_batch` at the size limit |
-| `tests/python/test_index.py` | tokenizer, n-grams, FULLTEXT codecs, BM25, index construction (entirely as differential tests) |
-| `tests/python/test_iterators.py` | lazy iterators (`range`/`find`, writing between iteration steps) |
-| `tests/python/test_kernel.py` | kernel functions, Unicode tables against the running Python (all code points), AES-256-GCM against `cryptography`, plan MAC, JSON |
-| `tests/python/test_kiss_api.py` | single-item API, context manager, durability option, loss of uncommitted data |
-| `tests/python/test_numpy_api.py` | NumPy ≙ list API byte-identical, dtypes, endianness, strides, errors without partial append |
-| `tests/python/test_numpy_columns.py` | `put_math_numpy`, query results as NumPy columns |
-| `tests/python/test_query.py` | QueryEngine: sparse overlays across all access paths, large `STRUCT_RANGE`; differential tests with random expression trees |
-| `tests/python/test_sql.py` | NHySQL via the query CLI; differential tests for lexer, parser, compiler, execution and error texts |
-| `tests/python/test_system.py` | R0,u1, external layout plan, fail closed, renamed DB, lock between processes, configuration, durability `full`, repair; differential tests for crash windows and compaction |
-| `tests/python/test_maintenance.py` | repair, superblock fallback, compaction, rolled-back appends, manipulated headers, plugin re-entrancy, CLI; differential tests (tail repair, `u > 2^64` postings) |
+| `tests/python/test_math.py` (6) | address mathematics: rejection of GZ/N0, worked example `(23, 14, 744)` |
+| `tests/python/test_math_map.py` (5) | MATH expressions, mapping targets of a MathMap, writing/reading/reopening a MATH layout, bit limit, rollback of `put_math_batch` at the size limit |
+| `tests/python/test_index.py` (4) | construction of VALUE, TOKEN, TRIGRAM and FULLTEXT indexes, equality and range lookup, token/substring/full-text candidates, detection and rebuild of stale indexes |
+| `tests/python/test_iterators.py` (3) | lazy iterators (`range`/`find`, writing between iteration steps) |
+| `tests/python/test_kernel.py` (7) | kernel functions, Unicode tables against the running Python (all code points), AES-256-GCM against `cryptography`, plan MAC, JSON |
+| `tests/python/test_kiss_api.py` (6) | single-item API, context manager, durability option, loss of uncommitted data |
+| `tests/python/test_numpy_api.py` (7) | NumPy ≙ list API byte-identical, dtypes, endianness, strides, errors without partial append |
+| `tests/python/test_numpy_columns.py` (5) | `put_math_numpy`, query results as NumPy columns |
+| `tests/python/test_query.py` (6) | QueryEngine: counting via a fresh VALUE index, aggregation and grouping, ordering and limit, BM25 search, sparse overlays across all access paths, large `STRUCT_RANGE` |
+| `tests/python/test_sql.py` (8) | NHySQL: filters, grouping, ordering, positional and named parameters, full-text relevance, NumPy output, syntax errors and unsupported statements, query CLI |
+| `tests/python/test_system.py` (6) | R0,u1, external layout plan, fail closed, renamed DB, lock between processes, configuration, durability `full`, repair |
+| `tests/python/test_maintenance.py` (8) | repair, superblock fallback, compaction, rolled-back appends, manipulated headers, plugin re-entrancy, CLI |
 
-Without the external reference implementation, a run on 2026-10-17
-(macOS, Python 3.14, with `numpy` and `cryptography`) yielded **53 passed and
-152 skipped** test cases (counted including parametrizations).
-Only the differential tests in `test_index.py`,
-`test_iterators.py`, `test_maintenance.py`, `test_math.py`,
-`test_math_map.py`, `test_query.py`, `test_sql.py` and `test_system.py` are skipped.
-`test_kernel.py` skips the AES-GCM comparison if the package
-`cryptography` is missing.
+A run on 2026-10-17 (macOS, Python 3.14, with `numpy` and
+`cryptography`) yielded **71 passed Python test cases** (counted including
+parametrizations) with no skipped tests, plus 51 passed Rust tests.
+`test_kernel.py` skips the AES-GCM comparison if the package `cryptography`
+is missing; `test_sql.py` skips the NumPy output test without `numpy`.
 
 ### 18.3 Version Identifiers
 

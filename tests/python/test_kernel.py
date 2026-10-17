@@ -10,7 +10,6 @@ import hmac
 import json
 import os
 import re
-import sys
 import unicodedata
 
 import pytest

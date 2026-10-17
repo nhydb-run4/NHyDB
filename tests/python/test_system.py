@@ -1,7 +1,5 @@
-"""System layer of the Rust engine: R0,u1, external layout plan,
-commit/crash windows, locking, configuration, durability, repair/compaction,
-including regression tests for weaknesses fixed relative to the external
-reference implementation."""
+"""System layer: R0,u1, external layout plan, fail-closed opening, locking,
+configuration, durability and repair."""
 import json
 import os
 import subprocess
@@ -67,51 +65,6 @@ def test_fail_closed_and_renamed_db(tmp_path):
     plan.write_bytes(nhydb._native._layout_envelope(env["db_id"], env["entries"], k))
     with pytest.raises(nhydb.CorruptionError, match="AES-GCM"):
         nhydb.NHyDB(p)
-
-
-def test_schema_commit_crash_windows(tmp_path, ref):
-    """Crash after writing the plan but before the SYSTEM block/superblock: the
-    previous generation stays valid (Rust and the reference open it identically)."""
-    p = tmp_path / "A.nhydb"
-    db = _classic(p)
-    db.commit()
-    gen = db.get_system_cell(5)
-    key = nhydb._native._layout_key_load(Path(str(p) + ".layout.key"), db._db_id, p.name)
-    future = db._export_external_schema()
-    future["realms"].append({"realm_id": 991, "name": "future", "description": "", "default_shape_id": None, "base_reserve_to": 0})
-    nxt = nhydb._native._layout_seal_entry(db._db_id, gen + 1, future, key)
-    active = db._active_layout_entry
-    db.create_realm(2, "nur im RAM")  # uncommitted schema change
-    db.close(commit=False)
-    nhydb._native._atomic_layout_replace(Path(str(p) + ".layout.enc"), nhydb._native._layout_envelope(db._db_id, [active, nxt], key))
-    for mod in (nhydb, ref):
-        d = mod.NHyDB(p)
-        assert 991 not in d.realms and 2 not in d.realms and d.get_system_cell(5) == gen
-        d.close(commit=False)
-    d = nhydb.NHyDB(p)
-    d.create_realm(3, "weiter")
-    d.close()
-    d = ref.NHyDB(p)  # the reference reads the generation written by Rust
-    assert 3 in d.realms and d.get_system_cell(5) == gen + 1
-    d.close()
-
-
-def test_python_and_rust_alternate_schema_commits(tmp_path, ref):
-    p = tmp_path / "A.nhydb"
-    db = ref.NHyDB.create(p)
-    db.create_realm(1, "py")
-    db.close()
-    db = nhydb.NHyDB(p)
-    assert db.get_system_cell(9) is None  # the reference does not write v9
-    db.create_realm(2, "rust")
-    db.close()
-    db = ref.NHyDB(p)
-    db.create_realm(3, "py2")
-    db.close()
-    db = nhydb.NHyDB(p)
-    assert set(db.realms) == {1, 2, 3} and db.get_system_cell(5) == 3
-    assert db.verify(deep=True)["ok"]
-    db.close()
 
 
 LOCK_HOLDER = textwrap.dedent("""
@@ -200,41 +153,3 @@ def test_repair_cuts_blocks_without_published_schema(tmp_path):
     db.close()
 
 
-def test_compaction_inplace_with_python_math_data(tmp_path, ref):
-    """In-place compaction of a DB with MATH data (the reference implementation
-    fails here); the result stays readable by the reference."""
-    p = tmp_path / "M.nhydb"
-    db = ref.NHyDB.create(p)
-    m = db.create_math_map_layout("m", ("x",), u="x+1", V="x+1", side="NL", payload_type="utf8")
-    db.put_math(m.layout_id, (5,), "hello", commit=True)
-    db.close()
-    with pytest.raises(ref.SchemaError):
-        ref.NHyDB.compact_file(p, make_backup=False)
-    res = nhydb.NHyDB.compact_file(p, make_backup=False)
-    assert res["ok"]
-    d = ref.NHyDB(p)
-    assert d.get_math(m.layout_id, (5,)) == "hello"
-    d.close()
-
-
-def test_export_keeps_realm_defaults(tmp_path, ref):
-    """Export keeps default_shape_id and base_reserve_to."""
-    p = tmp_path / "E.nhydb"
-    db = nhydb.NHyDB.create(p)
-    db.create_realm(1, "r", base_reserve_to=50)
-    db.create_shape(1, 1, "s", [{"v": 1, "name": "a", "type": "u32"}])
-    db.set_realm_default_shape(1, 1)
-    db.put(1, 1, [7], commit=True)
-    src_id = db.get_system_cell(1)
-    db.close()
-    out = tmp_path / "E2.nhydb"
-    res = nhydb.NHyDB.compact_file(p, output=out)
-    assert res["ok"]
-    for mod in (nhydb, ref):
-        d = mod.NHyDB(out)
-        r = d.realms[1]
-        r = r if isinstance(r, dict) else r.to_dict()
-        assert r["default_shape_id"] == 1 and r["base_reserve_to"] == 50
-        assert d.get_system_cell(1) != src_id and d.get_system_cell(2) == "E2.nhydb"
-        assert d.get(1, 1)["a"] == 7
-        d.close()

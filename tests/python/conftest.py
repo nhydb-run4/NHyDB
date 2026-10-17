@@ -1,58 +1,46 @@
-"""Shared fixtures.
+"""Shared fixtures and helpers for the Python test suite.
 
-Some tests compare the engine against an external Python reference
-implementation (differential/oracle tests). That reference is not part of
-this repository; the fixtures ``ref`` and ``ref14`` therefore skip the
-dependent tests unless the reference is available next to the repository
-root (see ``REFERENCE`` and ``REFERENCE_V027`` below).
+All tests run against the installed ``nhydb`` package.
 """
-import importlib
-import importlib.util
 import struct
-import sys
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-REFERENCE = ROOT / "reference"
-REFERENCE_V027 = ROOT / "reference_v0_27"
-PORTS = Path(__file__).resolve().parent / "ref_ports"
+import nhydb
 
 DATA_START = 8192
 BT_SYSTEM = 13
 
-
-def _load_reference_v014():
-    if not (REFERENCE / "nhydb_v014.py").exists():
-        pytest.skip("reference implementation not included")
-    sys.dont_write_bytecode = True
-    spec = importlib.util.spec_from_file_location("nhydb_v014", REFERENCE / "nhydb_v014.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["nhydb_v014"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+BODY = {
+    0: "the quick brown fox {u}",
+    1: "lazy dog sleeps",
+    2: "quick quick fox jumps",
+    3: "nothing here",
+}
 
 
-def _load_reference_v027():
-    if not (REFERENCE_V027 / "nhydb_v027.py").exists():
-        pytest.skip("reference implementation not included")
-    pytest.importorskip("cryptography", reason="the external reference implementation needs real AES-256-GCM")
-    sys.dont_write_bytecode = True
-    if str(REFERENCE_V027) not in sys.path:
-        sys.path.insert(0, str(REFERENCE_V027))
-    return importlib.import_module("nhydb_v027")
+def sample_rows(n=100):
+    """Deterministic sample records ``[id, status, body, amount]`` for u = 1..n."""
+    return [[u, "active" if u % 3 == 0 else "idle", BODY[u % 4].format(u=u), u * 10] for u in range(1, n + 1)]
 
 
-@pytest.fixture(scope="session")
-def ref14():
-    return _load_reference_v014()
-
-
-@pytest.fixture(scope="session")
-def ref():
-    """External reference implementation, not included (core module ``nhydb_v027``)."""
-    return _load_reference_v027()
+@pytest.fixture
+def sample_db(tmp_path):
+    """Database with realm 1, CLASSIC layout ``records`` and 100 committed records."""
+    db = nhydb.NHyDB.create(str(tmp_path / "sample.nhydb"))
+    db.create_realm(1, "main")
+    db.create_shape(1, 1, "row", [
+        {"v": 1, "name": "id", "type": "varuint"},
+        {"v": 2, "name": "status", "type": "utf8"},
+        {"v": 3, "name": "body", "type": "utf8"},
+        {"v": 4, "name": "amount", "type": "varuint"},
+    ])
+    db.create_classic_layout(1, 1, "records", shape_id=1)
+    db.put_dense_batch(1, 1, sample_rows(), shape_id=1)
+    db.commit()
+    yield db
+    db.close()
 
 
 @pytest.fixture

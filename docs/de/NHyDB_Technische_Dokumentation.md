@@ -544,9 +544,8 @@ derselbe Wert.
 | `address.rs::exhaustive_small_range` | alle `N` in `[1, 200 000)`: entweder GZ/N0 oder exakt invertierbar; > 199 000 gültige Zellen |
 | `address.rs::parse_refs` | Textformen von N-Referenzen |
 | `nat.rs` (Unit-Tests) | VarUInt/VarInt inkl. `i64::MIN`, abgeschnittene Eingaben |
-| `tests/python/test_math.py` | Ablehnung von GZ-/N0-Zahlen, Rechenbeispiel `(23, 14, 744)`; zusätzlich Differenztests (3 000 Zufallsadressen bis `10^40`, alle `N < 50 000`, Fehlertexte) gegen eine externe Referenzimplementierung, die ohne diese automatisch übersprungen werden |
+| `tests/python/test_math.py` | Ablehnung von GZ-/N0-Zahlen, Rechenbeispiel `(23, 14, 744)` |
 | `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Zugriff mit `u = 2^70` und `v ≥ 10^40` gegen ein unabhängiges Modell |
-| `tests/python/test_maintenance.py` | Postings mit `u > 2^64` (VarUInt-Codec 0); Differenztest, ohne externe Referenzimplementierung übersprungen |
 
 ---
 
@@ -2126,12 +2125,11 @@ UTF-8-JSON) und Layoutplan sind plattformneutral.
 2. **Python-Tests** (`python -m pytest tests/python`) über das installierte
    Paket `nhydb`.
 3. **Erschöpfende Tests** (alle Unicode-Code-Points, Adressbereiche).
-4. **System- und Crash-Fenster-Tests** (Sperren, Manipulation,
-   Konfiguration, Durability, Repair, Kompaktierung).
-5. **Differenztests** gegen eine externe Referenzimplementierung (gleiche
-   Operationsfolgen, Vergleich von Ergebnissen, Plänen, Fehlerklassen und
-   -texten). Diese Referenz ist nicht Bestandteil des Repositorys; die
-   betroffenen Tests werden ohne sie automatisch übersprungen (`pytest.skip`).
+4. **System- und Wartungstests** (Sperren, Manipulation, Konfiguration,
+   Durability, Repair, Kompaktierung).
+5. **Funktionstests je Bereich** (Indizes, QueryEngine, NHySQL, MATH_MAP)
+   mit erwarteten Ergebnissen, die unabhängig aus den Testdaten berechnet
+   sind.
 
 ### 18.2 Testinventar
 
@@ -2144,27 +2142,25 @@ Rust (`cargo test --workspace --release`): 44 Unit-Tests in
 | `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Nat/VarUInt, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), R0-Kette, Plattform (Sperre, Sync, atomarer Austausch), Konfiguration, Mengenoperationen, Textindex, MATH, SQL-Lexer |
 | `crates/nhydb-core/tests/selftest.rs` | End-to-End im Kern |
 | `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Punkt-/Bereichszugriff gegen unabhängiges Modell und Vollmerge (12 Seeds, `u = 2^70`, `v ≥ 10^40`) |
-| `tests/python/test_math.py` | Adressmathematik: Ablehnung von GZ/N0, Rechenbeispiel `(23, 14, 744)`; Differenztests (Zufallsadressen, Textformen, Fehlertexte) |
-| `tests/python/test_math_map.py` | MATH-Ausdrücke, MathMap, Realmplaner; Bitgrenze, Rollback von `put_math_batch` bei Größengrenze |
-| `tests/python/test_index.py` | Tokenizer, N-Gramme, FULLTEXT-Codecs, BM25, Indexaufbau (vollständig als Differenztests) |
-| `tests/python/test_iterators.py` | Lazy-Iteratoren (`range`/`find`, Schreiben zwischen Iterationsschritten) |
-| `tests/python/test_kernel.py` | Kernelfunktionen, Unicode-Tabellen gegen das laufende Python (alle Code Points), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
-| `tests/python/test_kiss_api.py` | Einzel-API, Kontextmanager, Durability-Option, Verlust unkommittierter Daten |
-| `tests/python/test_numpy_api.py` | NumPy ≙ Listen-API bytegleich, Dtypes, Endianness, Strides, Fehler ohne Teil-Append |
-| `tests/python/test_numpy_columns.py` | `put_math_numpy`, Abfrageergebnisse als NumPy-Spalten |
-| `tests/python/test_query.py` | QueryEngine: Sparse-Überlagerungen über alle Zugriffspfade, große `STRUCT_RANGE`; Differenztests mit zufälligen Ausdrucksbäumen |
-| `tests/python/test_sql.py` | NHySQL über die Query-CLI; Differenztests für Lexer, Parser, Compiler, Ausführung und Fehlertexte |
-| `tests/python/test_system.py` | R0,u1, externer Layoutplan, fail closed, umbenannte DB, Sperre zwischen Prozessen, Konfiguration, Durability `full`, Repair; Differenztests für Crash-Fenster und Kompaktierung |
-| `tests/python/test_maintenance.py` | Repair, Superblock-Fallback, Kompaktierung, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI; Differenztests (Tail-Repair, `u > 2^64`-Postings) |
+| `tests/python/test_math.py` (6) | Adressmathematik: Ablehnung von GZ/N0, Rechenbeispiel `(23, 14, 744)` |
+| `tests/python/test_math_map.py` (5) | MATH-Ausdrücke, Abbildungsziele einer MathMap, MATH-Layout schreiben/lesen/wieder öffnen, Bitgrenze, Rollback von `put_math_batch` bei Größengrenze |
+| `tests/python/test_index.py` (4) | Aufbau von VALUE-, TOKEN-, TRIGRAM- und FULLTEXT-Indizes, Gleichheits- und Bereichssuche, Token-/Teilstring-/Volltextkandidaten, Erkennung und Neuaufbau veralteter Indizes |
+| `tests/python/test_iterators.py` (3) | Lazy-Iteratoren (`range`/`find`, Schreiben zwischen Iterationsschritten) |
+| `tests/python/test_kernel.py` (7) | Kernelfunktionen, Unicode-Tabellen gegen das laufende Python (alle Code Points), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
+| `tests/python/test_kiss_api.py` (6) | Einzel-API, Kontextmanager, Durability-Option, Verlust unkommittierter Daten |
+| `tests/python/test_numpy_api.py` (7) | NumPy ≙ Listen-API bytegleich, Dtypes, Endianness, Strides, Fehler ohne Teil-Append |
+| `tests/python/test_numpy_columns.py` (5) | `put_math_numpy`, Abfrageergebnisse als NumPy-Spalten |
+| `tests/python/test_query.py` (6) | QueryEngine: Zählen über einen frischen VALUE-Index, Aggregation und Gruppierung, Sortierung und Limit, BM25-Suche, Sparse-Überlagerungen über alle Zugriffspfade, große `STRUCT_RANGE` |
+| `tests/python/test_sql.py` (8) | NHySQL: Filter, Gruppierung, Sortierung, positionelle und benannte Parameter, Volltext-Relevanz, NumPy-Ausgabe, Syntaxfehler und nicht unterstützte Anweisungen, Query-CLI |
+| `tests/python/test_system.py` (6) | R0,u1, externer Layoutplan, fail closed, umbenannte DB, Sperre zwischen Prozessen, Konfiguration, Durability `full`, Repair |
+| `tests/python/test_maintenance.py` (8) | Repair, Superblock-Fallback, Kompaktierung, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI |
 
-Ohne die externe Referenzimplementierung ergab ein Lauf am 2026-10-17
-(macOS, Python 3.14, mit `numpy` und `cryptography`) **53 bestandene und
-152 übersprungene** Testfälle (gezählt einschließlich Parametrisierungen).
-Übersprungen werden ausschließlich die Differenztests in `test_index.py`,
-`test_iterators.py`, `test_maintenance.py`, `test_math.py`,
-`test_math_map.py`, `test_query.py`, `test_sql.py` und `test_system.py`.
-`test_kernel.py` überspringt den AES-GCM-Vergleich, wenn das Paket
-`cryptography` fehlt.
+Ein Lauf am 2026-10-17 (macOS, Python 3.14, mit `numpy` und
+`cryptography`) ergab **71 bestandene Python-Testfälle** (gezählt
+einschließlich Parametrisierungen) ohne übersprungene Tests, dazu 51
+bestandene Rust-Tests. `test_kernel.py` überspringt den AES-GCM-Vergleich,
+wenn das Paket `cryptography` fehlt; `test_sql.py` überspringt die
+NumPy-Ausgabe ohne `numpy`.
 
 ### 18.3 Versionskennungen
 

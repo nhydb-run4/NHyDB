@@ -1,5 +1,4 @@
 """Maintenance and edge cases: repair, compaction, large u, plugin callbacks."""
-import shutil
 
 import pytest
 
@@ -12,23 +11,6 @@ def _classic(path):
     db.create_shape(1, 1, "s", [{"v": 1, "name": "a", "type": "varint"}, {"v": 2, "name": "b", "type": "utf8"}])
     db.create_classic_layout(1, 1, "c", shape_id=1, base_reserve_to=10)
     return db
-
-
-def test_repair_truncated_tail(tmpdb, ref):
-    db = _classic(tmpdb)
-    db.put_dense_batch(1, 1, [[i, f"x{i}"] for i in range(100)], commit=True)
-    db.close()
-    good = tmpdb.stat().st_size
-    with open(tmpdb, "ab") as f:
-        f.write(b"NHBL" + b"\x0e\x04" + b"\x00" * 50)  # broken block header
-    rep = nhydb.NHyDB.inspect_tail(tmpdb)
-    assert rep == ref.NHyDB.inspect_tail(tmpdb)
-    assert not rep["clean"] and rep["last_good_end"] == good
-    out = nhydb.NHyDB.repair_file(tmpdb, apply=True, make_backup=False)
-    assert out["applied"] and out["after"]["clean"]
-    db = nhydb.NHyDB(tmpdb)
-    assert db.get(1, 50)["b"] == "x49"
-    assert db.verify(deep=True)["ok"]
 
 
 def test_strict_open_rejects_corrupt_header(tmpdb):
@@ -59,38 +41,6 @@ def test_superblock_fallback(tmpdb):
     assert db.verify()["ok"]
 
 
-def test_compaction_with_tombstoned_base_field(tmp_path, ref):
-    p = tmp_path / "a.nhydb"
-    db = _classic(p)
-    db.put_dense_batch(1, 1, [[i, f"x{i}"] for i in range(1, 11)])
-    db.put_dense_batch(1, 3, [[99, "neu"]])          # overlay (newer segment)
-    db.delete_point(1, 4, 2)                          # BASE field deleted via tombstone
-    db.delete(1, 6)
-    db.put_points(1, [(8, 1, 777)])                   # BASE field overwritten via sparse cell
-    db.put_points(1, [(20, 5, "frei", "utf8")], lane="NR")
-    before = {u: db.get(1, u) for u in range(1, 12)}
-    before_nr = db.get_cell(1, 20, 5, lane="NR")["value"]
-    db.close()
-    # Known weakness of the reference implementation: merged BASE values are
-    # re-encoded, and a utf8 field deleted via tombstone (None) silently
-    # becomes 'None' (str(None)). The Rust engine keeps it None.
-    ref.NHyDB.compact_file(p, output=tmp_path / "py.nhydb", make_backup=False)
-    assert before[4]["b"] is None
-    assert ref.NHyDB(tmp_path / "py.nhydb").get(1, 4)["b"] == "None"
-    res = nhydb.NHyDB.compact_file(p, output=tmp_path / "c.nhydb", make_backup=False)
-    assert res["ok"]
-    db = nhydb.NHyDB(tmp_path / "c.nhydb")
-    after = {u: db.get(1, u) for u in range(1, 12)}
-    for u in range(1, 12):
-        if before[u] is None:
-            assert after[u] is None
-        else:
-            assert {k: v for k, v in after[u].items() if not k.startswith("_")} == \
-                   {k: v for k, v in before[u].items() if not k.startswith("_")}, u
-    assert db.get_cell(1, 20, 5, lane="NR")["value"] == before_nr
-    assert db.stats()["storage"]["physical_dense_records"] == 9
-
-
 def test_compact_replace_original_with_backup(tmpdb):
     db = _classic(tmpdb)
     for i in range(1, 6):
@@ -99,20 +49,6 @@ def test_compact_replace_original_with_backup(tmpdb):
     res = nhydb.NHyDB.compact_file(tmpdb)
     assert res["replaced_original"] and res["backup"] and res["saved_bytes"] > 0
     assert nhydb.NHyDB(tmpdb).get(1, 5)["a"] == 5
-
-
-def test_big_u_index_and_dense(tmpdb, ref):
-    big = 2**70
-    db = _classic(tmpdb)
-    db.create_index(1, 1, "a", "a")
-    db.put_dense_batch(1, big, [[i % 3, "x"] for i in range(10)])
-    db.put_dense_batch(1, 1, [[2, "y"]])
-    db.build_indexes(commit=True)
-    assert db.find_u(1, {"a": 2}) == [1, big + 2, big + 5, big + 8]
-    db.close()
-    r = ref.NHyDB(tmpdb)  # the reference reads big-u postings (width 0)
-    assert r.find_u(1, {"a": 2}) == [1, big + 2, big + 5, big + 8]
-    assert r.get(1, big + 9)["a"] == 0
 
 
 class Occ:
@@ -227,19 +163,3 @@ def test_crafted_huge_payload_len_is_corruption(tmpdb):
     assert not nhydb.NHyDB.inspect_tail(tmpdb)["clean"]
 
 
-def test_non_strict_open_fails_closed_on_committed_damage(tmpdb, ref):
-    """Non-strict open refuses any damaged committed block instead of
-    reading up to the damage (Rust and the reference implementation alike)."""
-    db = _classic(tmpdb)
-    db.put(1, 1, [1, "a"], commit=True)
-    db.put(1, 2, [2, "b"], commit=True)
-    db.close()
-    raw = bytearray(tmpdb.read_bytes())
-    idx = raw.rfind(b"NHBL\x10\x04")  # last DATA block (version 16)
-    assert idx > 0
-    raw[idx + 9] ^= 0xFF
-    tmpdb.write_bytes(bytes(raw))
-    with pytest.raises(nhydb.CorruptionError):
-        nhydb.NHyDB(tmpdb, strict=False)
-    with pytest.raises(ref.CorruptionError):
-        ref.NHyDB(tmpdb, strict=False)
