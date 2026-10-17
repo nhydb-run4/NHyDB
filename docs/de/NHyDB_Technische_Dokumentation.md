@@ -9,7 +9,7 @@
 | Engine-Version (`ENGINE_VERSION`) | `0.27.0` |
 | Dateikennung | `NHYDB016` (Formatrevision 16, `FILE_FORMAT_VERSION = "0.16"`) – interne Kennung des Dateiformats; sie ändert sich nur, wenn sich das Format auf dem Datenträger ändert, und ist unabhängig von der Produktversion |
 | Plattformen | macOS, Linux, Windows |
-| Lizenz | siehe Datei `LICENSE` |
+| Lizenz | siehe Datei `LICENSE` (eigene Lizenz; die Lizenzbedingungen sind noch nicht veröffentlicht) |
 | Kontakt | achim.meissner@nhydb.de |
 
 ---
@@ -34,7 +34,7 @@
 16. [Python-Schnittstelle (PyO3) und NumPy](#16-python-schnittstelle-pyo3-und-numpy)
 17. [Konfiguration, Installation, Build und Betrieb](#17-konfiguration-installation-build-und-betrieb)
 18. [Tests, Validierung und Benchmarks](#18-tests-validierung-und-benchmarks)
-19. [Bekannte Einschränkungen und offene Punkte](#19-bekannte-einschränkungen-und-offene-punkte)
+19. [Bekannte Einschränkungen](#19-bekannte-einschränkungen)
 20. [Anhang: Referenzen im Quellcode](#20-anhang-referenzen-im-quellcode)
 
 ---
@@ -178,8 +178,7 @@ werden:
 * Wegen `1 ≤ u ≤ G − 1` liegt `N_NL` in `[G² − G + 1, G² − 1]`, wegen
   `1 ≤ V ≤ G − 1` liegt `N_NR` in `[G² + 1, G² + G − 1]`.
 * Dieselbe Strukturkombination `(R, u, v)` ergibt zwei verschiedene Zellen
-  (NL und NR); beide sind unabhängig speicherbar
-  (Testvorgabe: „Adress-Testdaten bei NL und NR getrennt speicherbar“).
+  (NL und NR); beide sind unabhängig voneinander speicherbar.
 
 **Rechenbeispiele:**
 
@@ -233,7 +232,7 @@ m < d ≤ 2m     ⇒ NL:      G = m + 1, u = G² − N,     V = G − u
 
 (R, v) = split_global_v(V)
 Kontrolle: cell_address(R, u, v, lane).N == N, sonst AddressError
-           "N… konnte nicht eindeutig aufgeloest werden"
+           "N… could not be resolved unambiguously"
 ```
 
 Begründung der Fallunterscheidung: Für NR-Zellen gilt `G² < N < G² + G`, also
@@ -272,9 +271,13 @@ Beispiel `(1, 3, 5)`: `V = 5, G = 8, station = 4, stufenbreite = 5,
 stufe = 1, stufenstation = 4, NL = 61, NR = 69`. Für `(2, 3, 5)` gilt
 `station = T + 4`, `stufe = ⌊(T+4)/5⌋ + 1`, `stufenstation = (T+4) mod 5`.
 Diese Werte gehören **nicht** zur Zellidentität und werden nie gespeichert;
-sie erscheinen in Ausgaben nur, wenn sie angefordert werden
-(`dyn_address=True` bei `get_cell`, `set_dyn_address_output("off"|"once"|"auto")`
-mit Präfix `_dyn_…`).
+sie werden bei Bedarf berechnet und erscheinen in Zellausgaben mit dem Präfix
+`_dyn_…`: `get_cell` und `get_cell_n` liefern sie standardmäßig
+(`dyn_address=True`, abschaltbar mit `dyn_address=False`), `get_math_cell`
+nur mit `dyn_address=True`. Für Record-Lesezugriffe (`get`, `range`) gilt der
+Modus `dyn_address="off"|"once"|"auto"` (mit `dyn_v` für `"once"`); sein
+Standardwert wird mit `set_dyn_address_output(mode, v=…)` gesetzt
+(Voreinstellung `"off"`).
 
 ### 2.8 N-Referenzen als Text (`parse_n_reference`)
 
@@ -380,8 +383,9 @@ einer MATH-Zelle ist daher `N(R_phys, u, v, side)`.
 | strukturelle Blockkodierung, kein N-Index | Implementierungsentscheidung |
 | `u64`/`u128`-Schnellpfade, `BigUint`-Ausweichpfad | Implementierungsentscheidung (Performance) |
 
-> **Hinweis zu Nutzdaten:** Ein Schemafeld namens `N` (z. B. in den
-> KQ-Benchmarks) ist ein gewöhnlicher Anwendungswert, nicht die Zelladresse.
+> **Hinweis zu Nutzdaten:** Ein Schemafeld namens `N` (z. B. im
+> Benchmarkprogramm `bench_native` oder im Beispiel in Abschnitt 16.9) ist ein
+> gewöhnlicher Anwendungswert, nicht die Zelladresse.
 
 ---
 
@@ -540,9 +544,9 @@ derselbe Wert.
 | `address.rs::exhaustive_small_range` | alle `N` in `[1, 200 000)`: entweder GZ/N0 oder exakt invertierbar; > 199 000 gültige Zellen |
 | `address.rs::parse_refs` | Textformen von N-Referenzen |
 | `nat.rs` (Unit-Tests) | VarUInt/VarInt inkl. `i64::MIN`, abgeschnittene Eingaben |
-| `tests/python/test_math.py` | 3 000 Zufallsadressen bis `10^40`, alle `N < 50 000`, Fehlertexte (Differenztests gegen eine externe Referenzimplementierung; ohne diese automatisch übersprungen) |
-| `tests/sparse_access.rs` | Sparse-Zugriff mit `u = 2^70` und `v ≥ 10^40` gegen ein unabhängiges Modell |
-| `test_maintenance.py` | Postings mit `u > 2^64` (VarUInt-Codec 0) |
+| `tests/python/test_math.py` | Ablehnung von GZ-/N0-Zahlen, Rechenbeispiel `(23, 14, 744)`; zusätzlich Differenztests (3 000 Zufallsadressen bis `10^40`, alle `N < 50 000`, Fehlertexte) gegen eine externe Referenzimplementierung, die ohne diese automatisch übersprungen werden |
+| `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Zugriff mit `u = 2^70` und `v ≥ 10^40` gegen ein unabhängiges Modell |
+| `tests/python/test_maintenance.py` | Postings mit `u > 2^64` (VarUInt-Codec 0); Differenztest, ohne externe Referenzimplementierung übersprungen |
 
 ---
 
@@ -604,41 +608,46 @@ für rein native Abschnitte frei und überbrückt Python-Plugins.
 
 ### 4.2 Module des Rust-Kerns
 
-| Modul | Zeilen (ca.) | Aufgabe |
+Zeilenzahlen: physische Zeilen der Quelldateien in NHyDB 0.27.0 (`wc -l`,
+einschließlich Kommentaren und Unit-Tests); sie dienen nur der Orientierung.
+
+| Modul | Zeilen | Aufgabe |
 |---|---:|---|
-| `nat.rs` | 460 | Zahltyp `Nat`, VarUInt/VarInt-Kodierung |
-| `val.rs` | 930 | dynamischer Werttyp `Val` (None/Bool/Int/Big/Float/Str/Bytes/List/Map), Python-kompatibles JSON |
-| `address.rs` | 410 | Adressmathematik (Abschnitt 3) |
-| `codec.rs` | 480 | 15 Datentypen, `FieldDef`, Wert-Kodierung/-Dekodierung |
-| `schema.rs` | 590 | `ShapeDef`, `RealmDef`, `ExtensionDef`, `LayoutDef`, `IndexDef` |
-| `format.rs` | 220 | Superblock, Blockheader, Blocktypen, Konstanten |
-| `storage.rs` | 150 | Append-Puffer, positionsbasiertes Lesen, Sync |
-| `platform.rs` | 420 | OS-Schicht: Durability, Verzeichnis-Sync, atomarer Austausch, Sperren |
-| `config.rs` | 240 | `nhydb_config.toml` |
-| `crypto.rs` | 160 | AES-256-GCM, HMAC-SHA256, SHA-256, Base64, UUIDv4 |
-| `unicode.rs` + `unicode_tables.rs` | 180 + generiert | CPython-exakte Zeichenklassen und `casefold` (Unicode 16.0.0) |
-| `zlib.rs` | 50 | zlib-Kompression der Postings |
-| `plugin.rs` | 50 | Trait `LayoutPlugin` für CUSTOM-Layouts |
-| `setops.rs` | 100 | sortierte Mengenoperationen (galoppierender Schnitt) |
-| `textindex.rs` | 630 | Tokenizer, N-Gramme, FULLTEXT-Codecs, Phrase, BM25 |
-| `mathexpr.rs` | 1 940 | MATH-Ausdruckssprache, `MathMap`, `MathMapLayoutSpec`, `dry_run` |
-| `mathlayout.rs` | 550 | Realmplaner für MATH-Layouts |
-| `query.rs` | 2 400 | QueryEngine: Ausdrucksbaum, Planer, Auswertung, Aggregation, Suche |
-| `sql.rs` | 1 250 | NHySQL-0.24: Lexer, Parser, Compiler |
-| `db/mod.rs` | 1 200 | `Db`: Zustand, Öffnen, Commit, Blöcke, Open-Scan |
-| `db/system.rs` | 400 | R0,u1, Schlüssel-/Plan-Dateien, Schema-Snapshot |
-| `db/schema_ops.rs` | 430 | Realms, Shapes, Extensions, Indexdefinitionen |
-| `db/layout.rs` | 1 450 | Layouts, SpaceMaps, Routing, Evolution, logische Adressen |
+| `lib.rs` | 50 | Crate-Wurzel, öffentliche Re-Exporte |
+| `error.rs` | 155 | Fehlertyp `Error` (Abbildung auf die Python-Ausnahmen) |
+| `nat.rs` | 458 | Zahltyp `Nat`, VarUInt/VarInt-Kodierung |
+| `val.rs` | 927 | dynamischer Werttyp `Val` (None/Bool/Int/Big/Float/Str/Bytes/List/Map), Python-kompatibles JSON |
+| `address.rs` | 411 | Adressmathematik (Abschnitt 3) |
+| `codec.rs` | 479 | 15 Datentypen, `FieldDef`, Wert-Kodierung/-Dekodierung |
+| `schema.rs` | 585 | `ShapeDef`, `RealmDef`, `ExtensionDef`, `LayoutDef`, `IndexDef` |
+| `format.rs` | 217 | Superblock, Blockheader, Blocktypen, Konstanten |
+| `storage.rs` | 147 | Append-Puffer, positionsbasiertes Lesen, Sync |
+| `platform.rs` | 425 | OS-Schicht: Durability, Verzeichnis-Sync, atomarer Austausch, Sperren |
+| `config.rs` | 242 | `nhydb_config.toml` |
+| `crypto.rs` | 161 | AES-256-GCM, HMAC-SHA256, SHA-256, Base64, UUIDv4 |
+| `unicode.rs` + `unicode_tables.rs` | 180 + 17 (generierte Tabellen, sehr lange Zeilen) | CPython-exakte Zeichenklassen und `casefold` (Unicode 16.0.0) |
+| `zlib.rs` | 53 | zlib-Kompression der Postings |
+| `plugin.rs` | 46 | Trait `LayoutPlugin` für CUSTOM-Layouts |
+| `setops.rs` | 96 | sortierte Mengenoperationen (galoppierender Schnitt) |
+| `textindex.rs` | 625 | Tokenizer, N-Gramme, FULLTEXT-Codecs, Phrase, BM25 |
+| `mathexpr.rs` | 1 942 | MATH-Ausdruckssprache, `MathMap`, `MathMapLayoutSpec`, `dry_run` |
+| `mathlayout.rs` | 546 | Realmplaner für MATH-Layouts |
+| `query.rs` | 2 397 | QueryEngine: Ausdrucksbaum, Planer, Auswertung, Aggregation, Suche |
+| `sql.rs` | 1 252 | NHySQL: Lexer, Parser, Compiler |
+| `db/mod.rs` | 1 197 | `Db`: Zustand, Öffnen, Commit, Blöcke, Open-Scan |
+| `db/system.rs` | 397 | R0,u1, Schlüssel-/Plan-Dateien, Schema-Snapshot |
+| `db/schema_ops.rs` | 427 | Realms, Shapes, Extensions, Indexdefinitionen |
+| `db/layout.rs` | 1 451 | Layouts, SpaceMaps, Routing, Evolution, logische Adressen |
 | `db/dense.rs` | 620 | Dense-BASE-Records |
-| `db/sparse.rs` | 560 | Sparse-Zellen |
-| `db/vindex.rs` | 550 | v-Index je u-Gruppe (gezielter Sparse-Zugriff) |
-| `db/interval.rs` | 150 | Intervallindex mit Präfixmaximum |
-| `db/read.rs` | 830 | Lese-APIs, geometrisches GET |
-| `db/materialize.rs` | 370 | Iteration materialisierter Zellen, `record_N` |
+| `db/sparse.rs` | 555 | Sparse-Zellen |
+| `db/vindex.rs` | 554 | v-Index je u-Gruppe (gezielter Sparse-Zugriff) |
+| `db/interval.rs` | 152 | Intervallindex mit Präfixmaximum |
+| `db/read.rs` | 828 | Lese-APIs, geometrisches GET |
+| `db/materialize.rs` | 374 | Iteration materialisierter Zellen, `record_N` |
 | `db/cursor.rs` | 330 | Lazy-Cursor für `range`, `select`, `find`, Sparse-Punkte |
-| `db/columns.rs` | 490 | spaltenweises Schreiben/Lesen (NumPy-Pfade) |
-| `db/index.rs` | 1 160 | Indexaufbau, Verzeichnisse, Kandidaten |
-| `db/math.rs` | 550 | MATH-API im Kern, Rollback |
+| `db/columns.rs` | 489 | spaltenweises Schreiben/Lesen (NumPy-Pfade) |
+| `db/index.rs` | 1 155 | Indexaufbau, Verzeichnisse, Kandidaten |
+| `db/math.rs` | 553 | MATH-API im Kern, Rollback |
 | `db/maint.rs` | 1 060 | Checkpoint, Verify, Health, Stats, Repair, Kompaktierung |
 
 ### 4.3 PyO3-Schicht `nhydb-py`
@@ -742,9 +751,9 @@ Der jeweils **neueste** Zustand (höchste Block-ID) gewinnt.
 ### 5.3 Extensions und BASE-Grenze
 
 Extensions sind deklarierte Zusatzfelder eines Realms an einem `v` oberhalb
-der BASE-Felder. Sie werden als Sparse-Zellen gespeichert (der historische
-EXT-Bereich `0xEA` in Dense-Records wird nur noch gelesen, nicht mehr
-geschrieben). `define_extension`, `put_extensions`, `put_extension_list` und
+der BASE-Felder. Sie werden als Sparse-Zellen gespeichert (ein optionaler
+EXT-Bereich `0xEA` in Dense-Records wird beim Lesen unterstützt, von der
+Engine aber nicht geschrieben). `define_extension`, `put_extensions`, `put_extension_list` und
 `put_extension_range` arbeiten auf dieser Ebene. `base_reserve_to` reserviert
 einen `v`-Bereich für künftige BASE-Felder.
 
@@ -918,9 +927,9 @@ records                 Record i = Bytes [off[i], off[i+1])
 
 Ein Record enthält die BASE-Felder in Shape-Reihenfolge (feste Typen LE,
 `varuint`/`varint`, `utf8`/`bytes` als `vu(len)` + Bytes, `bool` 1 Byte).
-Ein optionaler historischer EXT-Bereich
-`0xEA vu(count) (vu(Δv<<1 | has_value) [wert])*` wird gelesen, aber nicht
-mehr geschrieben. Wegen der 32-Bit-Offsets darf der Recordbereich eines
+Ein optionaler EXT-Bereich
+`0xEA vu(count) (vu(Δv<<1 | has_value) [wert])*` wird beim Lesen
+unterstützt, aber nicht geschrieben. Wegen der 32-Bit-Offsets darf der Recordbereich eines
 Batches höchstens 4 GiB umfassen
 (`ValueError("a DATA batch may contain at most 4 GiB of record data")`).
 
@@ -967,8 +976,8 @@ Diagnosezwecke (`health` meldet eine Warnung, wenn keiner existiert).
 
 ### 7.10 Speicherbedarf
 
-Gemessene Dateigrößen (Abschnitt 18.5): 1 Mio. KQ-Datensätze BASE_ONLY
-≈ 23,4 MB (≈ 23,4 Byte je Record bei 11 Feldern), SPARSE_MIX zusätzlich
+Gemessene Dateigrößen des Kernbenchmarks (Abschnitt 18.5): 1 Mio.
+KQ-Datensätze BASE_ONLY ≈ 23,4 MB (≈ 23,4 Byte je Record bei 11 Feldern), SPARSE_MIX zusätzlich
 ≈ 9,78 Byte je materialisierter Extension-Zelle. Diese Werte gelten nur für
 das jeweilige Benchmark-Schema.
 
@@ -1176,7 +1185,9 @@ Speicherbedarf ist unabhängig von der Ergebnisgröße.
 * `fsync` ist der gewöhnliche Datei-Sync des Betriebssystems und wird auf Unix über
   `libc::fsync` aufgerufen – bewusst **nicht** über
   `std::fs::File::sync_all`, das auf Apple-Plattformen intern `F_FULLFSYNC`
-  verwendet (gemessene Halbierung des Schreibdurchsatzes).
+  verwendet und damit bereits dem Modus `full` entspräche (im Kernbenchmark,
+  Abschnitt 18.5, liegt der Schreibdurchsatz mit `full` je nach Szenario um
+  rund 30–60 % niedriger).
 * Auf macOS garantiert `fsync(2)` nur die Übergabe an das Laufwerk, nicht das
   Leeren seines Schreibcaches; `full` garantiert zusätzlich das Leeren.
 * Unter Linux und Windows führt `full` denselben Aufruf aus wie `fsync`
@@ -1260,7 +1271,7 @@ db.register_layout_plugin(name, obj)
 Das Objekt kann die optionalen Methoden `logical_address`, `describe`,
 `type_of`, `spacemap` und `occupied_addresses(db, layout, object_id, lane)`
 besitzen; fehlende Methoden werden per `hasattr`
-erkannt und durch dokumentiertes Fallback-Verhalten ersetzt. Im Kern ist die
+erkannt; die Engine verwendet dann ihr eingebautes Standardverhalten. Im Kern ist die
 Schnittstelle das Trait `LayoutPlugin` (`plugin.rs`); die PyO3-Schicht
 stellt eine Brücke für Python-Objekte bereit.
 
@@ -1269,7 +1280,7 @@ stellt eine Brücke für Python-Objekte bereit.
   fehl; die Logik wird nicht simuliert.
 * **Einschränkung:** Rückrufe eines Plugins in dieselbe Datenbank während
   eines laufenden Schreibvorgangs (`put_object`, `put_objects_batch`,
-  `delete_object` …) werden nicht unterstützt und mit einem PyO3-Borrow-Fehler
+  `delete_record` …) werden nicht unterstützt und mit einem PyO3-Borrow-Fehler
   (`RuntimeError`) abgewiesen. Lesende Rückrufe außerhalb von
   Schreibvorgängen funktionieren.
 
@@ -1482,7 +1493,7 @@ spec = MathMapLayoutSpec("grid", m, 4096)      # realm_auto_limit = 4096
 | `put_math_numpy(layout_id, inputs, payloads, …)` | NumPy-Variante (Abschnitt 16.6) |
 | `put_math(layout_id, inputs, payload, …)` | eine Zeile; Rückgabe der physischen Adresse |
 | `get_math(layout_id, inputs)` | Wert oder `None` (allokiert nie) |
-| `get_math_cell(layout_id, inputs, dyn_address=False)` | Zellen-Dict mit `_math_layout_id`, `_logical_realm`, `_V_global`, `_math_inputs` |
+| `get_math_cell(layout_id, inputs, *, dyn_address=False)` | Zellen-Dict mit `_math_layout_id`, `_logical_realm`, `_V_global`, `_math_inputs` |
 | `describe_math(layout_id)` | Zustand, Mapping, RealmMap, Anzahl Zellen |
 
 ### 13.6 Ablauf von `put_math_batch`
@@ -1695,8 +1706,8 @@ Prüfung von R0, Schlüssel und Plan – abgeschnitten; ihre Anzahl steht in
 | `stats()` | Datei, Format, Realms, Shapes, Layouts, Extensions, Indizes (inkl. `kind`, `options`, `distinct_values`), `max_db_size_bytes`, MATH-Layouts |
 | `checkpoint()` | CHECKPOINT-Block + Commit |
 | `NHyDB.inspect_tail(path)` | prüft den physischen Dateischwanz ohne Öffnen (Header-, Payload-CRC) |
-| `NHyDB.repair_file(path, apply=False, make_backup=True, rebuild_indexes=True, …)` | schneidet einen defekten Schwanz ab und setzt beide Superblöcke neu |
-| `NHyDB.compact_file(path, output=None, make_backup=True, rebuild_indexes=True, batch_records=10000, …)` | schreibt den logischen Zustand neu |
+| `NHyDB.repair_file(path, *, apply=False, make_backup=True, rebuild_indexes=True, …)` | schneidet einen defekten Schwanz ab und setzt beide Superblöcke neu |
+| `NHyDB.compact_file(path, *, output=None, make_backup=True, rebuild_indexes=True, batch_records=10000, …)` | schreibt den logischen Zustand neu |
 
 ### 15.4 Repair
 
@@ -1759,17 +1770,23 @@ Benutzerprofils. Geheimschlüssel gehören nie in die Konfigurationsdatei.
 | `nhydb.mathlayout` | Realmplaner (`plan_math_realms`, `validate_plan`, `resolve_math_target`, …) |
 | `nhydb.query` | `Q`, Ausdrucksklassen, native `QueryEngine`, `expr_from_spec`, `parse_sql`, SQL-Dataclasses, CLI |
 
-Modulkonstanten: `REALM_SPAN`, `ENGINE_VERSION` (`"0.27"`),
-`FILE_FORMAT_VERSION` (`"0.16"`), `TYPE_CODES`.
+Modulkonstanten von `nhydb`: `REALM_SPAN` (`10**100`), `ENGINE_VERSION`
+(`"0.27.0"`, die Produktversion), `FILE_FORMAT_VERSION` (`"0.16"`, interne
+Kennung des Dateiformats), `TYPE_CODES`. `nhydb.query` stellt zusätzlich
+`QUERY_VERSION` (`"0.27"`) und `SQL_LANGUAGE_VERSION` (`"NHySQL-0.24"`)
+bereit (Abschnitt 18.3).
 
 ### 16.2 Öffnen und Anlegen
 
 ```python
-db = nhydb.NHyDB.create("x.nhydb", overwrite=False, layout_path=None, key_path=None,
+db = nhydb.NHyDB.create("x.nhydb", *, overwrite=False, layout_path=None, key_path=None,
                         config=None, durability=None, lock=None, lock_timeout_ms=None)
-db = nhydb.NHyDB("x.nhydb", strict=True, layout_path=None, key_path=None,
+db = nhydb.NHyDB("x.nhydb", *, strict=True, layout_path=None, key_path=None,
                  config=None, durability=None, lock=None, lock_timeout_ms=None)
 ```
+
+Alle Optionen sind Schlüsselwortargumente. `nhydb.create(...)` und
+`nhydb.open(...)` sind Kurzformen für `NHyDB.create(...)` bzw. `NHyDB(...)`.
 
 Attribute: `path`, `closed`, `durability` (les- und schreibbar),
 `layout_path`, `key_path`, `max_db_size_bytes`, `next_block_id`,
@@ -1853,27 +1870,44 @@ Python-`int` verwenden.
 ### 16.7 Ausnahmehierarchie
 
 ```text
-NHyDBError
-├── CorruptionError
-├── SchemaError
-├── StaleIndexError
-├── RealmLimitError
-└── AddressError
-DatabaseSizeLimitError, DatabaseLockedError
-IndexConfigError (Unterklasse von ValueError)
-MathLayoutError ├── MathLayoutNotFound ├── MappingFrozenError └── MathCellConflictError
-MathError       ├── MathSyntaxError   └── MathDomainError
-LayoutError     ├── LayoutStateError ├── RealmBudgetExceeded ├── StalePlanError └── AllocationConflictError
-QueryError      ├── QueryPlanError   ├── QueryDomainError    └── SQLSyntaxError
-sowie die Builtins ValueError, KeyError, TypeError, FileNotFoundError, FileExistsError
+Exception
+├── NHyDBError
+│   ├── CorruptionError
+│   ├── SchemaError
+│   ├── StaleIndexError
+│   ├── RealmLimitError
+│   ├── AddressError
+│   ├── DatabaseLockedError
+│   ├── DatabaseSizeLimitError
+│   └── MathLayoutError
+│       ├── MathLayoutNotFound
+│       ├── MappingFrozenError
+│       └── MathCellConflictError
+├── MathError
+│   ├── MathSyntaxError
+│   └── MathDomainError
+├── LayoutError                  (Fehler des MATH-Realmplaners)
+│   ├── LayoutStateError
+│   ├── RealmBudgetExceeded
+│   ├── StalePlanError
+│   └── AllocationConflictError
+├── QueryError
+│   ├── QueryPlanError
+│   ├── QueryDomainError
+│   └── SQLSyntaxError
+└── ValueError
+    └── IndexConfigError
 ```
 
-Die genaue Basisklassenzuordnung ist in
-`crates/nhydb-py/src/exceptions.rs` definiert.
+Daneben verwendet die Engine die Builtins `ValueError`, `KeyError`,
+`TypeError`, `FileNotFoundError` und `FileExistsError`. `MathError`,
+`LayoutError` und `QueryError` sind **keine** Unterklassen von `NHyDBError`.
+Definiert ist die Hierarchie in `crates/nhydb-py/src/exceptions.rs`.
 
 ### 16.8 CLI
 
-`python -m nhydb`:
+Das Paket installiert den Befehl `nhydb` (gleichwertig: `python -m nhydb`);
+`nhydb --help` bzw. `nhydb <befehl> --help` zeigen die Optionen.
 
 | Befehl | Zweck |
 |---|---|
@@ -1891,8 +1925,8 @@ Die genaue Basisklassenzuordnung ist in
 `--explain`, `--json`.
 
 ```bash
-python -m nhydb from-n N589
-python -m nhydb get daten.nhydb u5,v2 --realm 1 --mode cell
+nhydb from-n N589
+nhydb get daten.nhydb u5,v2 --realm 1 --mode cell
 python -m nhydb.query daten.nhydb --sql "SELECT COUNT(*) FROM records"
 ```
 
@@ -1967,9 +2001,9 @@ nhydb.NHyDB.compact_file("daten.nhydb")["ok"]                    # True
 |---|---|---|
 | Python | `requires-python = ">=3.9"` (`pyproject.toml`) | für das Python-Paket `nhydb` |
 | NumPy | `numpy>=1.22` | optional (`nhydb[numpy]`), für die NumPy-Batch-API |
-| Rust (Edition 2024, Resolver 3) | Rust ≥ 1.89 | nur für den Build aus dem Quellcode; `std::fs::File::lock` wird für die Sperre benötigt |
+| Rust (Edition 2024, Resolver 3) | aktuelle stabile Toolchain (getestet mit Rust 1.99); mindestens Rust 1.89 | nur für den Build aus dem Quellcode; die Schreibsperre nutzt `std::fs::File::try_lock` (stabil seit Rust 1.89). Unter Windows zusätzlich die *Microsoft C++ Build Tools*, unter macOS die Xcode Command Line Tools |
 | maturin | `maturin>=1.15,<2.0` | Build-Backend, nur für den Build aus dem Quellcode |
-| pytest | `pytest>=7` (Extra `nhydb[test]`) | nur für die Tests |
+| pytest | Extra `nhydb[test]` = `pytest>=7`, `numpy>=1.22`, `cryptography` | nur für die Tests |
 
 ### 17.2 Konfigurationsdatei `nhydb_config.toml`
 
@@ -2029,26 +2063,35 @@ pip install nhydb-0.27.0-<plattform>.whl
 pip install numpy                             # optional, für die NumPy-API
 ```
 
-**Build aus dem Quellcode** (Rust-Toolchain und maturin erforderlich):
+**Build aus dem Quellcode** (Rust-Toolchain erforderlich, siehe `BUILDING.md`):
 
 ```bash
-maturin build --release        # erzeugt ein Wheel unter target/wheels/
-pip install target/wheels/nhydb-0.27.0-*.whl
-# alternativ in einem Schritt:
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install maturin
+maturin build --release --out dist   # Wheel unter dist/
+pip install dist/nhydb-0.27.0-*.whl
+# alternativ Build und Installation in einem Schritt:
 pip install .
 ```
+
+Ein Wheel ist spezifisch für Betriebssystem, CPU-Architektur und
+Python-Version, mit denen es gebaut wurde.
 
 Tests aus dem Quellbaum:
 
 ```bash
-cargo test --workspace
-pip install pytest numpy
-python -m pytest -q tests/python
+cargo test --workspace --release     # Rust-Kern
+pip install ".[test]"                # oder: pip install numpy pytest
+python -m pytest tests/python        # Python-Paket (gegen das installierte Paket)
 ```
 
-Ausführliche Hinweise zu Toolchain, Plattformen und Wheels enthält
-`BUILDING.md`. Das Repository enthält GitHub-Actions-Workflows
-(`.github/workflows/`) für den Bau der Wheels.
+Die Python-Tests importieren das **installierte** Paket, nicht die Quellen
+unter `python/`. Ausführliche Hinweise zu Toolchain, Plattformen und Wheels
+enthält `BUILDING.md`. Die GitHub-Actions-Workflows unter
+`.github/workflows/` führen die Tests aus (`ci.yml`) und bauen Wheels für
+Linux, macOS und Windows (`release.yml`, ausgelöst durch einen Versions-Tag;
+siehe `RELEASING.md`).
 
 ### 17.4 Plattformen
 
@@ -2065,8 +2108,8 @@ UTF-8-JSON) und Layoutplan sind plattformneutral.
 * **Mehrere Prozesse:** genau ein öffnender Prozess je Datenbank (die
   Sperre wird bei jedem Öffnen exklusiv genommen); `lock_timeout_ms` wartet.
 * **Durability:** `fsync` ist Standard; für Schutz gegen Laufwerkscache-Verlust
-  auf macOS `durability="full"` wählen (Schreibdurchsatz etwa halbiert,
-  Abschnitt 18.5).
+  auf macOS `durability="full"` wählen (im Kernbenchmark rund 30–60 %
+  geringerer Schreibdurchsatz, Abschnitt 18.5).
 * **Wartung:** regelmäßig `verify()`/`health()`; vor `repair_file(apply=True)`
   und Kompaktierung Kopien sichern (Backups sind standardmäßig aktiv).
 
@@ -2076,15 +2119,15 @@ UTF-8-JSON) und Layoutplan sind plattformneutral.
 
 ### 18.1 Teststrategie
 
-1. **Unit- und Integrationstests im Kern** (`cargo test --workspace`):
+1. **Unit- und Integrationstests im Kern** (`cargo test --workspace --release`):
    Unit-Tests in `crates/nhydb-core/src/**` sowie die Integrationstests
    `crates/nhydb-core/tests/selftest.rs` und
    `crates/nhydb-core/tests/sparse_access.rs`.
-2. **Python-Tests** (`python -m pytest tests/python`) über das gebaute
+2. **Python-Tests** (`python -m pytest tests/python`) über das installierte
    Paket `nhydb`.
 3. **Erschöpfende Tests** (alle Unicode-Code-Points, Adressbereiche).
-4. **System- und Crash-Fenster-Tests** (Sperren, Plan-vor-Superblock,
-   Manipulation, Konfiguration).
+4. **System- und Crash-Fenster-Tests** (Sperren, Manipulation,
+   Konfiguration, Durability, Repair, Kompaktierung).
 5. **Differenztests** gegen eine externe Referenzimplementierung (gleiche
    Operationsfolgen, Vergleich von Ergebnissen, Plänen, Fehlerklassen und
    -texten). Diese Referenz ist nicht Bestandteil des Repositorys; die
@@ -2092,151 +2135,123 @@ UTF-8-JSON) und Layoutplan sind plattformneutral.
 
 ### 18.2 Testinventar
 
+Rust (`cargo test --workspace --release`): 44 Unit-Tests in
+`crates/nhydb-core/src/**`, 5 Tests in `selftest.rs`, 2 Tests in
+`sparse_access.rs`; die PyO3-Crate `nhydb-py` enthält keine eigenen Tests.
+
 | Datei | Schwerpunkt |
 |---|---|
-| `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), Plan, R0-Kette, Plattform, Konfiguration, SQL-Lexer |
+| `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Nat/VarUInt, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), R0-Kette, Plattform (Sperre, Sync, atomarer Austausch), Konfiguration, Mengenoperationen, Textindex, MATH, SQL-Lexer |
 | `crates/nhydb-core/tests/selftest.rs` | End-to-End im Kern |
 | `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Punkt-/Bereichszugriff gegen unabhängiges Modell und Vollmerge (12 Seeds, `u = 2^70`, `v ≥ 10^40`) |
-| `tests/python/test_math.py` | Adressmathematik, Pflichtbeispiele, Textformen von N-Referenzen, Zufallsadressen und Fehlertexte |
-| `tests/python/test_math_map.py` | MATH-Ausdrücke, MathMap, Realmplaner |
-| `tests/python/test_index.py` | Tokenizer, N-Gramme, FULLTEXT-Codecs, BM25 |
-| `tests/python/test_iterators.py` | Lazy-Iteratoren (`range`/`select`/`find`/`iter_materialized_sparse_points`) |
-| `tests/python/test_kernel.py` | Kernelfunktionen, Unicode (alle Code Points), AES-256-GCM, HMAC/SHA-256, JSON |
-| `tests/python/test_kiss_api.py` | Einzel-API |
+| `tests/python/test_math.py` | Adressmathematik: Ablehnung von GZ/N0, Rechenbeispiel `(23, 14, 744)`; Differenztests (Zufallsadressen, Textformen, Fehlertexte) |
+| `tests/python/test_math_map.py` | MATH-Ausdrücke, MathMap, Realmplaner; Bitgrenze, Rollback von `put_math_batch` bei Größengrenze |
+| `tests/python/test_index.py` | Tokenizer, N-Gramme, FULLTEXT-Codecs, BM25, Indexaufbau (vollständig als Differenztests) |
+| `tests/python/test_iterators.py` | Lazy-Iteratoren (`range`/`find`, Schreiben zwischen Iterationsschritten) |
+| `tests/python/test_kernel.py` | Kernelfunktionen, Unicode-Tabellen gegen das laufende Python (alle Code Points), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
+| `tests/python/test_kiss_api.py` | Einzel-API, Kontextmanager, Durability-Option, Verlust unkommittierter Daten |
 | `tests/python/test_numpy_api.py` | NumPy ≙ Listen-API bytegleich, Dtypes, Endianness, Strides, Fehler ohne Teil-Append |
 | `tests/python/test_numpy_columns.py` | `put_math_numpy`, Abfrageergebnisse als NumPy-Spalten |
-| `tests/python/test_query.py` | QueryEngine mit zufälligen Ausdrucksbäumen (Ergebnisse, Pläne, Fehler) |
-| `tests/python/test_sql.py` | NHySQL: Lexer, Parser, Compiler, Ausführung, Fehlertexte |
-| `tests/python/test_system.py` | R0,u1, externer Layoutplan, fail closed, Crash-Fenster, Sperren, Konfiguration, Durability, Repair, Kompaktierung |
-| `tests/python/test_maintenance.py` | Repair, Superblock-Fallback, Kompaktierung mit Tombstone, `u > 2^64`-Postings, Plugin-Re-Entrancy, CLI |
+| `tests/python/test_query.py` | QueryEngine: Sparse-Überlagerungen über alle Zugriffspfade, große `STRUCT_RANGE`; Differenztests mit zufälligen Ausdrucksbäumen |
+| `tests/python/test_sql.py` | NHySQL über die Query-CLI; Differenztests für Lexer, Parser, Compiler, Ausführung und Fehlertexte |
+| `tests/python/test_system.py` | R0,u1, externer Layoutplan, fail closed, umbenannte DB, Sperre zwischen Prozessen, Konfiguration, Durability `full`, Repair; Differenztests für Crash-Fenster und Kompaktierung |
+| `tests/python/test_maintenance.py` | Repair, Superblock-Fallback, Kompaktierung, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI; Differenztests (Tail-Repair, `u > 2^64`-Postings) |
 
-Einzelne Tests der Dateien `test_math.py`, `test_math_map.py`,
-`test_index.py`, `test_query.py`, `test_sql.py` und `test_kernel.py`
-vergleichen mit der externen Referenzimplementierung bzw. benötigen das
-Paket `cryptography`; sie werden übersprungen, wenn diese nicht verfügbar
-sind.
+Ohne die externe Referenzimplementierung ergab ein Lauf am 2026-10-17
+(macOS, Python 3.14, mit `numpy` und `cryptography`) **53 bestandene und
+152 übersprungene** Testfälle (gezählt einschließlich Parametrisierungen).
+Übersprungen werden ausschließlich die Differenztests in `test_index.py`,
+`test_iterators.py`, `test_maintenance.py`, `test_math.py`,
+`test_math_map.py`, `test_query.py`, `test_sql.py` und `test_system.py`.
+`test_kernel.py` überspringt den AES-GCM-Vergleich, wenn das Paket
+`cryptography` fehlt.
 
 ### 18.3 Versionskennungen
 
 | Kennung | Wert | Bedeutung |
 |---|---|---|
-| Produktversion | `0.27.0` | identisch in Cargo-Workspace (`nhydb-core`, `nhydb-py`), Python-Paket `nhydb` (Version über maturin aus Cargo) und `ENGINE_VERSION` |
-| Dateikennung | `NHYDB016` (`FILE_FORMAT_VERSION = "0.16"`) | interne Kennung des Dateiformats; ändert sich nur bei einer Änderung des Formats auf dem Datenträger, unabhängig von der Produktversion |
-| `QUERY_VERSION` / Sprache `NHySQL-0.24` | `"0.27"` / `NHySQL-0.24` | Kennung der Abfrageschicht (erscheint als `query_version` in Ergebnissen) bzw. des Sprachumfangs von NHySQL; keine Produktversionen |
+| Produktversion | `0.27.0` | identisch in Cargo-Workspace (`nhydb-core`, `nhydb-py`), Python-Paket `nhydb` (Version über maturin aus Cargo) und `nhydb.ENGINE_VERSION` |
+| Dateikennung | `NHYDB016` (`FILE_FORMAT_VERSION = "0.16"`, Blockversion 16) | interne Kennung des Dateiformats; ändert sich nur bei einer Änderung des Formats auf dem Datenträger, unabhängig von der Produktversion |
+| `QUERY_VERSION` | `"0.27"` | Kennung der Abfrageschicht; erscheint als `query_version` in Abfrageergebnissen; keine Produktversion |
+| `SQL_LANGUAGE_VERSION` | `"NHySQL-0.24"` | Kennung des Sprachumfangs von NHySQL; erscheint als `language` in SQL-Ergebnissen; keine Produktversion |
+| Contract-Kennungen | `NHYDB027_R0U1_V1`, `NHYDB027_KEY_V1`, `NHYDB027_EXTERNAL_LAYOUT_V1`, `NHYDB027_SCHEMA_V1`, `NHYDB_DB_CONFIG_V015`, MAC-Domäne `NHYDB027-LAYOUT-MAC:` | feste Bezeichner der JSON-Strukturen bzw. der Schlüsselableitung im Dateiformat (Abschnitte 7.5 und 8.3); die enthaltenen Ziffern sind Teil des Bezeichners, keine Produktversion |
 
 ### 18.4 Lizenz
 
-Siehe Datei `LICENSE`.
+Siehe Datei `LICENSE`. NHyDB steht unter einer eigenen Lizenz, deren
+Bedingungen noch nicht veröffentlicht sind; Rückfragen an
+achim.meissner@nhydb.de.
 
 ### 18.5 Benchmarks
 
-**Messbedingungen (sofern nicht anders angegeben):** MacBook Air M2, macOS,
-Release-Profil (Abschnitt 4.5), Python 3.14, Durability wie angegeben. Die
-Zahlen sind an die jeweiligen Szenarien gebunden und keine allgemeinen
-Leistungszusagen. Messungen auf kleinen Datenmengen schwanken spürbar.
+**Messbedingungen:** gemessen am 2026-10-17 auf einem MacBook Air
+(15 Zoll, Apple M2, 8 Kerne) unter macOS 26.6.2 mit Rust 1.99.0,
+Release-Profil (Abschnitt 4.5), Datenbankdateien auf der internen SSD,
+jeweils ein Einzellauf. Die Zahlen beschreiben nur die genannten
+Szenarien auf diesem System; sie sind **keine** Leistungszusagen. Andere
+Hardware, Dateisysteme und Datenmengen führen zu abweichenden Werten, und
+Wiederholungen schwanken spürbar.
 
 #### Kernbenchmark (reines Rust)
 
-`cargo run --release -p nhydb-core --example bench_native -- 1000000 <dir> fsync|full`;
-KQ-Datensätze (11 Felder), Realm 500, Batch 10 000, Commit alle 10 Batches,
-anschließend `verify`.
+```bash
+cargo run --release -p nhydb-core --example bench_native -- 1000000 <dir> fsync   # bzw. full
+```
 
-| Szenario (1 Mio. Records) | `fsync` | `full` |
-|---|---:|---:|
-| BASE_ONLY | 12,9–14,6 Mio./s | 8,3 Mio./s |
-| RESERVE_ONLY | 18,6 Mio./s | 8,2 Mio./s |
-| DEFINITIONS_EMPTY | 18,7 Mio./s | 8,3 Mio./s |
-| SPARSE_MIX | 5,6 Mio./s | 4,0 Mio./s |
+1 Mio. synthetische Datensätze mit 11 Ganzzahlfeldern („KQ-Datensätze“,
+aus `N` abgeleitete Kennzahlen; Definition in
+`crates/nhydb-core/examples/bench_native.rs`), Realm 500, Batch 10 000,
+Commit alle 10 Batches, anschließend `verify`. Szenarien: BASE_ONLY (nur
+Dense-Records), RESERVE_ONLY (CLASSIC-Layout mit `base_reserve_to = 1000`),
+DEFINITIONS_EMPTY (zusätzlich fünf deklarierte, unbelegte Extensions),
+SPARSE_MIX (zusätzlich 710 000 Sparse-Extension-Zellen).
 
-Kontrolllauf (macOS, `fsync`):
+| Szenario (1 Mio. Records) | Dateigröße | `fsync` | `full` |
+|---|---:|---:|---:|
+| BASE_ONLY | 23 375 280 B | 14,2 Mio. Records/s | 6,9 Mio. Records/s |
+| RESERVE_ONLY | 23 375 304 B | 18,8 Mio. Records/s | 7,7 Mio. Records/s |
+| DEFINITIONS_EMPTY | 23 375 328 B | 18,8 Mio. Records/s | 7,8 Mio. Records/s |
+| SPARSE_MIX | 30 318 768 B | 5,7 Mio. Records/s | 4,1 Mio. Records/s |
+
+Ausgabe des Laufs mit `fsync`:
 
 ```text
 Scenario                     bytes   write s         rec/s    verify s
-BASE_ONLY                 23375280     0.074      13453330       0.003
-RESERVE_ONLY              23375304     0.054      18576512       0.003
-DEFINITIONS_EMPTY         23375328     0.054      18545046       0.003
-SPARSE_MIX                30318768     0.177       5645275       0.011
+BASE_ONLY                 23375280     0.070      14188866       0.003
+RESERVE_ONLY              23375304     0.053      18808587       0.003
+DEFINITIONS_EMPTY         23375328     0.053      18805683       0.003
+SPARSE_MIX                30318768     0.175       5722328       0.011
 ```
 
-#### KQ-Szenarien über die Python-API
+#### MATH im Kern
 
-KQ-Skripte über die Python-API mit 1 Mio. Records; Wandzeit inklusive
-Python-seitiger Datenerzeugung der Skripte.
+```bash
+cargo run --release -p nhydb-core --example bench_math -- 200000 <dir>
+```
 
-| Skript / Szenario | `fsync` | `full` |
-|---|---:|---:|
-| extension: BASE_ONLY (Schreiben) | 5,25 Mio./s | 5,20 Mio./s |
-| extension: SPARSE_MIX (Schreiben) | 2,43 Mio./s | 2,31 Mio./s |
-| extension: Datendatei BASE / SPARSE_MIX | 22,29 / 28,91 MiB | gleich |
-| hyperraum: CLASSIC | 4,99 Mio./s | 4,94 Mio./s |
-| hyperraum: COLUMN | 0,97 Mio./s | 0,96 Mio./s |
-| hyperraum: PACKED | 0,90 Mio./s | 0,89 Mio./s |
-| hyperraum: Gesamtlaufzeit | 3,6 s | 3,7 s |
+200 000 Zeilen mit zwei Eingaben, 8 logische Realms, Payload-Typ `varint`,
+`put_math_batch` mit Commit (Durability `fsync`), `get_math` für jede
+zehnte Zeile.
 
-#### Abfragen, SQL, Indizes, MATH
-
-QueryEngine, 20 000 Records:
-
-| Abfrage (20 k Records) | Zeit |
+| Operation | Durchsatz |
 |---|---:|
-| COUNT über VALUE (POSTING_COUNT) | 0,003 ms |
-| AND zweier Indizes (CLASSIC_U) | 0,04 ms |
-| fields LIMIT 20 (CLASSIC_U) | 0,04 ms |
-| fields ORDER BY −amount LIMIT 10 | 0,39 ms |
-| TOKEN tokens_all | 0,04 ms |
-| Scan `contains` ohne Index | 22 ms |
-| NOT über das Universum | 24 ms |
-| Aggregat GROUP BY | 61 ms |
-| STRUCT_RANGE 1000 u | 4,9 ms |
-| Formel-Provider ∧ Index | 4,4 ms |
-| BM25 Top 10 | 1,4 ms |
+| `MathMap.target` (Zielberechnung) | 1,77 Mio./s |
+| `put_math_batch` | 852 000 Zeilen/s |
+| `get_math` | 645 000 Abfragen/s |
 
-NHySQL, 20 000 Records:
-
-| Statement (20 k Records) | Zeit |
-|---|---:|
-| `parse_sql` (komplexes SELECT) | 0,023 ms |
-| `COUNT(*)` mit Index | 0,009 ms |
-| fields ORDER BY LIMIT 10 | 0,41 ms |
-| GROUP BY über alle Records | 57 ms |
-| TOKEN ∧ Bereich (Scan) | 23 ms |
-| BM25 `relevance` Top 10 | 1,4 ms |
-
-Indexaufbau (100 000 Records, 5 Indizes, 4 Familien): `build_indexes`
-0,43 s (mit Sparse-Daten 0,45 s).
-
-MATH (200 000 Zeilen, 8 logische Realms, `fsync`):
-
-| Operation (200 k Zeilen) | Durchsatz |
-|---|---:|
-| `put_math_batch` (aus Python) | 590 k/s |
-| `put_math_numpy` | 636 k/s |
-| `get_math` (aus Python) | 544 k/s |
-| `MathMap.target` (Kern) | 1,73 Mio./s |
-
-#### Öffnen und Commit
-
-Öffnen einer 30-MB-Datenbank (1 Mio. Records + 710 k Sparse-Zellen, inkl.
-Schlüssel, MAC, AES-GCM): 0,4 ms. Schema-Commit
-0,8 ms, normaler Commit 0,08 ms (`fsync`).
-
-Weiteres Benchmark-Programm: `crates/nhydb-core/examples/bench_math.rs`
-(MATH im Kern).
-
----
-
-## 19. Bekannte Einschränkungen und offene Punkte
+## 19. Bekannte Einschränkungen
 
 ### 19.1 Einschränkungen
 
 | Thema | Stand |
 |---|---|
 | Nutzdatenverschlüsselung | Nur der Layoutplan ist verschlüsselt; Daten in `X.nhydb` liegen im Klartext |
-| Nebenläufigkeit | ein öffnender Prozess je Datenbank; kein geteilter Lesemodus, keine Mehrprozess-Transaktionen |
+| Schlüsseldatei | ohne die passende `*.layout.key` lässt sich die Datenbank nicht öffnen (fail closed); ein verlorener Schlüssel kann nicht wiederhergestellt werden |
+| Nebenläufigkeit | ein öffnender Prozess je Datenbank (exklusive Sperre `<db>.lock`, auch innerhalb eines Prozesses nur ein offenes Objekt je Datei); kein geteilter Lesemodus, keine Mehrprozess-Transaktionen |
 | Transaktionen | keine explizite Transaktions-API; Atomarität über die Commit-Grenze; Mehrblock-Operationen nicht als Ganzes atomar (Ausnahme: `put_math_batch` mit Rollback) |
 | Kontextmanager | `__exit__` committet auch nach einer Ausnahme im `with`-Block |
 | Plugins | Rückrufe in dieselbe DB während eines Schreibvorgangs nicht unterstützt (`RuntimeError`); CUSTOM-Logik muss zur Laufzeit registriert werden |
-| `[cache]`-Konfiguration | Schlüssel werden geparst, aber nicht angewendet (fest: 64 MiB Block-Cache, 4 194 304 Sprungmarken, 4 096 v-Indizes); der Wert `vindex_max_marks = 4000000` im Konfigurationsbeispiel weicht vom einkompilierten Wert ab |
+| `[cache]`-Konfiguration | Schlüssel werden geparst und validiert, aber von der Engine noch nicht verwendet (fest: 64 MiB Block-Cache, 4 194 304 Sprungmarken, 4 096 v-Indizes); der Wert `vindex_max_marks = 4000000` im Konfigurationsbeispiel weicht vom einkompilierten Wert ab |
 | Parameter `strict` | wird gespeichert, beeinflusst den Öffnungspfad in NHyDB 0.27.0 aber nicht; das Öffnen ist immer fail closed |
 | Ältere Formatrevisionen | Dateien mit einer anderen Dateikennung als `NHYDB016` sind nicht lesbar; kein Konverter |
 | ID-Bereiche | `shape_id`, `layout_id`, `index_id`, `block_id` ≤ 2^64−1; Enum-Codes `i64`; mathematische Koordinaten unbeschränkt |
@@ -2244,7 +2259,8 @@ Weiteres Benchmark-Programm: `crates/nhydb-core/examples/bench_math.rs`
 | Dense-Batch | Recordbereich ≤ 4 GiB je Block |
 | Plan-Generationen | nur zwei Generationen im Plan; Superblock-Rückfall über mehr als eine Schema-Generation ⇒ fail closed |
 | Repair | kann intakte, unkommittierte Blöcke dauerhaft machen |
-| Plattformen | primär auf macOS getestet |
+| Durability `full` | macOS: `F_FULLFSYNC`, bei fehlender Unterstützung des Dateisystems ein Fehler (kein stiller Rückfall); Linux: `fsync(2)`; Windows: `FlushFileBuffers` (Abschnitt 9.6) |
+| Plattformen | primär auf macOS (Apple Silicon) entwickelt und getestet; Wheels für Linux und Windows werden per CI gebaut und getestet |
 | NHySQL | nur lesend, nur CLASSIC-Quellen; `DISTINCT`, `HAVING` nicht implementiert |
 | Volltextsuche | `search` setzt einen frischen FULLTEXT-Index voraus (kein Scan-Fallback) |
 
@@ -2253,14 +2269,9 @@ Weiteres Benchmark-Programm: `crates/nhydb-core/examples/bench_math.rs`
 Fehler aus intern verwendeten Bibliotheken erscheinen mit der passenden
 NHyDB-Fehlerklasse und eigenem Text, z. B.
 `CorruptionError("layout plan: decryption/authentication failed (invalid AES-GCM tag)")` bei einem
-nicht entschlüsselbaren Layoutplan oder „invalid syntax (<unknown>, line 1)“
-bei Syntaxfehlern in MATH-Ausdrücken.
-
-### 19.3 Bekannte Optimierungspotenziale
-
-* Generische Aggregation über `Q.all()` auf CLASSIC nutzt noch nicht den
-  Spaltenpfad.
-* Weitere Optimierung von `get()`/`get_n` und des Kaltstarts des v-Index.
+nicht entschlüsselbaren Layoutplan oder
+`MathSyntaxError("invalid syntax (<unknown>, line 1)")` bei Syntaxfehlern in
+MATH-Ausdrücken. Alle Fehlertexte der Engine sind englisch.
 
 ---
 

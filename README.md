@@ -97,16 +97,14 @@ set via an optional `nhydb_config.toml`; see
   file system does not support it (no silent fallback); Linux uses `fsync(2)`,
   Windows `FlushFileBuffers`.
 * **Configuration:** the `[cache]` keys are accepted but not yet used by the
-  engine.
+  engine; the open parameter `strict` currently has no effect.
 * **Platforms:** developed and tested primarily on macOS (Apple Silicon);
   Linux and Windows wheels are built and tested by CI.
-* **Documentation:** the complete technical reference is currently available
-  in German only.
 
 ## Documentation
 
-* [`docs/de/`](docs/de/) – technical reference documentation (German)
-* [`docs/en/`](docs/en/) – English documentation (in preparation)
+* [Technical documentation (English)](docs/en/NHyDB_Technical_Documentation.md)
+* [Technische Dokumentation (Deutsch)](docs/de/NHyDB_Technische_Dokumentation.md)
 * [`BUILDING.md`](BUILDING.md) – building wheels from source
 * [`RELEASING.md`](RELEASING.md) – versioning and release procedure
 * [`CHANGELOG.md`](CHANGELOG.md)
