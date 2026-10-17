@@ -142,6 +142,11 @@ purposes (unlimited for private individuals, time-limited for teaching,
 research and businesses), and **production use is not permitted** without a separate written license. Please read the
 license text before using the software.
 
+The compiled extension module contains third-party Rust components (all
+under MIT/Apache-2.0-style licenses); their notices are in
+[`THIRD-PARTY-LICENSES.txt`](THIRD-PARTY-LICENSES.txt), which is also shipped
+inside the wheel.
+
 ## Contact
 
 Achim Meissner – achim.meissner@nhydb.de

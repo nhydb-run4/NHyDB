@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "nhydb"
 description = "NHyDB – general-purpose database with mathematical cell addressing (R, u, v, lane); native Rust engine with Python bindings"
 readme = "README.md"
-license-files = ["LICENSE.md"]
+license-files = ["LICENSE.md", "THIRD-PARTY-LICENSES.txt"]
 authors = [{ name = "Achim Meissner", email = "achim.meissner@nhydb.de" }]
 requires-python = ">=3.9"
 keywords = ["database", "storage-engine", "rust", "numpy", "append-only"]

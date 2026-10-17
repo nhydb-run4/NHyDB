@@ -23,6 +23,9 @@ the format changes (`crates/nhydb-core/src/format.rs`).
 1. Update `version` in `Cargo.toml` and run `cargo update -w` so that
    `Cargo.lock` follows.
 2. Add a section to `CHANGELOG.md`.
+   If dependencies changed (`Cargo.lock`), regenerate the third-party
+   notices: `cargo fetch && python tools/gen_third_party_licenses.py`, and
+   commit `THIRD-PARTY-LICENSES.txt`.
 3. Build and test locally (see [BUILDING.md](BUILDING.md)).
 4. Commit and tag:
 
