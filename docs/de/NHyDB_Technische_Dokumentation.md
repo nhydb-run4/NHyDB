@@ -2146,7 +2146,7 @@ Rust (`cargo test --workspace --release`): 50 Unit-Tests in
 | `tests/python/test_math_map.py` (5) | MATH-Ausdrücke, Abbildungsziele einer MathMap, MATH-Layout schreiben/lesen/wieder öffnen, Bitgrenze, Rollback von `put_math_batch` bei Größengrenze |
 | `tests/python/test_index.py` (4) | Aufbau von VALUE-, TOKEN-, TRIGRAM- und FULLTEXT-Indizes, Gleichheits- und Bereichssuche, Token-/Teilstring-/Volltextkandidaten, Erkennung und Neuaufbau veralteter Indizes |
 | `tests/python/test_iterators.py` (3) | Lazy-Iteratoren (`range`/`find`, Schreiben zwischen Iterationsschritten) |
-| `tests/python/test_kernel.py` (7) | Kernelfunktionen, Unicode-Tabellen gegen das laufende Python (alle Code Points), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
+| `tests/python/test_kernel.py` (8) | Kernelfunktionen, Unicode-16.0.0-Referenzwerte (alle Python-Versionen), Unicode-Tabellen gegen das laufende Python über alle Code Points (nur wenn es ebenfalls Unicode 16.0.0 verwendet, also CPython 3.14), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
 | `tests/python/test_kiss_api.py` (6) | Einzel-API, Kontextmanager, Durability-Option, Verlust unkommittierter Daten |
 | `tests/python/test_numpy_api.py` (7) | NumPy ≙ Listen-API bytegleich, Dtypes, Endianness, Strides, Fehler ohne Teil-Append |
 | `tests/python/test_numpy_columns.py` (5) | `put_math_numpy`, Abfrageergebnisse als NumPy-Spalten |
@@ -2156,9 +2156,14 @@ Rust (`cargo test --workspace --release`): 50 Unit-Tests in
 | `tests/python/test_maintenance.py` (9) | Repair, Superblock-Fallback, Kompaktierung, Freigabe des Dateihandles bei `close`, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI |
 
 Ein Lauf am 2026-10-18 (macOS, Python 3.14, mit `numpy` und
-`cryptography`) ergab **72 bestandene Python-Testfälle** (gezählt
+`cryptography`) ergab **73 bestandene Python-Testfälle** (gezählt
 einschließlich Parametrisierungen) ohne übersprungene Tests, dazu 57
-bestandene Rust-Tests. Unter Windows wird
+bestandene Rust-Tests. Die Unicode-Tabellen der Engine sind fest auf
+Unicode 16.0.0 (CPython 3.14) festgelegt, unabhängig vom laufenden Python.
+Unter CPython 3.9–3.13 (Unicode 13.0–15.1) werden deshalb die beiden
+vollständigen Vergleiche gegen das laufende `unicodedata` übersprungen
+(71 bestanden, 2 übersprungen); die festen Unicode-16.0.0-Referenzwerte
+werden auf jeder Version geprüft. Unter Windows wird
 `test_failed_append_is_rolled_back` übersprungen, weil er die
 POSIX-Dateigrößengrenze (`RLIMIT_FSIZE`) benötigt; dieselbe Eigenschaft
 (kein Teilblock nach einem Schreibfehler) prüft auf allen Plattformen der

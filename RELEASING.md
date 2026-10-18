@@ -48,7 +48,7 @@ the format changes (`crates/nhydb-core/src/format.rs`).
    * checks the complete file set (`tools/check_dist.py`) and the package
      metadata (`twine check`),
    * installs the wheels and runs the Python tests on every platform with
-     Python 3.9 and 3.14,
+     every supported Python version (3.9–3.14, 30 jobs),
    * creates a **draft** GitHub release with all files. If a release for
      the tag already exists, the job fails and changes nothing.
 7. Check the draft release on GitHub and publish it.

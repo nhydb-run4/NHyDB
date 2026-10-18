@@ -2140,7 +2140,7 @@ Rust (`cargo test --workspace --release`): 50 unit tests in
 | `tests/python/test_math_map.py` (5) | MATH expressions, mapping targets of a MathMap, writing/reading/reopening a MATH layout, bit limit, rollback of `put_math_batch` at the size limit |
 | `tests/python/test_index.py` (4) | construction of VALUE, TOKEN, TRIGRAM and FULLTEXT indexes, equality and range lookup, token/substring/full-text candidates, detection and rebuild of stale indexes |
 | `tests/python/test_iterators.py` (3) | lazy iterators (`range`/`find`, writing between iteration steps) |
-| `tests/python/test_kernel.py` (7) | kernel functions, Unicode tables against the running Python (all code points), AES-256-GCM against `cryptography`, plan MAC, JSON |
+| `tests/python/test_kernel.py` (8) | kernel functions, Unicode 16.0.0 reference values (all Python versions), Unicode tables against the running Python over all code points (only where it also uses Unicode 16.0.0, i.e. CPython 3.14), AES-256-GCM against `cryptography`, plan MAC, JSON |
 | `tests/python/test_kiss_api.py` (6) | single-item API, context manager, durability option, loss of uncommitted data |
 | `tests/python/test_numpy_api.py` (7) | NumPy ≙ list API byte-identical, dtypes, endianness, strides, errors without partial append |
 | `tests/python/test_numpy_columns.py` (5) | `put_math_numpy`, query results as NumPy columns |
@@ -2150,8 +2150,13 @@ Rust (`cargo test --workspace --release`): 50 unit tests in
 | `tests/python/test_maintenance.py` (9) | repair, superblock fallback, compaction, file handle release on `close`, rolled-back appends, manipulated headers, plugin re-entrancy, CLI |
 
 A run on 2026-10-18 (macOS, Python 3.14, with `numpy` and
-`cryptography`) yielded **72 passed Python test cases** (counted including
+`cryptography`) yielded **73 passed Python test cases** (counted including
 parametrizations) with no skipped tests, plus 57 passed Rust tests.
+The engine's Unicode tables are fixed to Unicode 16.0.0 (CPython 3.14),
+independent of the running Python. On CPython 3.9–3.13 (Unicode 13.0–15.1)
+the two exhaustive comparisons against the running `unicodedata` are
+therefore skipped (71 passed, 2 skipped); the fixed Unicode 16.0.0 reference
+values are checked on every version.
 On Windows, `test_failed_append_is_rolled_back` is skipped because it needs
 the POSIX file size limit (`RLIMIT_FSIZE`); the same property (no partial
 block after a write error) is checked on all platforms by the Rust test
