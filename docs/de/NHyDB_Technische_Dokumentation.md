@@ -1210,7 +1210,7 @@ Speicherbedarf ist unabhängig von der Ergebnisgröße.
 | `NHyDB(path, …)` / `nhydb.open` | öffnet fail closed (Abschnitt 8.4) |
 | `commit()` | Commit-Protokoll; Rückgabe: Commit-Grenze |
 | `sync(hard=False)` | Puffer schreiben, optional Datei-Sync – **kein** Superblock-Commit |
-| `close(commit=True)` | optional Commit, danach Dateihandle und Sperre freigeben (sofort, nicht erst bei der Objekt-Freigabe); anschließend löst jeder Dateizugriff `NHyDBError` ("database is closed") aus; wiederholte Aufrufe sind wirkungslos; schlägt der Commit fehl, bleibt die Datenbank geöffnet (erneuter Versuch oder `close(commit=False)`); `close(commit=False)` gibt Handle und Sperre auch dann frei, wenn das Schreiben des Puffers fehlschlägt |
+| `close(commit=True)` | optional Commit, danach Dateihandle und Sperre freigeben (sofort, nicht erst bei der Objekt-Freigabe); anschließend löst jede Operation, die die Datei benötigt, `NHyDBError` ("database is closed") aus; bereits im Arbeitsspeicher-Cache gehaltene Werte können weiterhin zurückgegeben werden, ein geschlossenes Objekt sollte daher nicht mehr zum Lesen verwendet werden; wiederholte Aufrufe sind wirkungslos; schlägt der Commit fehl, bleibt die Datenbank geöffnet (erneuter Versuch oder `close(commit=False)`); `close(commit=False)` gibt Handle und Sperre auch dann frei, wenn das Schreiben des Puffers fehlschlägt |
 | `with nhydb.create(...) as db:` | `__exit__` ruft `close(commit=True)` auf – **auch wenn im Block eine Ausnahme auftrat** |
 | Objekt-Freigabe ohne `close` | Puffer wird geschrieben, aber nicht committet |
 

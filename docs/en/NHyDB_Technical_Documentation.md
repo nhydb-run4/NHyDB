@@ -1207,7 +1207,7 @@ memory requirement is independent of the result size.
 | `NHyDB(path, …)` / `nhydb.open` | opens fail closed (section 8.4) |
 | `commit()` | commit protocol; return value: commit boundary |
 | `sync(hard=False)` | write buffer, optionally file sync – **no** superblock commit |
-| `close(commit=True)` | optional commit, then release file handle and lock (immediately, not only when the object is released); afterwards every file access raises `NHyDBError` ("database is closed"); repeated calls have no effect; if the commit fails, the database stays open (retry or `close(commit=False)`); `close(commit=False)` releases handle and lock even if writing the buffer fails |
+| `close(commit=True)` | optional commit, then release file handle and lock (immediately, not only when the object is released); afterwards every operation that needs the file raises `NHyDBError` ("database is closed"); values already held in the in-memory cache may still be returned, so a closed object should not be used for reading; repeated calls have no effect; if the commit fails, the database stays open (retry or `close(commit=False)`); `close(commit=False)` releases handle and lock even if writing the buffer fails |
 | `with nhydb.create(...) as db:` | `__exit__` calls `close(commit=True)` – **even if an exception occurred in the block** |
 | object release without `close` | buffer is written but not committed |
 
