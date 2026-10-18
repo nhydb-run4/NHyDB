@@ -1,43 +1,89 @@
-# Builds wheels for Linux, macOS and Windows plus a source distribution when a
-# version tag (v*, e.g. v0.27.0) is pushed, and attaches them to a GitHub
-# release. Publishing to PyPI is optional: set the repository variable
-# PUBLISH_PYPI to "true" and configure PyPI "trusted publishing" for this
-# repository (see RELEASING.md).
+# Release pipeline (see RELEASING.md).
+#
+# * workflow_dispatch (manual run): builds and tests all wheels and the source
+#   distribution – a dry run, nothing is published.
+# * push of a version tag vX.Y.Z: builds and tests as above, then creates a
+#   DRAFT GitHub release with all files. An existing release is never
+#   modified; the job fails instead.
+# * release published (manual publication of the draft on GitHub): uploads
+#   exactly the files attached to the release to PyPI via trusted publishing.
+#   Requires the repository variable PUBLISH_PYPI = "true" and the approval
+#   of the protected environment "pypi".
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  linux:
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
+  check-version:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
+      - id: v
+        name: Version from Cargo.toml, tag and CHANGELOG must match
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"
+              exit 1
+            fi
+            if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md has no section [$version]"
+              exit 1
+            fi
+          fi
+
+  linux:
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
-          manylinux: auto
+          manylinux: "2_28"
+          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13 python3.14
+          # crates/nhydb-core/src/zlib.rs links the system zlib on Unix
+          before-script-linux: |
+            if command -v dnf >/dev/null; then dnf install -y zlib-devel
+            elif command -v yum >/dev/null; then yum install -y zlib-devel
+            fi
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-linux-${{ matrix.target }}
+          name: dist-linux-${{ matrix.target }}
           path: dist
 
   macos:
+    needs: check-version
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-15-intel
@@ -62,10 +108,11 @@ jobs:
           args: --release --out dist --find-interpreter
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-macos-${{ matrix.target }}
+          name: dist-macos-${{ matrix.target }}
           path: dist
 
   windows:
+    needs: check-version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,10 +132,11 @@ jobs:
           args: --release --out dist --find-interpreter
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-windows-x64
+          name: dist-windows-x64
           path: dist
 
   sdist:
+    needs: check-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -99,37 +147,103 @@ jobs:
           args: --out dist
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-sdist
+          name: dist-sdist
           path: dist
 
-  github-release:
-    name: GitHub release
+  # Merges all build artifacts and checks that exactly the expected files exist.
+  verify:
+    needs: [check-version, linux, macos, windows, sdist]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, macos, windows, sdist]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Check file set
+        run: python3 tools/check_dist.py dist --version "${{ needs.check-version.outputs.version }}"
+      - name: Check package metadata
+        run: pipx run twine check --strict dist/*
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-files
+          path: dist
+
+  # Installs the built wheels like a user and runs the Python test suite on
+  # every platform with the oldest and the newest supported Python.
+  test:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-latest, windows-latest]
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-files
+          path: dist
+      - name: Install wheel and run Python tests
+        shell: bash
+        run: |
+          python -m pip install numpy pytest cryptography
+          python -m pip install --no-index --find-links dist nhydb
+          python -m pytest -q tests/python
+
+  github-release:
+    name: GitHub release (draft)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check-version, verify, test]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v7
         with:
+          name: release-files
           path: dist
-          merge-multiple: true
-      - name: Create release and upload files
+      - name: Create draft release (never modifies an existing release)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "See CHANGELOG.md"
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists; it is not modified. Delete it manually or use a new version."
+            exit 1
+          fi
+          awk -v h="## [$VERSION]" 'index($0, h) == 1 {f = 1; next} /^## \[/ {f = 0} f' CHANGELOG.md > notes.md
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "NHyDB $VERSION" --notes-file notes.md
 
   pypi:
-    name: Publish to PyPI (optional)
+    name: Publish to PyPI
+    if: github.event_name == 'release' && vars.PUBLISH_PYPI == 'true'
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_PYPI == 'true'
-    needs: [linux, macos, windows, sdist]
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/project/nhydb/
     permissions:
+      contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v7
-        with:
-          path: dist
-          merge-multiple: true
+      - uses: actions/checkout@v6
+      - name: Download the files attached to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern 'nhydb-*.whl' --pattern 'nhydb-*.tar.gz'
+      - name: Check file set against the tagged Cargo.toml
+        run: python3 tools/check_dist.py dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

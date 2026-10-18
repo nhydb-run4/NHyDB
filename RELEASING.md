@@ -22,12 +22,17 @@ the format changes (`crates/nhydb-core/src/format.rs`).
 
 1. Update `version` in `Cargo.toml` and run `cargo update -w` so that
    `Cargo.lock` follows.
-2. Add a section to `CHANGELOG.md`.
+2. Rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] – <date>`
+   (the release notes are taken from this section) and add a new empty
+   `## [Unreleased]` above it.
    If dependencies changed (`Cargo.lock`), regenerate the third-party
    notices: `cargo fetch && python tools/gen_third_party_licenses.py`, and
    commit `THIRD-PARTY-LICENSES.txt`.
 3. Build and test locally (see [BUILDING.md](BUILDING.md)).
-4. Commit and tag:
+4. Optional dry run: start the workflow *Release* manually
+   (Actions → Release → Run workflow). It builds and tests all wheels and
+   the source distribution and publishes nothing.
+5. Commit and tag:
 
    ```bash
    git commit -am "Release X.Y.Z"
@@ -35,20 +40,41 @@ the format changes (`crates/nhydb-core/src/format.rs`).
    git push origin main vX.Y.Z
    ```
 
-5. GitHub Actions (`.github/workflows/release.yml`) builds the wheels and
-   the source distribution and creates a GitHub release with all files.
+6. The tag starts `.github/workflows/release.yml`:
+   * checks that tag, `Cargo.toml` version and `CHANGELOG.md` section match,
+   * builds wheels for CPython 3.9–3.14 on Linux (x86_64, aarch64;
+     manylinux_2_28), macOS (x86_64, arm64) and Windows (x64) plus the
+     source distribution,
+   * checks the complete file set (`tools/check_dist.py`) and the package
+     metadata (`twine check`),
+   * installs the wheels and runs the Python tests on every platform with
+     Python 3.9 and 3.14,
+   * creates a **draft** GitHub release with all files. If a release for
+     the tag already exists, the job fails and changes nothing.
+7. Check the draft release on GitHub and publish it.
 
-## Publishing on PyPI (optional)
+## Publishing on PyPI
 
-The release workflow can upload to PyPI via *trusted publishing* (no
-password or token in the repository):
+Publishing the GitHub release (step 7) starts the PyPI job of the same
+workflow. It downloads exactly the files attached to the release, checks
+them again and uploads them via *trusted publishing* (OpenID Connect; no
+password or token is stored anywhere). The job only runs if
 
-1. On pypi.org, add a trusted publisher for this GitHub repository,
-   workflow `release.yml`, environment `pypi`.
-2. In the GitHub repository settings, create the environment `pypi` and
-   the repository variable `PUBLISH_PYPI` = `true`.
+* the repository variable `PUBLISH_PYPI` is `true`, and
+* the deployment to the protected environment `pypi` is approved.
 
-Without these settings the PyPI step is skipped.
+One-time setup:
+
+1. On pypi.org (account settings → Publishing), add a *pending publisher*
+   for the project `nhydb`: owner `nhydb`, repository `NHyDB`, workflow
+   `release.yml`, environment `pypi`.
+2. In the GitHub repository settings → Environments, create `pypi` with a
+   required reviewer and restrict deployments to tags `v*`.
+3. Create the repository variable `PUBLISH_PYPI` = `true` only when PyPI
+   releases are wanted.
+
+A PyPI version can never be uploaded twice; a faulty upload needs a new
+version number.
 
 ## Continuous integration
 
