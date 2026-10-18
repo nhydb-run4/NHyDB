@@ -1210,7 +1210,7 @@ Speicherbedarf ist unabhängig von der Ergebnisgröße.
 | `NHyDB(path, …)` / `nhydb.open` | öffnet fail closed (Abschnitt 8.4) |
 | `commit()` | Commit-Protokoll; Rückgabe: Commit-Grenze |
 | `sync(hard=False)` | Puffer schreiben, optional Datei-Sync – **kein** Superblock-Commit |
-| `close(commit=True)` | optional Commit, Sperre freigeben |
+| `close(commit=True)` | optional Commit, danach Dateihandle und Sperre freigeben (sofort, nicht erst bei der Objekt-Freigabe); anschließend löst jeder Dateizugriff `NHyDBError` ("database is closed") aus; wiederholte Aufrufe sind wirkungslos; schlägt der Commit fehl, bleibt die Datenbank geöffnet (erneuter Versuch oder `close(commit=False)`); `close(commit=False)` gibt Handle und Sperre auch dann frei, wenn das Schreiben des Puffers fehlschlägt |
 | `with nhydb.create(...) as db:` | `__exit__` ruft `close(commit=True)` auf – **auch wenn im Block eine Ausnahme auftrat** |
 | Objekt-Freigabe ohne `close` | Puffer wird geschrieben, aber nicht committet |
 
@@ -2133,13 +2133,13 @@ UTF-8-JSON) und Layoutplan sind plattformneutral.
 
 ### 18.2 Testinventar
 
-Rust (`cargo test --workspace --release`): 44 Unit-Tests in
+Rust (`cargo test --workspace --release`): 50 Unit-Tests in
 `crates/nhydb-core/src/**`, 5 Tests in `selftest.rs`, 2 Tests in
 `sparse_access.rs`; die PyO3-Crate `nhydb-py` enthält keine eigenen Tests.
 
 | Datei | Schwerpunkt |
 |---|---|
-| `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Nat/VarUInt, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), R0-Kette, Plattform (Sperre, Sync, atomarer Austausch), Konfiguration, Mengenoperationen, Textindex, MATH, SQL-Lexer |
+| `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Nat/VarUInt, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), R0-Kette, Plattform (Sperre, Sync, atomarer Austausch), Freigabe des Dateihandles bei `close`, Rücknahme nach Schreibfehler (Fehlerinjektion, die nur in Test-Builds existiert), Konfiguration, Mengenoperationen, Textindex, MATH, SQL-Lexer |
 | `crates/nhydb-core/tests/selftest.rs` | End-to-End im Kern |
 | `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Punkt-/Bereichszugriff gegen unabhängiges Modell und Vollmerge (12 Seeds, `u = 2^70`, `v ≥ 10^40`) |
 | `tests/python/test_math.py` (6) | Adressmathematik: Ablehnung von GZ/N0, Rechenbeispiel `(23, 14, 744)` |
@@ -2153,12 +2153,16 @@ Rust (`cargo test --workspace --release`): 44 Unit-Tests in
 | `tests/python/test_query.py` (6) | QueryEngine: Zählen über einen frischen VALUE-Index, Aggregation und Gruppierung, Sortierung und Limit, BM25-Suche, Sparse-Überlagerungen über alle Zugriffspfade, große `STRUCT_RANGE` |
 | `tests/python/test_sql.py` (8) | NHySQL: Filter, Gruppierung, Sortierung, positionelle und benannte Parameter, Volltext-Relevanz, NumPy-Ausgabe, Syntaxfehler und nicht unterstützte Anweisungen, Query-CLI |
 | `tests/python/test_system.py` (6) | R0,u1, externer Layoutplan, fail closed, umbenannte DB, Sperre zwischen Prozessen, Konfiguration, Durability `full`, Repair |
-| `tests/python/test_maintenance.py` (8) | Repair, Superblock-Fallback, Kompaktierung, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI |
+| `tests/python/test_maintenance.py` (9) | Repair, Superblock-Fallback, Kompaktierung, Freigabe des Dateihandles bei `close`, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI |
 
-Ein Lauf am 2026-10-17 (macOS, Python 3.14, mit `numpy` und
-`cryptography`) ergab **71 bestandene Python-Testfälle** (gezählt
-einschließlich Parametrisierungen) ohne übersprungene Tests, dazu 51
-bestandene Rust-Tests. `test_kernel.py` überspringt den AES-GCM-Vergleich,
+Ein Lauf am 2026-10-18 (macOS, Python 3.14, mit `numpy` und
+`cryptography`) ergab **72 bestandene Python-Testfälle** (gezählt
+einschließlich Parametrisierungen) ohne übersprungene Tests, dazu 57
+bestandene Rust-Tests. Unter Windows wird
+`test_failed_append_is_rolled_back` übersprungen, weil er die
+POSIX-Dateigrößengrenze (`RLIMIT_FSIZE`) benötigt; dieselbe Eigenschaft
+(kein Teilblock nach einem Schreibfehler) prüft auf allen Plattformen der
+Rust-Test `db::file_handle_tests::failed_append_is_rolled_back`. `test_kernel.py` überspringt den AES-GCM-Vergleich,
 wenn das Paket `cryptography` fehlt; `test_sql.py` überspringt die
 NumPy-Ausgabe ohne `numpy`.
 

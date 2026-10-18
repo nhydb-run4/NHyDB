@@ -552,13 +552,18 @@ impl Db {
             return Ok(());
         }
         if commit {
+            // On a failed commit the database stays open (as in the reference
+            // implementation): retry, or close(commit=false) to discard.
             self.commit()?;
-        } else {
-            self.store.flush()?;
         }
+        // Release the OS file handle immediately (not only on drop), so the
+        // file can be replaced by compact_file()/repair or renamed while the
+        // closed object is still referenced (Windows). The handle and the
+        // lock are released even if writing the buffer fails.
+        let res = self.store.close();
         self.closed = true;
         self.lock.release();
-        Ok(())
+        res
     }
 
     /// `sync(hard=False)`: write buffers, optionally fsync.
@@ -1194,4 +1199,193 @@ fn pack_header_with_crc(bt: u8, bid: u64, plen: u64, pcrc: u32, flags: u16) -> [
     let hcrc = crc32(&b);
     b[28..32].copy_from_slice(&hcrc.to_le_bytes());
     b
+}
+
+#[cfg(test)]
+mod file_handle_tests {
+    use super::*;
+    use crate::db::dense::DenseRows;
+    use crate::db::maint::CompactOptions;
+    use crate::codec::FieldDef;
+    use crate::address::NL;
+    use crate::db::sparse::CellInput;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nhydb_fh_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(format!("{name}.nhydb"))
+    }
+
+    fn bytes_db(p: &Path) -> Db {
+        let r = Nat::S(1);
+        let mut db = Db::create(p, true, OpenOptions::default()).unwrap();
+        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
+        db.create_shape(1, &r, "s", vec![FieldDef::new(Nat::S(1), "b", TypeCode::Bytes)], "").unwrap();
+        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
+        db
+    }
+
+    fn put(db: &mut Db, u: u64, b: Vec<u8>, commit: bool) -> Result<Val> {
+        let rows = vec![vec![Val::Bytes(b)]];
+        db.put_dense_batch(&Nat::S(1), &Nat::S(u), &DenseRows::Tuples(&rows), Some(1), &[], NL, commit)
+    }
+
+    /// Platform-independent counterpart of the POSIX-only Python test
+    /// `test_failed_append_is_rolled_back`: a write error in the middle of a
+    /// large block (here injected like a file size limit) must not leave a
+    /// partial block behind that a later commit would make durable.
+    #[test]
+    fn failed_append_is_rolled_back() {
+        let p = tmp("efbig");
+        let mut db = bytes_db(&p);
+        put(&mut db, 1, b"ok".to_vec(), true).unwrap();
+        let len_before = db.store.len();
+        db.store.fail_writes_beyond = Some(1 << 20);
+        let err = put(&mut db, 2, vec![b'x'; 9 << 20], false).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err}");
+        db.store.fail_writes_beyond = None;
+        assert_eq!(db.store.len(), len_before, "logical length rolled back");
+        assert!(std::fs::metadata(&p).unwrap().len() <= len_before, "partially written bytes removed from the file");
+        put(&mut db, 3, b"drei".to_vec(), true).unwrap();
+        db.close(true).unwrap();
+        let db = Db::open(&p).unwrap();
+        assert_eq!(db.recovered_tail_bytes, 0);
+        let field = |u: u64| db.get(&Nat::S(1), &Nat::S(u), NL, None, None, true).unwrap();
+        assert_eq!(field(1).and_then(|r| r.get("b").cloned()), Some(Val::Bytes(b"ok".to_vec())));
+        assert_eq!(field(3).and_then(|r| r.get("b").cloned()), Some(Val::Bytes(b"drei".to_vec())));
+        assert!(field(2).is_none());
+        assert_eq!(db.verify(true).unwrap().get("ok"), Some(&Val::Bool(true)));
+    }
+
+    /// `close()` releases the OS file handle: the file can be replaced
+    /// (compact_file) and renamed while the closed object still exists.
+    /// On Windows an open handle makes MoveFileExW fail with os error 5.
+    #[test]
+    fn close_releases_file_handle() {
+        let p = tmp("close");
+        let mut db = bytes_db(&p);
+        for u in 1..=5 {
+            put(&mut db, u, vec![u as u8; 10], true).unwrap();
+        }
+        db.close(true).unwrap();
+        assert!(matches!(db.get(&Nat::S(1), &Nat::S(1), NL, None, None, true), Err(Error::NHyDB(_))));
+        let res = Db::compact_file(&p, &CompactOptions::default()).unwrap();
+        assert_eq!(res.get("replaced_original"), Some(&Val::Bool(true)));
+        let q = p.with_extension("renamed");
+        std::fs::rename(&p, &q).unwrap();
+        std::fs::rename(&q, &p).unwrap();
+        drop(db);
+        let db = Db::open(&p).unwrap();
+        assert!(db.get(&Nat::S(1), &Nat::S(5), NL, None, None, true).unwrap().is_some());
+    }
+
+    /// Repeated close() is a no-op; every file operation afterwards fails
+    /// with "database is closed" instead of touching the file.
+    #[test]
+    fn close_is_idempotent_and_blocks_file_access() {
+        let p = tmp("twice");
+        let mut db = bytes_db(&p);
+        put(&mut db, 1, b"a".to_vec(), true).unwrap();
+        db.close(true).unwrap();
+        db.close(true).unwrap();
+        db.close(false).unwrap();
+        let closed = |r: Result<()>| matches!(r, Err(Error::NHyDB(m)) if m.contains("closed"));
+        assert!(closed(put(&mut db, 2, b"b".to_vec(), true).map(|_| ())));
+        assert!(closed(db.commit().map(|_| ())));
+        assert!(closed(db.sync(true)));
+        assert!(closed(db.store.append(b"x")));
+        assert!(closed(db.store.read_vec(0, 8).map(|_| ())));
+        assert!(closed(db.store.fsync()));
+        assert!(closed(db.store.write_at(0, b"x")));
+        assert!(closed(db.store.truncate(0)));
+        assert!(closed(db.store.rollback_to(0)));
+        drop(db); // Drop after close() does not flush
+        let db = Db::open(&p).unwrap();
+        assert_eq!(db.verify(true).unwrap().get("ok"), Some(&Val::Bool(true)));
+    }
+
+    /// close(commit=false) releases handle and lock even if writing the
+    /// buffer fails; the error is returned, the commit boundary is intact.
+    #[test]
+    fn close_releases_handle_on_write_error() {
+        let p = tmp("closeerr");
+        let mut db = bytes_db(&p);
+        put(&mut db, 1, b"ok".to_vec(), true).unwrap();
+        put(&mut db, 2, b"pending".to_vec(), false).unwrap(); // stays in the buffer
+        db.store.fail_writes_beyond = Some(std::fs::metadata(&p).unwrap().len()); // nothing more can be written
+        assert!(matches!(db.close(false), Err(Error::Io(_))));
+        assert!(db.closed && !db.lock.is_held());
+        let q = p.with_extension("moved");
+        std::fs::rename(&p, &q).unwrap();
+        std::fs::rename(&q, &p).unwrap();
+        let other = Db::open(&p).unwrap(); // lock released
+        assert!(other.get(&Nat::S(1), &Nat::S(1), NL, None, None, true).unwrap().is_some());
+        assert!(other.get(&Nat::S(1), &Nat::S(2), NL, None, None, true).unwrap().is_none());
+        drop(other);
+        drop(db);
+    }
+
+    /// close(commit=false) never publishes uncommitted data: neither records
+    /// still in the buffer, nor records already written to the file (sync,
+    /// large direct writes), nor sparse cells - not after reopening, not
+    /// after a later commit, not after reopening again.
+    #[test]
+    fn close_without_commit_hides_uncommitted_data() {
+        let p = tmp("nocommit");
+        let r = Nat::S(1);
+        let r2 = Nat::S(2);
+        let mut db = bytes_db(&p);
+        db.create_realm(&r2, "sparse", "", None, &Nat::ZERO).unwrap();
+        put(&mut db, 1, b"committed".to_vec(), true).unwrap();
+        let boundary = db.superblock().last_valid_end;
+        put(&mut db, 2, b"flushed".to_vec(), false).unwrap();
+        db.sync(true).unwrap(); // physically in the file, but behind the commit boundary
+        put(&mut db, 3, vec![b'L'; 9 << 20], false).unwrap(); // written directly (> buffer threshold)
+        put(&mut db, 4, b"buffered".to_vec(), false).unwrap(); // only in the buffer
+        let cell = CellInput::typed(Nat::S(5), Nat::S(9), Val::str("sparse"), Some(TypeCode::Utf8));
+        db.put_points(&r2, vec![cell], NL, false, 10_000).unwrap();
+        assert!(db.get(&r, &Nat::S(4), NL, None, None, true).unwrap().is_some()); // visible before close
+        assert_eq!(db.get_cell_value(&r2, &Nat::S(5), &Nat::S(9), NL).unwrap(), Some(Val::str("sparse")));
+        db.close(false).unwrap();
+        assert!(std::fs::metadata(&p).unwrap().len() > boundary, "uncommitted bytes reached the file");
+        let invisible = |db: &Db| {
+            for u in 2..=4 {
+                assert!(db.get(&r, &Nat::S(u), NL, None, None, true).unwrap().is_none(), "record u={u} visible");
+            }
+            assert_eq!(db.get_cell_value(&r2, &Nat::S(5), &Nat::S(9), NL).unwrap(), None, "sparse cell visible");
+            assert!(db.get(&r, &Nat::S(1), NL, None, None, true).unwrap().is_some());
+            assert_eq!(db.verify(true).unwrap().get("ok"), Some(&Val::Bool(true)));
+        };
+        drop(db);
+        let mut db = Db::open(&p).unwrap();
+        assert_eq!(db.superblock().last_valid_end, boundary);
+        assert!(db.recovered_tail_bytes > 0);
+        invisible(&db);
+        // a later commit must not resurrect the discarded tail
+        put(&mut db, 6, b"later".to_vec(), true).unwrap();
+        invisible(&db);
+        db.close(true).unwrap();
+        let db = Db::open(&p).unwrap();
+        invisible(&db);
+        assert!(db.get(&r, &Nat::S(6), NL, None, None, true).unwrap().is_some());
+    }
+
+    /// A failed commit in close(commit=true) keeps the database open (as
+    /// in the reference implementation) so it can be retried.
+    #[test]
+    fn failed_commit_on_close_keeps_database_open() {
+        let p = tmp("commiterr");
+        let mut db = bytes_db(&p);
+        put(&mut db, 1, b"ok".to_vec(), true).unwrap();
+        put(&mut db, 2, b"zwei".to_vec(), false).unwrap();
+        db.store.fail_writes_beyond = Some(std::fs::metadata(&p).unwrap().len()); // nothing more can be written
+        assert!(db.close(true).is_err());
+        assert!(!db.closed && db.lock.is_held());
+        db.store.fail_writes_beyond = None;
+        db.close(true).unwrap(); // retry succeeds
+        let db = Db::open(&p).unwrap();
+        assert!(db.get(&Nat::S(1), &Nat::S(2), NL, None, None, true).unwrap().is_some());
+        assert_eq!(db.verify(true).unwrap().get("ok"), Some(&Val::Bool(true)));
+    }
 }

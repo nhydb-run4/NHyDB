@@ -1,5 +1,7 @@
 """Maintenance and edge cases: repair, compaction, large u, plugin callbacks."""
 
+import sys
+
 import pytest
 
 import nhydb
@@ -49,6 +51,23 @@ def test_compact_replace_original_with_backup(tmpdb):
     res = nhydb.NHyDB.compact_file(tmpdb)
     assert res["replaced_original"] and res["backup"] and res["saved_bytes"] > 0
     assert nhydb.NHyDB(tmpdb).get(1, 5)["a"] == 5
+
+
+def test_close_releases_file_handle(tmpdb):
+    """close() releases the OS file handle while the object is still
+    referenced: the file can be compacted in place and renamed (on Windows
+    an open handle blocks the replacement with "Access is denied")."""
+    db = _classic(tmpdb)
+    db.put(1, 1, [1, "v"], commit=True)
+    db.close()
+    with pytest.raises(nhydb.NHyDBError, match="closed"):
+        db.get(1, 1)
+    assert nhydb.NHyDB.compact_file(tmpdb, make_backup=False)["replaced_original"]
+    moved = tmpdb.with_name("moved.nhydb")
+    tmpdb.rename(moved)
+    moved.rename(tmpdb)
+    with nhydb.open(tmpdb) as db2:
+        assert db2.get(1, 1)["a"] == 1
 
 
 class Occ:
@@ -114,6 +133,8 @@ def test_cli_get_and_stats(tmpdb):
     assert "Result      :" in out
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="RLIMIT_FSIZE/SIGXFSZ are POSIX-only; on all platforms the "
+                    "same property is covered by the Rust test db::file_handle_tests::failed_append_is_rolled_back")
 def test_failed_append_is_rolled_back(tmp_path):
     """A write error (here: file size limit) must not leave a partial block
     behind that a later commit would make durable."""

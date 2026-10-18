@@ -1207,7 +1207,7 @@ memory requirement is independent of the result size.
 | `NHyDB(path, …)` / `nhydb.open` | opens fail closed (section 8.4) |
 | `commit()` | commit protocol; return value: commit boundary |
 | `sync(hard=False)` | write buffer, optionally file sync – **no** superblock commit |
-| `close(commit=True)` | optional commit, release lock |
+| `close(commit=True)` | optional commit, then release file handle and lock (immediately, not only when the object is released); afterwards every file access raises `NHyDBError` ("database is closed"); repeated calls have no effect; if the commit fails, the database stays open (retry or `close(commit=False)`); `close(commit=False)` releases handle and lock even if writing the buffer fails |
 | `with nhydb.create(...) as db:` | `__exit__` calls `close(commit=True)` – **even if an exception occurred in the block** |
 | object release without `close` | buffer is written but not committed |
 
@@ -2127,13 +2127,13 @@ UTF-8 JSON) and the layout plan are platform-neutral.
 
 ### 18.2 Test Inventory
 
-Rust (`cargo test --workspace --release`): 44 unit tests in
+Rust (`cargo test --workspace --release`): 50 unit tests in
 `crates/nhydb-core/src/**`, 5 tests in `selftest.rs`, 2 tests in
 `sparse_access.rs`; the PyO3 crate `nhydb-py` contains no tests of its own.
 
 | File | Focus |
 |---|---|
-| `crates/nhydb-core/src/**` (unit) | address mathematics, Nat/VarUInt, format, codec, crypto (NIST GCM, RFC 4231, SHA KATs), R0 chain, platform (lock, sync, atomic replacement), configuration, set operations, text index, MATH, SQL lexer |
+| `crates/nhydb-core/src/**` (unit) | address mathematics, Nat/VarUInt, format, codec, crypto (NIST GCM, RFC 4231, SHA KATs), R0 chain, platform (lock, sync, atomic replacement), file handle release on `close`, rollback after a write error (fault injection that exists only in test builds), configuration, set operations, text index, MATH, SQL lexer |
 | `crates/nhydb-core/tests/selftest.rs` | end-to-end in the core |
 | `crates/nhydb-core/tests/sparse_access.rs` | sparse point/range access against an independent model and full merge (12 seeds, `u = 2^70`, `v ≥ 10^40`) |
 | `tests/python/test_math.py` (6) | address mathematics: rejection of GZ/N0, worked example `(23, 14, 744)` |
@@ -2147,11 +2147,15 @@ Rust (`cargo test --workspace --release`): 44 unit tests in
 | `tests/python/test_query.py` (6) | QueryEngine: counting via a fresh VALUE index, aggregation and grouping, ordering and limit, BM25 search, sparse overlays across all access paths, large `STRUCT_RANGE` |
 | `tests/python/test_sql.py` (8) | NHySQL: filters, grouping, ordering, positional and named parameters, full-text relevance, NumPy output, syntax errors and unsupported statements, query CLI |
 | `tests/python/test_system.py` (6) | R0,u1, external layout plan, fail closed, renamed DB, lock between processes, configuration, durability `full`, repair |
-| `tests/python/test_maintenance.py` (8) | repair, superblock fallback, compaction, rolled-back appends, manipulated headers, plugin re-entrancy, CLI |
+| `tests/python/test_maintenance.py` (9) | repair, superblock fallback, compaction, file handle release on `close`, rolled-back appends, manipulated headers, plugin re-entrancy, CLI |
 
-A run on 2026-10-17 (macOS, Python 3.14, with `numpy` and
-`cryptography`) yielded **71 passed Python test cases** (counted including
-parametrizations) with no skipped tests, plus 51 passed Rust tests.
+A run on 2026-10-18 (macOS, Python 3.14, with `numpy` and
+`cryptography`) yielded **72 passed Python test cases** (counted including
+parametrizations) with no skipped tests, plus 57 passed Rust tests.
+On Windows, `test_failed_append_is_rolled_back` is skipped because it needs
+the POSIX file size limit (`RLIMIT_FSIZE`); the same property (no partial
+block after a write error) is checked on all platforms by the Rust test
+`db::file_handle_tests::failed_append_is_rolled_back`.
 `test_kernel.py` skips the AES-GCM comparison if the package `cryptography`
 is missing; `test_sql.py` skips the NumPy output test without `numpy`.
 

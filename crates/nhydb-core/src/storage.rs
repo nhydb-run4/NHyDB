@@ -17,11 +17,18 @@ const FLUSH_THRESHOLD: usize = 8 << 20;
 pub type SyncMode = platform::Durability;
 
 pub struct Storage {
-    file: File,
+    /// `None` after [`Storage::close`]: the OS handle is released so that the
+    /// file can be replaced, renamed or deleted (required on Windows, where
+    /// an open handle blocks `MoveFileExW` with "Access is denied").
+    file: Option<File>,
     pending: Vec<u8>,
     /// File offset of `pending[0]` == length of the written file.
     pending_start: u64,
     pub sync_mode: SyncMode,
+    /// Test-only fault injection: writes beyond this file offset fail after
+    /// writing the part below it (emulates a file size limit / full disk).
+    #[cfg(test)]
+    pub(crate) fail_writes_beyond: Option<u64>,
 }
 
 impl Storage {
@@ -29,7 +36,45 @@ impl Storage {
         sync_mode.check_supported()?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len();
-        Ok(Storage { file, pending: Vec::new(), pending_start: len, sync_mode })
+        Ok(Storage {
+            file: Some(file),
+            pending: Vec::new(),
+            pending_start: len,
+            sync_mode,
+            #[cfg(test)]
+            fail_writes_beyond: None,
+        })
+    }
+
+    fn file(&self) -> Result<&File> {
+        self.file.as_ref().ok_or_else(|| Error::NHyDB("database is closed".into()))
+    }
+
+    /// Positional write of the underlying file (single point for all writes).
+    fn write_file_at(&self, data: &[u8], off: u64) -> Result<()> {
+        #[cfg(test)]
+        if let Some(limit) = self.fail_writes_beyond {
+            if off + data.len() as u64 > limit {
+                let n = limit.saturating_sub(off).min(data.len() as u64) as usize;
+                write_all_at(self.file()?, &data[..n], off)?;
+                return Err(Error::Io(std::io::Error::other("injected write error (file size limit)")));
+            }
+        }
+        write_all_at(self.file()?, data, off)?;
+        Ok(())
+    }
+
+    /// Writes the buffer and releases the OS file handle, also if that
+    /// write fails (like closing a Python file object); the error is still
+    /// returned. Further accesses fail with "database is closed". Idempotent.
+    pub fn close(&mut self) -> Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let res = self.flush();
+        self.file = None;
+        self.pending = Vec::new();
+        res
     }
 
     pub fn open_readonly(path: &Path) -> Result<File> {
@@ -48,10 +93,11 @@ impl Storage {
 
     /// Appends bytes to the end of the file.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
+        self.file()?;
         if self.pending.len() + data.len() > FLUSH_THRESHOLD {
             self.flush()?;
             if data.len() >= FLUSH_THRESHOLD {
-                write_all_at(&self.file, data, self.pending_start)?;
+                self.write_file_at(data, self.pending_start)?;
                 self.pending_start += data.len() as u64;
                 return Ok(());
             }
@@ -67,7 +113,7 @@ impl Storage {
 
     pub fn flush(&mut self) -> Result<()> {
         if !self.pending.is_empty() {
-            write_all_at(&self.file, &self.pending, self.pending_start)?;
+            self.write_file_at(&self.pending, self.pending_start)?;
             self.pending_start += self.pending.len() as u64;
             self.pending.clear();
             if self.pending.capacity() > 2 * FLUSH_THRESHOLD {
@@ -78,19 +124,19 @@ impl Storage {
     }
 
     pub fn fsync(&self) -> Result<()> {
-        platform::sync_file(&self.file, self.sync_mode)
+        platform::sync_file(self.file()?, self.sync_mode)
     }
 
     /// Positional write outside the append region (superblocks). The range
     /// must not overlap the append buffer.
     pub fn write_at(&mut self, off: u64, data: &[u8]) -> Result<()> {
         debug_assert!(off + data.len() as u64 <= self.pending_start);
-        write_all_at(&self.file, data, off)?;
-        Ok(())
+        self.write_file_at(data, off)
     }
 
     /// Reads exactly `buf.len()` bytes from `off` (including unwritten bytes).
     pub fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        self.file()?;
         let end = off.saturating_add(buf.len() as u64);
         if end > self.len() {
             return Err(Error::Corruption(format!("read {off}..{end} beyond end of file {}", self.len())));
@@ -99,10 +145,10 @@ impl Storage {
             let s = (off - self.pending_start) as usize;
             buf.copy_from_slice(&self.pending[s..s + buf.len()]);
         } else if end <= self.pending_start {
-            read_exact_at(&self.file, buf, off)?;
+            read_exact_at(self.file()?, buf, off)?;
         } else {
             let split = (self.pending_start - off) as usize;
-            read_exact_at(&self.file, &mut buf[..split], off)?;
+            read_exact_at(self.file()?, &mut buf[..split], off)?;
             let rest = buf.len() - split;
             buf[split..].copy_from_slice(&self.pending[..rest]);
         }
@@ -127,12 +173,13 @@ impl Storage {
 
     /// Discards all bytes from `len` on (rollback of a failed append).
     pub fn rollback_to(&mut self, len: u64) -> Result<()> {
+        self.file()?;
         if len >= self.pending_start {
             self.pending.truncate((len - self.pending_start) as usize);
             Ok(())
         } else {
             self.pending.clear();
-            self.file.set_len(len)?;
+            self.file()?.set_len(len)?;
             self.pending_start = len;
             Ok(())
         }
@@ -140,7 +187,7 @@ impl Storage {
 
     pub fn truncate(&mut self, len: u64) -> Result<()> {
         self.flush()?;
-        self.file.set_len(len)?;
+        self.file()?.set_len(len)?;
         self.pending_start = len;
         Ok(())
     }

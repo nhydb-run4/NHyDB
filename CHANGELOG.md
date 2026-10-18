@@ -5,6 +5,27 @@ The project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+* `close()` releases the file handle and the write lock immediately, not only
+  when the object is released. Afterwards every file access raises
+  `NHyDBError` ("database is closed"); previously reads on a closed database
+  could still succeed. Repeated calls have no effect.
+* If the commit in `close(commit=True)` fails, the database stays open (retry,
+  or discard with `close(commit=False)`). `close(commit=False)` releases handle
+  and lock even if writing the buffer fails; uncommitted data never becomes
+  visible, also not after reopening.
+
+### Fixed
+
+* Windows: `compact_file()` failed with "Access is denied (os error 5)" when
+  the database had been closed but the object was still referenced.
+* Windows: the Rust corruption test no longer uses Unix-only positional file
+  I/O.
+* Windows: the Python test for rolling back a failed append relies on the
+  POSIX file size limit and is skipped on Windows; the same property is
+  checked on all platforms by a Rust test with injected write errors.
+
 ## [0.27.0] – 2026-10-17
 
 First public release under the NHyDB / dNHyDB Experimental Software License 1.0
