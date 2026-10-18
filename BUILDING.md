@@ -24,14 +24,14 @@ maturin build --release --out dist
 ```
 
 The wheel is written to `dist/`, e.g.
-`nhydb-0.27.0-cp313-cp313-macosx_11_0_arm64.whl`. It is specific to the
+`nhydb-0.27.1-cp313-cp313-macosx_11_0_arm64.whl`. It is specific to the
 operating system, the CPU architecture and the Python version it was built
 with.
 
 ## Install
 
 ```bash
-pip install dist/nhydb-0.27.0-*.whl
+pip install dist/nhydb-0.27.1-*.whl
 pip install numpy                    # optional, NumPy batch API
 ```
 

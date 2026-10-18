@@ -1,13 +1,13 @@
-# NHyDB 0.27.0 – Technical Documentation
+# NHyDB 0.27.1 – Technical Documentation
 
 | Metadata | Value |
 |---|---|
-| Document | Technical reference documentation NHyDB 0.27.0 (native Rust engine with Python binding) |
+| Document | Technical reference documentation NHyDB 0.27.1 (native Rust engine with Python binding) |
 | Language | English |
 | German version | `../de/NHyDB_Technische_Dokumentation.md` |
-| Document date | 2026-10-17 |
-| Product | NHyDB 0.27.0, Python package `nhydb` |
-| Engine version (`ENGINE_VERSION`) | `0.27.0` |
+| Document date | 2026-10-18 |
+| Product | NHyDB 0.27.1, Python package `nhydb` |
+| Engine version (`ENGINE_VERSION`) | `0.27.1` |
 | File identifier | `NHYDB016` (format revision 16, `FILE_FORMAT_VERSION = "0.16"`) – internal identifier of the file format; it changes only when the on-disk format changes and is independent of the product version |
 | Platforms | macOS, Linux, Windows |
 | License | NHyDB / dNHyDB Experimental Software License 1.0, see file `LICENSE.md` (source-available, not an open-source license; no production use) |
@@ -664,7 +664,7 @@ including comments and unit tests); they serve for orientation only.
 
 ### 4.4 External Dependencies
 
-Versions according to `Cargo.lock` of NHyDB 0.27.0:
+Versions according to `Cargo.lock` of NHyDB 0.27.1:
 
 | Crate | Version | Usage |
 |---|---|---|
@@ -1765,7 +1765,7 @@ user profile applies. Secret keys never belong in the configuration file.
 | `nhydb.query` | `Q`, expression classes, native `QueryEngine`, `expr_from_spec`, `parse_sql`, SQL dataclasses, CLI |
 
 Module constants of `nhydb`: `REALM_SPAN` (`10**100`), `ENGINE_VERSION`
-(`"0.27.0"`, the product version), `FILE_FORMAT_VERSION` (`"0.16"`, internal
+(`"0.27.1"`, the product version), `FILE_FORMAT_VERSION` (`"0.16"`, internal
 identifier of the file format), `TYPE_CODES`. `nhydb.query` additionally provides
 `QUERY_VERSION` (`"0.27"`) and `SQL_LANGUAGE_VERSION` (`"NHySQL-0.24"`)
 (section 18.3).
@@ -2044,16 +2044,17 @@ Rules:
   keys (fixed system settings).
 * Relative path templates refer to the directory of the database.
 * **Note on the `[cache]` section:** The keys are parsed and
-  validated, but in NHyDB 0.27.0 the engine uses fixed
+  validated, but in NHyDB 0.27.1 the engine uses fixed
   compiled-in values (block cache 64 MiB, v index 4,194,304 skip marks
   and 4,096 indexes). See section 19.1.
 
 ### 17.3 Installation and Build from Source
 
-**Installing a wheel:**
+**Installing from PyPI** (prebuilt wheels for CPython 3.9–3.14 on Linux
+x86_64/aarch64, macOS x86_64/arm64 and Windows x64):
 
 ```bash
-pip install nhydb-0.27.0-<platform>.whl
+pip install nhydb
 pip install numpy                             # optional, for the NumPy API
 ```
 
@@ -2064,7 +2065,7 @@ python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install maturin
 maturin build --release --out dist   # wheel in dist/
-pip install dist/nhydb-0.27.0-*.whl
+pip install dist/nhydb-0.27.1-*.whl
 # alternatively, build and install in one step:
 pip install .
 ```
@@ -2168,7 +2169,7 @@ is missing; `test_sql.py` skips the NumPy output test without `numpy`.
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| Product version | `0.27.0` | identical in the Cargo workspace (`nhydb-core`, `nhydb-py`), the Python package `nhydb` (version via maturin from Cargo) and `nhydb.ENGINE_VERSION` |
+| Product version | `0.27.1` | identical in the Cargo workspace (`nhydb-core`, `nhydb-py`), the Python package `nhydb` (version via maturin from Cargo) and `nhydb.ENGINE_VERSION` |
 | File identifier | `NHYDB016` (`FILE_FORMAT_VERSION = "0.16"`, block version 16) | internal identifier of the file format; changes only when the on-disk format changes, independent of the product version |
 | `QUERY_VERSION` | `"0.27"` | identifier of the query layer; appears as `query_version` in query results; not a product version |
 | `SQL_LANGUAGE_VERSION` | `"NHySQL-0.24"` | identifier of the NHySQL language scope; appears as `language` in SQL results; not a product version |
@@ -2254,7 +2255,7 @@ tenth row.
 | Context manager | `__exit__` commits even after an exception in the `with` block |
 | Plugins | callbacks into the same DB during a write operation not supported (`RuntimeError`); CUSTOM logic must be registered at runtime |
 | `[cache]` configuration | keys are parsed and validated but not yet used by the engine (fixed: 64 MiB block cache, 4,194,304 skip marks, 4,096 v indexes); the value `vindex_max_marks = 4000000` in the configuration example deviates from the compiled-in value |
-| Parameter `strict` | is stored but does not affect the open path in NHyDB 0.27.0; opening is always fail closed |
+| Parameter `strict` | is stored but does not affect the open path in NHyDB 0.27.1; opening is always fail closed |
 | Older format revisions | files with a file identifier other than `NHYDB016` cannot be read; no converter |
 | ID ranges | `shape_id`, `layout_id`, `index_id`, `block_id` ≤ 2^64−1; enum codes `i64`; mathematical coordinates unbounded |
 | NumPy coordinates | `u`/`v`/`object_id` arrays limited to `uint64` |

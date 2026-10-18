@@ -11,7 +11,7 @@ The storage engine is written in native Rust; the Python package `nhydb`
 binds it via PyO3 and offers single operations as well as NumPy batch
 operations.
 
-Version: **0.27.0** · Platforms: macOS, Linux, Windows · License: see
+Version: **0.27.1** · Platforms: macOS, Linux, Windows · License: see
 [`LICENSE.md`](LICENSE.md)
 
 ## Features
@@ -40,12 +40,16 @@ Version: **0.27.0** · Platforms: macOS, Linux, Windows · License: see
 
 ## Installation
 
-From a prebuilt wheel (see the *Releases* page of the repository):
+From PyPI (prebuilt wheels for CPython 3.9–3.14 on Linux x86_64/aarch64,
+macOS x86_64/arm64 and Windows x64):
 
 ```bash
-pip install nhydb-0.27.0-<platform>.whl
+pip install nhydb
 pip install numpy          # optional, for the NumPy batch API
 ```
+
+The same files are attached to each release on the *Releases* page of the
+repository.
 
 From source (requires a Rust toolchain, see [`BUILDING.md`](BUILDING.md)):
 

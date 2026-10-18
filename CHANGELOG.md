@@ -5,6 +5,14 @@ The project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.27.1] – 2026-10-18
+
+### Added
+
+* Prebuilt wheels for CPython 3.9–3.14 on Linux (x86_64, aarch64;
+  manylinux_2_28), macOS (x86_64, arm64) and Windows (x64), published on
+  PyPI: `pip install nhydb`.
+
 ### Changed
 
 * `close()` releases the file handle and the write lock immediately, not only
