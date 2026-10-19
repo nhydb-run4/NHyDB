@@ -16,6 +16,9 @@ used from Python.
 **→ [Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
 task-oriented guide with tested examples for the complete Python API.
 
+**→ Interactive Jupyter Notebooks — [English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md) | [Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md)** –
+22 runnable notebooks per language, including all 57 Python Cookbook examples.
+
 ## The addressing idea
 
 A cell is addressed by `(R, u, v, lane)`: realm `R`, record `u`, field or
@@ -105,6 +108,41 @@ Measured throughput figures and their exact test conditions are documented
 in the
 [technical documentation, section 18.5](https://github.com/nhydb/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md#185-benchmarks).
 
+## Learn NHyDB interactively — Jupyter Notebooks
+
+NHyDB comes with a complete interactive notebook series in
+**[English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md)** and **[Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md)**.
+Each language contains 15 guided notebooks and 7 reference notebooks.
+
+The guided notebooks connect the mathematics of the Dynadron with real
+database experiments. Each idea is explained briefly and then shown with code
+you can run; the diagrams and visualizations are drawn from data the engine
+actually stored. Topics include mathematical addressing, records and layouts,
+MATH_MAP, storage on disk and persistence, indexes and queries, NumPy batches,
+the encrypted layout plan and its key (ENC/KEY), benchmarks on your own
+machine and a complete small application. You can execute every example,
+change its parameters and run your own experiments.
+
+The seven reference notebooks contain all 57 tested examples of the
+[Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)
+as runnable cells, each followed by the output documented in the cookbook.
+The cookbook remains the authoritative reference; the notebooks let you run
+and explore its examples step by step.
+
+The notebooks were written for NHyDB 0.27.1 and are stored with their outputs,
+so they can also be read directly on GitHub. To run them locally, clone the
+repository and start JupyterLab in its `notebooks/` folder; it opens in your
+browser:
+
+```bash
+git clone https://github.com/nhydb/NHyDB.git
+cd NHyDB/notebooks
+python -m pip install "nhydb==0.27.1" numpy pandas matplotlib jupyterlab ipykernel
+python -m jupyterlab
+```
+
+Step-by-step instructions are in the notebook READMEs.
+
 ## Documentation
 
 * **[Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
@@ -112,6 +150,10 @@ in the
   NHySQL, NumPy, layouts, MATH_MAP, configuration, maintenance, backups,
   errors and locking, complete application examples and an API reference.
   All examples are executed by the test suite.
+* **Jupyter notebooks:** [English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md) ·
+  [Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md) – 15 guided notebooks
+  and 7 reference notebooks per language. The reference notebooks present the
+  57 cookbook examples as runnable cells with the cookbook's expected output.
 * [Technical documentation (English)](https://github.com/nhydb/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md) ·
   [Technische Dokumentation (Deutsch)](https://github.com/nhydb/NHyDB/blob/main/docs/de/NHyDB_Technische_Dokumentation.md) –
   mathematics, architecture, file format, guarantees.
