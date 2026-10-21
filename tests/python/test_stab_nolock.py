@@ -8,7 +8,6 @@ with changes detects the concurrent writer and commits nothing
 Crashes are simulated in a sub process only.
 """
 import hashlib
-import signal
 import subprocess
 import sys
 import textwrap
@@ -98,7 +97,7 @@ def test_nolock_close_then_writer_crash_keeps_acknowledged_commit(tmp_path):
         assert w.stdout.readline().strip() == "ack3"
         r.close()  # reader-like handle without changes
     finally:
-        w.send_signal(signal.SIGKILL)
+        w.kill()  # SIGKILL on POSIX, TerminateProcess on Windows
         w.wait()
     x = nhydb.NHyDB(str(p))  # locked open after the writer crash
     assert x.get(1, 2) is not None

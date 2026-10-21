@@ -57,7 +57,9 @@ def test_n1_readonly_open_during_schema_commits(tmp_path):
     only keeps two generations) and must see monotonically growing data."""
     p = str(tmp_path / "s.nhydb")
     _classic(p).close()
-    w = subprocess.Popen([sys.executable, "-c", WRITER, p, "3.0"], stdout=subprocess.PIPE, text=True)
+    # commits are slower on Windows: longer writer run, lower bar
+    seconds, min_schema_commits = ("10.0", 10) if os.name == "nt" else ("3.0", 20)
+    w = subprocess.Popen([sys.executable, "-c", WRITER, p, seconds], stdout=subprocess.PIPE, text=True)
     try:
         assert w.stdout.readline().strip() == "ready"
         failures, opens, last = [], 0, 0
@@ -81,7 +83,7 @@ def test_n1_readonly_open_during_schema_commits(tmp_path):
             w.kill()
     assert w.returncode == 0, out
     schema_commits = int(out.split()[-1])
-    assert schema_commits >= 20, out
+    assert schema_commits >= min_schema_commits, out
     assert opens >= 5
     assert failures == [], failures[:5]
     r = nhydb.NHyDB(p, readonly=True)

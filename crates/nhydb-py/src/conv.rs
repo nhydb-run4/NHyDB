@@ -97,6 +97,9 @@ pub(crate) fn io_err(e: std::io::Error, filename: Option<String>) -> PyErr {
             let text = text.strip_suffix(&suffix).unwrap_or(&text).to_string();
             os_error(code, text, filename)
         }
+        // Windows has no OS code for "is a directory": errno EISDIR (21 in
+        // the C runtimes of all platforms) gives `IsADirectoryError` there too.
+        None if e.kind() == std::io::ErrorKind::IsADirectory => os_error(21, "Is a directory".to_string(), filename),
         None => match filename {
             Some(f) => PyOSError::new_err(format!("{e}: '{f}'")),
             None => PyErr::from(e),

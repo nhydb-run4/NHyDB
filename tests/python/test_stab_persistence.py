@@ -339,7 +339,7 @@ def test_overwrite_with_shared_key_template(tmp_path):
     keys = tmp_path / "secure"
     for d in ("A", "B"):
         (tmp_path / d).mkdir()
-        (tmp_path / d / "nhydb_config.toml").write_text(f'[paths]\nkey_path = "{keys}/{{db}}.layout.key"\n')
+        (tmp_path / d / "nhydb_config.toml").write_text(f'[paths]\nkey_path = "{keys.as_posix()}/{{db}}.layout.key"\n')
     _classic(tmp_path / "A" / "kunden.nhydb").close()
     with pytest.raises(FileExistsError):
         nhydb.NHyDB.create(tmp_path / "B" / "kunden.nhydb")
@@ -349,7 +349,7 @@ def test_overwrite_with_shared_key_template(tmp_path):
     # unique template placeholder separates the two databases
     for d in ("A", "B"):
         (tmp_path / d / "nhydb_config.toml").write_text(
-            f'[paths]\nkey_path = "{keys}/{{db}}.{{db_path_hash}}.layout.key"\n')
+            f'[paths]\nkey_path = "{keys.as_posix()}/{{db}}.{{db_path_hash}}.layout.key"\n')
     nhydb.NHyDB.create(tmp_path / "B" / "kunden.nhydb").close()
     assert len(list(keys.glob("kunden.nhydb.*.layout.key"))) == 1
 
