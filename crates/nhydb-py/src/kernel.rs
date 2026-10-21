@@ -23,11 +23,15 @@ use crate::exceptions::{CorruptionError, SchemaError};
 fn field_of(obj: &Bound<'_, PyAny>) -> PyResult<FieldDef> {
     let typ: String = obj.getattr("type")?.extract()?;
     let t = TypeCode::from_name(&typ).ok_or_else(|| SchemaError::new_err(format!("type {} unknown", Val::str(typ.as_str()).py_repr())))?;
+    // F056: a present but invalid attribute is an error, not silently 0/""
     let v = match obj.getattr("v") {
-        Ok(x) => crate::conv::to_nat(&x).unwrap_or(Nat::ZERO),
-        Err(_) => Nat::ZERO,
+        Ok(x) if !x.is_none() => crate::conv::to_nat(&x)?,
+        _ => Nat::ZERO,
     };
-    let name: String = obj.getattr("name").and_then(|n| n.extract()).unwrap_or_default();
+    let name: String = match obj.getattr("name") {
+        Ok(n) if !n.is_none() => n.extract()?,
+        _ => String::new(),
+    };
     let mut f = FieldDef::new(v, name, t);
     if let Ok(e) = obj.getattr("enum") {
         if !e.is_none() {
@@ -136,7 +140,7 @@ fn dec_value(py: Python<'_>, field: &Bound<'_, PyAny>, buf: &Bound<'_, PyAny>, p
     let f = field_of(field)?;
     let raw: Vec<u8> = buf.call_method0("__bytes__").or_else(|_| PyBytes::new(py, &[]).get_type().call1((buf,)))?.extract()?;
     let mut p = pos;
-    let v = decode_value(&f, &raw, &mut p).py()?;
+    let v = decode_value(&f, &raw, &mut p).py()?; // F041: pos overflow → CorruptionError
     Ok((from_val(py, &v)?, p))
 }
 
@@ -292,9 +296,12 @@ fn unpack_super<'py>(py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyDict>
 }
 
 #[pyfunction]
-#[pyo3(signature = (bt, bid, payload, *, flags=0))]
-fn pack_block_header<'py>(py: Python<'py>, bt: u8, bid: u64, payload: &[u8], flags: i64) -> Bound<'py, PyBytes> {
-    PyBytes::new(py, &format::pack_block_header(bt, bid, payload, (flags & 0xFFFF) as u16))
+#[pyo3(signature = (bt, bid, payload, *, flags=None))]
+fn pack_block_header<'py>(py: Python<'py>, bt: u8, bid: u64, payload: &[u8], flags: Option<BigInt>) -> Bound<'py, PyBytes> {
+    // reference: `int(flags) & 0xFFFF` for any int (two's complement semantics)
+    use num_traits::ToPrimitive;
+    let masked = (flags.unwrap_or_default() & BigInt::from(0xFFFF)).to_u16().unwrap_or(0);
+    PyBytes::new(py, &format::pack_block_header(bt, bid, payload, masked))
 }
 
 #[pyfunction]
@@ -303,9 +310,10 @@ fn unpack_block_header(raw: &[u8]) -> PyResult<(u8, u16, u64, u64, u32)> {
     Ok((h.block_type, h.flags, h.block_id, h.payload_len, h.payload_crc))
 }
 
+/// Reference `align8`: `(int(n) + 7) & ~7` on unbounded integers (F056).
 #[pyfunction]
-fn align8(n: u64) -> u64 {
-    format::align8(n)
+fn align8(n: BigInt) -> BigInt {
+    (n + 7) & BigInt::from(-8)
 }
 
 #[pyfunction]
@@ -341,7 +349,8 @@ fn _unicode_map(kind: &str, s: &str) -> PyResult<String> {
         "lower" => unicode::lower(s),
         "upper" => unicode::upper(s),
         "strip" => unicode::strip(s).to_string(),
-        _ => return Err(PyValueError::new_err("kind: casefold|lower|upper|strip")),
+        "nfc" => unicode::nfc(s),
+        _ => return Err(PyValueError::new_err(format!("{}|nfc", "kind: casefold|lower|upper|strip"))),
     })
 }
 

@@ -353,7 +353,10 @@ impl Db {
             }
             dense_count = dense_count.add(&ce.checked_sub(&cs).unwrap().add_u64(1));
         }
+        // P021: membership via a hash set (was `Vec::contains`, quadratic in
+        // the number of sparse u groups); the counts do not depend on order.
         let mut sparse_u: Vec<(Lane, Nat)> = Vec::new();
+        let mut sparse_seen: std::collections::HashSet<(Lane, Nat)> = std::collections::HashSet::new();
         for lane in [0u8, 1] {
             if let Some(idx) = self.sparse.get(&(realm.clone(), lane)) {
                 for seg in &idx.segs {
@@ -366,7 +369,7 @@ impl Db {
                     let bi = self.sparse_block_index(seg)?;
                     for (u, _, _) in bi.iter() {
                         if risky.iter().any(|ch| ch.contains(u)) {
-                            if !sparse_u.contains(&(lane, u.clone())) {
+                            if sparse_seen.insert((lane, u.clone())) {
                                 sparse_u.push((lane, u.clone()));
                             }
                             add_sample(&mut samples, u);
@@ -577,7 +580,7 @@ impl Db {
             let old = self.realms[&realm_id].clone();
             if old.default_shape_id.is_none() || (spec.u_start == 1 && spec.u_end.is_none()) {
                 let brt = old.base_reserve_to.clone().max(spec.base_reserve_to.clone());
-                self.create_realm(&realm_id, &old.name, &old.description, spec.shape_id, &brt)?;
+                self.store_realm_def(&realm_id, &old.name, &old.description, spec.shape_id, &brt)?;
             }
         }
         Ok(lay)

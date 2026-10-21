@@ -321,10 +321,10 @@ impl Db {
     }
 
     fn rec_span_for(&self, realm: &Nat, u: &Nat, seg: &SparseSegment) -> Result<Option<RecSpan>> {
-        let Some((payload, rel, len)) = self.read_sparse_record_bytes(seg, u)? else {
+        let Some((raw, rel)) = self.read_sparse_record_bytes(seg, u)? else {
             return Ok(None);
         };
-        self.scan_record(realm, u, &payload[rel..rel + len], seg.block_offset, rel)
+        self.scan_record(realm, u, &raw, seg.block_offset, rel)
     }
 
     /// v index of the u group (cached).
@@ -333,10 +333,34 @@ impl Db {
             return Ok(None);
         };
         let key = (realm.clone(), lane, u.clone());
-        if let Some(x) = self.cache().sparse_uindex.get(&key) {
-            if x.segs_seen == idx.segs.len() {
-                return Ok(Some(x.clone()));
+        let n = idx.segs.len();
+        // P019: an index built before later sparse blocks were written is
+        // brought up to date here, for this u only (the write path no longer
+        // touches every cached index of the realm/lane).
+        let stale = {
+            let mut c = self.cache();
+            match c.sparse_uindex.get(&key) {
+                Some(x) if x.segs_seen == n => return Ok(Some(x.clone())),
+                Some(x) if x.segs_seen < n => {
+                    let x = c.sparse_uindex.remove(&key).expect("present");
+                    c.uindex_ck = c.uindex_ck.saturating_sub(x.ck_count());
+                    Some(x)
+                }
+                _ => None,
             }
+        };
+        if let Some(mut ui) = stale {
+            let m = Arc::make_mut(&mut ui);
+            for seg in &idx.segs[m.segs_seen..] {
+                if &seg.u_start <= u && u <= &seg.u_end {
+                    if let Some(r) = self.rec_span_for(realm, u, seg)? {
+                        m.push(r);
+                    }
+                }
+            }
+            m.segs_seen = n;
+            self.store_uindex(key, ui.clone());
+            return Ok(Some(ui));
         }
         let mut hits = Vec::new();
         idx.iv.stab(u, &mut hits);
@@ -375,14 +399,15 @@ impl Db {
         for &i in &hits {
             let seg = &idx.segs[i];
             let bi = self.sparse_block_index(seg)?;
-            let payload = self.block_payload(seg.block_offset)?;
+            let acc = self.block_access(seg.block_offset)?;
             for (k, uu) in us.iter().enumerate() {
                 let Ok(j) = bi.binary_search_by(|(x, _, _)| x.cmp(uu)) else {
                     continue;
                 };
                 let (_, abs, len) = &bi[j];
                 let rel = (abs - seg.payload_offset) as usize;
-                if let Some(r) = self.scan_record(realm, uu, &payload[rel..rel + *len as usize], seg.block_offset, rel)? {
+                let raw = self.access_range(&acc, seg.block_offset, rel, *len as usize)?;
+                if let Some(r) = self.scan_record(realm, uu, &raw, seg.block_offset, rel)? {
                     uis[k].push(r);
                 }
             }
@@ -416,45 +441,6 @@ impl Db {
         c.sparse_uindex.insert(key, ui);
     }
 
-    /// After writing (and registering) a sparse block: update cached
-    /// v indexes of the same `(realm, lane)`; affected
-    /// u groups receive the new record.
-    pub(crate) fn uindex_note_written(&mut self, realm: &Nat, lane: Lane, us: &[Nat]) {
-        let Some(idx) = self.sparse.get(&(realm.clone(), lane)) else {
-            return;
-        };
-        let seg_idx = idx.segs.len() - 1;
-        let keys: Vec<(Nat, Lane, Nat)> = self
-            .cache()
-            .sparse_uindex
-            .keys()
-            .filter(|(r, l, _)| r == realm && *l == lane)
-            .cloned()
-            .collect();
-        for key in keys {
-            let Some(mut ui) = self.cache().sparse_uindex.remove(&key) else {
-                continue;
-            };
-            {
-                let mut c = self.cache();
-                c.uindex_ck = c.uindex_ck.saturating_sub(ui.ck_count());
-            }
-            // only update if the index was current up to the previous segment
-            if ui.segs_seen != seg_idx {
-                continue;
-            }
-            let r = if us.contains(&key.2) { self.rec_span_for(realm, &key.2, &idx.segs[seg_idx]) } else { Ok(None) };
-            if let Ok(r) = r {
-                let m = Arc::make_mut(&mut ui);
-                if let Some(r) = r {
-                    m.push(r);
-                }
-                m.segs_seen = seg_idx + 1;
-                self.store_uindex(key, ui);
-            }
-        }
-    }
-
     /// Newest state of a sparse cell or `None` (never written).
     pub(crate) fn sparse_point(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<SVal>> {
         let Some(ui) = self.sparse_uindex(realm, u, lane)? else {
@@ -466,9 +452,13 @@ impl Db {
         let mut res = LazyResolver::new(self, realm, u);
         for i in hits {
             let r = &ui.recs[i];
-            let payload = self.block_payload(r.block_offset)?;
-            let raw = &payload[r.rel..r.rel + r.len];
-            if let Some(s) = find_in_record(r, raw, v, realm, &mut res)? {
+            if v < &r.v_first || v > &r.v_last {
+                continue;
+            }
+            // only the bytes between the two checkpoints around v (P001)
+            let w = window(r, v, v);
+            let raw = self.block_range(r.block_offset, r.rel + w.start, w.end - w.start)?;
+            if let Some(s) = find_in_record(&w, &raw, v, realm, &mut res)? {
                 return Ok(Some(s));
             }
         }
@@ -490,9 +480,9 @@ impl Db {
         let mut res = LazyResolver::new(self, realm, u);
         for i in hits {
             let r = &ui.recs[i];
-            let payload = self.block_payload(r.block_offset)?;
-            let raw = &payload[r.rel..r.rel + r.len];
-            range_in_record(r, raw, lo, hi, realm, &mut res, &mut out)?;
+            let w = window(r, lo, hi);
+            let raw = self.block_range(r.block_offset, r.rel + w.start, w.end - w.start)?;
+            range_in_record(&w, &raw, lo, hi, realm, &mut res, &mut out)?;
         }
         Ok(out)
     }
@@ -504,14 +494,32 @@ fn start_ck<'r>(r: &'r RecSpan, x: &Nat) -> &'r Ck {
     &r.ck[i.saturating_sub(1)]
 }
 
-fn find_in_record(r: &RecSpan, raw: &[u8], v: &Nat, realm: &Nat, res: &mut LazyResolver<'_>) -> Result<Option<SVal>> {
-    if v < &r.v_first || v > &r.v_last {
-        return Ok(None);
-    }
-    let c = start_ck(r, v);
-    let mut p = c.pos as usize;
-    let mut prev = c.prev.clone();
-    for _ in c.idx..r.count {
+/// Part of a sparse record that can contain cells with `lo <= v <= hi`:
+/// from the checkpoint at or before `lo` up to the first checkpoint with
+/// `v > hi` (exclusive) or the end of the record. Byte positions are
+/// relative to the record, `start` is the first byte of the window.
+struct Window<'r> {
+    ck: &'r Ck,
+    start: usize,
+    end: usize,
+    end_idx: u64,
+}
+
+fn window<'r>(r: &'r RecSpan, lo: &Nat, hi: &Nat) -> Window<'r> {
+    let c = start_ck(r, lo);
+    let j = r.ck.partition_point(|c| &c.v <= hi);
+    let (end, end_idx) = match r.ck.get(j) {
+        Some(n) if n.idx > c.idx => (n.pos as usize, n.idx),
+        Some(_) => (c.pos as usize, c.idx),
+        None => (r.len, r.count),
+    };
+    Window { ck: c, start: c.pos as usize, end, end_idx }
+}
+
+fn find_in_record(w: &Window<'_>, raw: &[u8], v: &Nat, realm: &Nat, res: &mut LazyResolver<'_>) -> Result<Option<SVal>> {
+    let mut p = 0usize;
+    let mut prev = w.ck.prev.clone();
+    for _ in w.ck.idx..w.end_idx {
         let h = read_head(raw, &mut p, &prev, realm)?;
         if &h.v == v {
             return res.decode(&h, raw, &mut p).map(Some);
@@ -526,7 +534,7 @@ fn find_in_record(r: &RecSpan, raw: &[u8], v: &Nat, realm: &Nat, res: &mut LazyR
 }
 
 fn range_in_record(
-    r: &RecSpan,
+    w: &Window<'_>,
     raw: &[u8],
     lo: &Nat,
     hi: &Nat,
@@ -534,10 +542,9 @@ fn range_in_record(
     res: &mut LazyResolver<'_>,
     out: &mut BTreeMap<Nat, SVal>,
 ) -> Result<()> {
-    let c = start_ck(r, lo);
-    let mut p = c.pos as usize;
-    let mut prev = c.prev.clone();
-    for _ in c.idx..r.count {
+    let mut p = 0usize;
+    let mut prev = w.ck.prev.clone();
+    for _ in w.ck.idx..w.end_idx {
         let h = read_head(raw, &mut p, &prev, realm)?;
         if &h.v > hi {
             break;

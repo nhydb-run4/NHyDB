@@ -3,11 +3,55 @@
 All tests run against the installed ``nhydb`` package.
 """
 import struct
+import zlib
 from pathlib import Path
 
 import pytest
 
 import nhydb
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _source_files(root):
+    """Same file set and order as ``crates/nhydb-py/build.rs`` (T024)."""
+    files = [root / r for r in ("Cargo.toml", "Cargo.lock", "crates/nhydb-core/Cargo.toml", "crates/nhydb-py/Cargo.toml")]
+    for d in ("crates/nhydb-core/src", "crates/nhydb-py/src"):
+        files += (root / d).rglob("*.rs")
+    rel = sorted((p.relative_to(root).as_posix(), p) for p in files if p.is_file())
+    return rel
+
+
+def source_hash(root=ROOT):
+    """CRC-32 fingerprint of the Rust sources (None outside a source checkout)."""
+    if not (root / "crates/nhydb-core/src").is_dir():
+        return None
+    crc = 0
+    for rel, p in _source_files(root):
+        for part in (rel.encode(), b"\0", p.read_bytes(), b"\0"):
+            crc = zlib.crc32(part, crc)
+    return f"crc32:{crc:08x}"
+
+
+def pytest_configure(config):
+    """Warn (never fail) if the installed native module does not match the checkout."""
+    built = getattr(nhydb._native, "BUILD_SOURCE_HASH", None)
+    here = source_hash()
+    if here is not None and built not in (None, "unknown") and built != here:
+        config.issue_config_time_warning(
+            pytest.PytestWarning(
+                f"nhydb native module was built from other sources ({built}) than this checkout ({here}); "
+                "rebuild it (maturin develop) before trusting the test results"
+            ),
+            stacklevel=2,
+        )
+
+
+def pytest_report_header(config):
+    built = getattr(nhydb._native, "BUILD_SOURCE_HASH", None)
+    here = source_hash()
+    state = "n/a" if here is None or built in (None, "unknown") else ("ok" if built == here else "MISMATCH")
+    return f"nhydb native build: {built} (checkout {here}, {state})"
 
 DATA_START = 8192
 BT_SYSTEM = 13

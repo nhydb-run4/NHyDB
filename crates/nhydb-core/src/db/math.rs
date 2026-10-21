@@ -11,12 +11,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
-use crate::codec::TypeCode;
+use crate::codec::{int_like, TypeCode};
 use crate::error::{Error, Result};
 use crate::mathexpr::{MathMap, MathMapLayoutSpec, MathMapTarget};
 use crate::mathlayout::{
-    plan_math_realms, resolve_math_target, validate_map_against_snapshot, validate_plan, CoreLayoutSnapshot, MathRealmMap,
-    OwnedRealmExtent,
+    coalesce_math_extents, plan_math_realms, resolve_math_target, validate_map_against_snapshot, validate_plan, CoreLayoutSnapshot, MathRealmMap,
+    OwnedRealmExtent, ResolvedMathCell,
 };
 use crate::nat::Nat;
 use crate::val::Val;
@@ -39,6 +39,10 @@ pub struct MathLayoutState {
     pub frozen: bool,
     pub created_block_id: u64,
     pub first_write_block_id: Option<u64>,
+    /// `math_max_intermediate_bits` frozen when the layout is created (F030):
+    /// writing and reading always evaluate the mapping with the same limit,
+    /// independent of the configuration of a later session.
+    pub max_intermediate_bits: u64,
 }
 
 fn schema(m: impl Into<String>) -> Error {
@@ -58,6 +62,7 @@ impl MathLayoutState {
         if layout_id == 0 {
             return Err(Error::Value("layout_id must be > 0".into()));
         }
+        crate::schema::check_id("layout_id", layout_id)?;
         let pt = TypeCode::from_name(payload_type)
             .ok_or_else(|| schema(format!("unknown MATH payload type {}", Val::str(payload_type).py_repr())))?;
         if realm_map.layout_id != BigInt::from(layout_id) {
@@ -78,7 +83,16 @@ impl MathLayoutState {
         if first_write_block_id.is_some() && !frozen {
             return Err(schema("first_write_block_id requires frozen"));
         }
-        Ok(MathLayoutState { layout_id, spec, realm_map, payload_type: pt, frozen, created_block_id, first_write_block_id })
+        Ok(MathLayoutState {
+            layout_id,
+            spec,
+            realm_map,
+            payload_type: pt,
+            frozen,
+            created_block_id,
+            first_write_block_id,
+            max_intermediate_bits: crate::config::DEFAULT_MATH_MAX_INTERMEDIATE_BITS,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -87,11 +101,12 @@ impl MathLayoutState {
 
     pub fn to_val(&self) -> Val {
         vmap! {
-            "contract" => STATE_CONTRACT, "layout_id" => self.layout_id as i64,
+            "contract" => STATE_CONTRACT, "layout_id" => Val::int(self.layout_id),
             "spec" => self.spec.to_val(), "realm_map" => self.realm_map.to_val(),
             "payload_type" => self.payload_type.name(), "frozen" => self.frozen,
-            "created_block_id" => self.created_block_id as i64,
-            "first_write_block_id" => self.first_write_block_id.map(|b| Val::Int(b as i64)).unwrap_or(Val::None),
+            "created_block_id" => Val::int(self.created_block_id),
+            "first_write_block_id" => self.first_write_block_id.map(Val::int).unwrap_or(Val::None),
+            "max_intermediate_bits" => Val::int(self.max_intermediate_bits),
         }
     }
 
@@ -99,14 +114,39 @@ impl MathLayoutState {
         if d.get("contract").map(|v| v.py_str()).as_deref() != Some(STATE_CONTRACT) {
             return Err(schema("unknown MATH layout state contract"));
         }
-        let lid = d.get("layout_id").and_then(|v| v.as_i64()).ok_or_else(|| Error::Key("'layout_id'".into()))?;
+        // F004: persisted IDs/block IDs are never clamped; out of range = corruption.
+        let id_of = |k: &str, v: &Val| -> Result<u64> {
+            match int_like(v).and_then(|b| b.to_u64()) {
+                Some(x) => Ok(x),
+                None => Err(Error::Corruption(format!("MATH state {k}: {} outside 0..2^64-1", v.py_repr()))),
+            }
+        };
+        let lid = id_of("layout_id", d.get("layout_id").ok_or_else(|| Error::Key("'layout_id'".into()))?)?;
+        if lid > crate::schema::MAX_ID {
+            return Err(Error::Corruption(format!("MATH state layout_id {lid} outside 0..2^63-1")));
+        }
         let spec = MathMapLayoutSpec::from_val(d.get("spec").ok_or_else(|| Error::Key("'spec'".into()))?)?;
         let rm = MathRealmMap::from_val(d.get("realm_map").ok_or_else(|| Error::Key("'realm_map'".into()))?)?;
         let pt = d.get("payload_type").map(|v| v.py_str()).unwrap_or_else(|| "bytes".into());
         let frozen = d.get("frozen").map(|v| v.is_truthy()).unwrap_or(false);
-        let created = d.get("created_block_id").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64;
-        let first = d.get("first_write_block_id").and_then(|v| v.as_i64()).map(|b| b as u64);
-        MathLayoutState::new(lid.max(0) as u64, spec, rm, &pt, frozen, created, first)
+        let created = match d.get("created_block_id") {
+            None | Some(Val::None) => 0,
+            Some(v) => id_of("created_block_id", v)?,
+        };
+        let first = match d.get("first_write_block_id") {
+            None | Some(Val::None) => None,
+            Some(v) => Some(id_of("first_write_block_id", v)?),
+        };
+        let bits = match d.get("max_intermediate_bits") {
+            None | Some(Val::None) => crate::config::DEFAULT_MATH_MAX_INTERMEDIATE_BITS,
+            Some(v) => match id_of("max_intermediate_bits", v)? {
+                0 => return Err(Error::Corruption("MATH state max_intermediate_bits must be > 0".into())),
+                b => b,
+            },
+        };
+        let mut st = MathLayoutState::new(lid, spec, rm, &pt, frozen, created, first)?;
+        st.max_intermediate_bits = bits;
+        Ok(st)
     }
 }
 
@@ -124,13 +164,20 @@ fn py_int(v: &Val) -> Result<Val> {
     Ok(match v {
         Val::Bool(b) => Val::Int(*b as i64),
         Val::Int(_) | Val::Big(_) => v.clone(),
-        Val::Float(f) if f.is_finite() => Val::from_bigint(BigInt::from(f.trunc() as i128)),
-        Val::Str(s) => {
-            let t = crate::unicode::strip(s).replace('_', "");
-            Val::from_bigint(
-                t.parse::<BigInt>()
-                    .map_err(|_| Error::Value(format!("invalid literal for int() with base 10: {}", Val::str(s.as_str()).py_repr())))?,
-            )
+        // F031: exact truncation (no saturation at i128), NaN/inf → ValueError
+        Val::Float(f) if f.is_nan() => return Err(Error::Value("cannot convert float NaN to integer".into())),
+        Val::Float(f) if f.is_infinite() => return Err(Error::Value("cannot convert float infinity to integer".into())),
+        Val::Float(f) => {
+            use num_traits::FromPrimitive;
+            Val::from_bigint(BigInt::from_f64(f.trunc()).unwrap_or_default())
+        }
+        Val::Str(s) => Val::from_bigint(
+            crate::codec::parse_py_int(s)
+                .ok_or_else(|| Error::Value(format!("invalid literal for int() with base 10: {}", Val::str(s.as_str()).py_repr())))?,
+        ),
+        Val::Bytes(b) => {
+            let parsed = std::str::from_utf8(b).ok().filter(|s| s.is_ascii()).and_then(crate::codec::parse_py_int);
+            Val::from_bigint(parsed.ok_or_else(|| Error::Value(format!("invalid literal for int() with base 10: {}", v.py_repr())))?)
         }
         other => return Err(Error::Type(format!("int() argument must be a string, a bytes-like object or a real number, not {}", other.py_repr()))),
     })
@@ -278,7 +325,8 @@ impl Db {
             return Err(schema(format!("unknown payload type {}", Val::str(payload_type).py_repr())));
         }
         let rm = MathRealmMap::new(BigInt::from(lid), &spec.fingerprint(), Vec::new(), spec.realm_auto_limit.clone())?;
-        let rec = MathLayoutState::new(lid, spec, rm, payload_type, false, self.next_block_id, None)?;
+        let mut rec = MathLayoutState::new(lid, spec, rm, payload_type, false, self.next_block_id, None)?;
+        rec.max_intermediate_bits = self.config.math_max_intermediate_bits;
         self.append_block(crate::format::BT_MATH_LAYOUT_STATE, rec.to_val().to_json()?.as_bytes(), 0)?;
         self.math_layouts.insert(lid, rec.clone());
         if commit {
@@ -328,7 +376,9 @@ impl Db {
             return Err(schema(format!("unknown payload type {}", Val::str(typ.as_str()).py_repr())));
         }
         let rm = MathRealmMap::new(BigInt::from(old.layout_id), &spec.fingerprint(), Vec::new(), spec.realm_auto_limit.clone())?;
-        let rec = MathLayoutState::new(old.layout_id, spec, rm, &typ, false, old.created_block_id, None)?;
+        let mut rec = MathLayoutState::new(old.layout_id, spec, rm, &typ, false, old.created_block_id, None)?;
+        // nothing written yet: the replaced spec takes the current limit
+        rec.max_intermediate_bits = self.config.math_max_intermediate_bits;
         self.append_block(crate::format::BT_MATH_LAYOUT_STATE, rec.to_val().to_json()?.as_bytes(), 0)?;
         self.math_layouts.insert(old.layout_id, rec.clone());
         if commit {
@@ -348,25 +398,31 @@ impl Db {
             }
         }
         Ok(vmap! {
-            "layout_id" => rec.layout_id as i64, "kind" => "MATH", "name" => rec.name(),
+            "layout_id" => Val::int(rec.layout_id), "kind" => "MATH", "name" => rec.name(),
             "frozen" => rec.frozen, "payload_type" => rec.payload_type.name(),
             "mapping_fingerprint" => rec.spec.fingerprint(), "mapping" => rec.spec.mapping.to_val(),
             "mapped_realms" => Val::from_bigint(rec.realm_map.mapped_count()),
             "realm_extents" => Val::List(rec.realm_map.extents.iter().map(|e| e.to_val()).collect()),
             "realm_auto_limit" => Val::from_bigint(rec.realm_map.realm_auto_limit.clone()),
-            "created_block_id" => rec.created_block_id as i64,
-            "first_write_block_id" => rec.first_write_block_id.map(|b| Val::Int(b as i64)).unwrap_or(Val::None),
+            "created_block_id" => Val::int(rec.created_block_id),
+            "first_write_block_id" => rec.first_write_block_id.map(Val::int).unwrap_or(Val::None),
             "materialized_sparse_cells" => cells,
         })
     }
 
     fn math_target(&self, rec: &MathLayoutState, inputs: &[Val]) -> Result<MathMapTarget> {
         let ins: Vec<Val> = inputs.iter().map(py_int).collect::<Result<_>>()?;
-        rec.spec.mapping.target(&ins, self.config.math_max_intermediate_bits)
+        rec.spec.mapping.target(&ins, rec.max_intermediate_bits)
     }
 
     /// `put_math_batch(layout_id, rows, overwrite=False, commit=False)`
     pub fn put_math_batch(&mut self, layout_id: u64, rows: Vec<(Vec<Val>, Val)>, overwrite: bool, commit: bool) -> Result<Val> {
+        self.put_math_rows(layout_id, rows, overwrite, commit).map(|(v, _)| v)
+    }
+
+    /// `put_math_batch` returning the physical target cells as well (P008:
+    /// `put_math` evaluates the mapping only once).
+    fn put_math_rows(&mut self, layout_id: u64, rows: Vec<(Vec<Val>, Val)>, overwrite: bool, commit: bool) -> Result<(Val, Vec<ResolvedMathCell>)> {
         let rec = self.math_record(layout_id)?.clone();
         let mut materialized: Vec<(MathMapTarget, Val)> = Vec::with_capacity(rows.len());
         let mut logical_seen = HashSet::new();
@@ -386,16 +442,35 @@ impl Db {
             if commit {
                 self.commit()?;
             }
-            return Ok(vmap! {"cells" => 0i64, "new_realms" => 0i64, "blocks" => 0i64});
+            return Ok((vmap! {"cells" => 0i64, "new_realms" => 0i64, "blocks" => 0i64}, Vec::new()));
         }
         let mut needed: Vec<BigInt> = materialized.iter().map(|(t, _)| t.logical_realm.clone()).collect();
         needed.sort();
         needed.dedup();
-        let snapshot = self.math_layout_snapshot()?;
-        let plan = plan_math_realms(&snapshot, &rec.realm_map, &needed)?;
-        plan.require_allowed()?;
-        validate_plan(&snapshot, &rec.realm_map, &plan)?;
-        let preview = MathRealmMap::new(rec.realm_map.layout_id.clone(), &rec.spec.fingerprint(), plan.resulting_extents.clone(), rec.realm_map.realm_auto_limit.clone())?;
+        // P008: when every logical realm is already mapped, no realm is
+        // created and the RealmMap stays the same – the realm planner (a
+        // snapshot over all realms) and the full state validation are only
+        // needed when the RealmMap grows. The persisted state was validated
+        // when it was opened and after every change of realms/layouts.
+        let mut all_mapped = true;
+        for r in &needed {
+            if rec.realm_map.resolve(r)?.is_none() {
+                all_mapped = false;
+                break;
+            }
+        }
+        let (plan_extents, new_realms) = if all_mapped {
+            (Vec::new(), BigInt::zero())
+        } else {
+            let snapshot = self.math_layout_snapshot()?;
+            let plan = plan_math_realms(&snapshot, &rec.realm_map, &needed)?;
+            plan.require_allowed()?;
+            validate_plan(&snapshot, &rec.realm_map, &plan)?;
+            (plan.proposed_extents.clone(), plan.new_count.clone())
+        };
+        let mut resulting = rec.realm_map.extents.clone();
+        resulting.extend(plan_extents.iter().cloned());
+        let preview = MathRealmMap::new(rec.realm_map.layout_id.clone(), &rec.spec.fingerprint(), coalesce_math_extents(resulting)?, rec.realm_map.realm_auto_limit.clone())?;
         let resolved: Vec<_> = materialized.iter().map(|(t, _)| resolve_math_target(&preview, t)).collect::<Result<_>>()?;
         // Physical collisions within the batch imply logical ones (the RealmMap is
         // bijective) and are already rejected above; what remains to check is the
@@ -416,14 +491,16 @@ impl Db {
                 }
             }
         }
-        // rollback point (`_rollback_math_tail`)
+        // rollback point (`_rollback_math_tail`); without new realms only the
+        // state of this MATH layout changes, so the schema is exported only
+        // if the batch fails (after restoring that state).
         let start_len = self.store.len();
         let start_next = self.next_block_id;
         let start_last = self.last_valid_end;
-        let prior_schema = self.export_schema()?;
+        let prior_schema = if all_mapped { None } else { Some(self.export_schema()?) };
         let prior_dirty = self.sys.layout_dirty;
         let result = (|| -> Result<Val> {
-            for ext in &plan.proposed_extents {
+            for ext in &plan_extents {
                 let mut r = Nat::from_bigint(&ext.physical_start).unwrap();
                 let end = Nat::from_bigint(&ext.physical_end).unwrap();
                 while r <= end {
@@ -434,7 +511,7 @@ impl Db {
                     r = r.add_u64(1);
                 }
             }
-            let new_state = MathLayoutState::new(
+            let mut new_state = MathLayoutState::new(
                 rec.layout_id,
                 rec.spec.clone(),
                 preview.clone(),
@@ -443,6 +520,7 @@ impl Db {
                 rec.created_block_id,
                 Some(rec.first_write_block_id.unwrap_or(self.next_block_id)),
             )?;
+            new_state.max_intermediate_bits = rec.max_intermediate_bits;
             self.math_layouts.insert(rec.layout_id, new_state.clone());
             let mut order: Vec<(Nat, u8)> = Vec::new();
             let mut grouped: HashMap<(Nat, u8), Vec<CellInput>> = HashMap::new();
@@ -469,27 +547,41 @@ impl Db {
             }
             self.append_block(crate::format::BT_MATH_LAYOUT_STATE, new_state.to_val().to_json()?.as_bytes(), 0)?;
             self.math_layouts.insert(rec.layout_id, new_state);
-            self.validate_math_layout_state()?;
+            if !all_mapped {
+                self.validate_math_layout_state()?;
+            }
             if commit {
                 self.commit()?;
             }
             Ok(vmap! {
                 "cells" => cells_n, "blocks" => blocks_n, "bytes" => bytes_n,
-                "new_realms" => Val::from_bigint(plan.new_count.clone()),
+                "new_realms" => Val::from_bigint(new_realms.clone()),
                 "mapped_realms" => Val::from_bigint(preview.mapped_count()),
                 "realm_extents" => Val::List(preview.extents.iter().map(|e| e.to_val()).collect()),
             })
         })();
-        if result.is_err() {
-            self.rollback_math_tail(start_len, start_next, start_last, &prior_schema, prior_dirty)?;
+        match result {
+            Ok(v) => Ok((v, resolved)),
+            Err(e) => {
+                let prior_schema = match prior_schema {
+                    Some(s) => s,
+                    None => {
+                        self.math_layouts.insert(rec.layout_id, rec.clone());
+                        self.export_schema()?
+                    }
+                };
+                self.rollback_math_tail(start_len, start_next, start_last, &prior_schema, prior_dirty)?;
+                Err(e)
+            }
         }
-        result
     }
 
     /// `_rollback_math_tail`: truncate the file to its state before the batch and
-    /// rebuild the state from the file + previous schema.
-    fn rollback_math_tail(&mut self, file_len: u64, next_block_id: u64, last_valid_end: u64, prior_schema: &Val, prior_dirty: bool) -> Result<()> {
+    /// rebuild the state from the file + previous schema (also used by
+    /// [`Db::put_point_groups`]).
+    pub(super) fn rollback_math_tail(&mut self, file_len: u64, next_block_id: u64, last_valid_end: u64, prior_schema: &Val, prior_dirty: bool) -> Result<()> {
         self.store.rollback_to(file_len)?;
+        self.invalidate_blocks_from(file_len);
         self.reset_in_memory_state();
         self.next_block_id = next_block_id;
         let record = self.open_scan(last_valid_end)?;
@@ -501,12 +593,10 @@ impl Db {
 
     /// `put_math(layout_id, inputs, payload, overwrite=False, commit=False)`
     pub fn put_math(&mut self, layout_id: u64, inputs: &[Val], payload: Val, overwrite: bool, commit: bool) -> Result<Val> {
-        self.put_math_batch(layout_id, vec![(inputs.to_vec(), payload)], overwrite, commit)?;
-        let rec = self.math_record(layout_id)?.clone();
-        let t = self.math_target(&rec, inputs)?;
-        let addr = resolve_math_target(&rec.realm_map, &t)?;
+        let (_, mut resolved) = self.put_math_rows(layout_id, vec![(inputs.to_vec(), payload)], overwrite, commit)?;
+        let addr = resolved.pop().ok_or_else(|| Error::LayoutState("put_math: no target cell".into()))?;
         Ok(vmap! {
-            "layout_id" => rec.layout_id as i64, "physical_realm" => Val::from_bigint(addr.physical_realm),
+            "layout_id" => Val::int(layout_id), "physical_realm" => Val::from_bigint(addr.physical_realm),
             "u" => Val::from_bigint(addr.u), "v" => Val::from_bigint(addr.v_local),
             "lane" => addr.side, "lane_name" => if addr.side == 1 { "NR" } else { "NL" },
         })
@@ -523,7 +613,7 @@ impl Db {
         let cell = self.get_cell(&pr, &Nat::from_bigint(&t.u).unwrap(), &Val::from_bigint(t.v_local.clone()), t.side as u8, dyn_address)?;
         let Some(mut out) = cell else { return Ok(None) };
         let ins: Vec<Val> = inputs.iter().map(py_int).collect::<Result<_>>()?;
-        out.set("_math_layout_id", Val::Int(rec.layout_id as i64));
+        out.set("_math_layout_id", Val::int(rec.layout_id));
         out.set("_math_layout_name", Val::str(rec.name()));
         out.set("_math_inputs", Val::List(ins));
         out.set("_logical_realm", Val::from_bigint(t.logical_realm.clone()));

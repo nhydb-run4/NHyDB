@@ -35,7 +35,8 @@ pub fn lane_name(lane: Lane) -> &'static str {
 
 /// `normalize_lane` for text input.
 pub fn normalize_lane_str(s: &str) -> Result<Lane> {
-    let x = s.trim().to_uppercase();
+    // Python `str.strip().upper()` (F056: Unicode whitespace as in CPython)
+    let x = crate::unicode::upper(crate::unicode::strip(s));
     match x.as_str() {
         "0" | "NL" | "L" | "DEFAULT" => Ok(NL),
         "1" | "NR" | "R" => Ok(NR),
@@ -264,13 +265,23 @@ pub fn cell_address(realm: &Nat, u: &Nat, local_v: &Nat, lane: Lane) -> Result<C
 
 /// `parse_n_reference` for text input (`"N123"`, `"123"`).
 pub fn parse_n_reference(s: &str) -> Result<Nat> {
-    let raw = s.trim();
+    let strip = crate::unicode::strip;
+    let raw = strip(s);
     let raw = if raw.as_bytes().first().map(|c| c.eq_ignore_ascii_case(&b'N')).unwrap_or(false) {
-        raw[1..].trim()
+        strip(&raw[1..])
     } else {
         raw
     };
-    let n = Nat::parse_decimal(raw).ok_or_else(|| Error::Address(format!("invalid N reference '{s}'")))?;
+    // Python `raw.isdigit()` + `int(raw)`: Unicode decimal digits are accepted (F056)
+    let ascii: Option<String> = if raw.is_ascii() {
+        Some(raw.to_string())
+    } else {
+        raw.chars().map(|c| crate::unicode::decimal_value(c).map(|d| (b'0' + d) as char)).collect()
+    };
+    let n = ascii
+        .filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|a| Nat::parse_decimal(&a))
+        .ok_or_else(|| Error::Address(format!("invalid N reference '{s}'")))?;
     require_positive("N", &n)?;
     Ok(n)
 }

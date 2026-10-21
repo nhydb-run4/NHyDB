@@ -52,6 +52,7 @@ impl Db {
         dyn_v: Option<&Nat>,
         include_extensions: bool,
     ) -> Result<Option<Val>> {
+        self.check_open()?;
         let Some(rec) = self.get_internal(realm, u, lane)? else {
             return Ok(None);
         };
@@ -97,6 +98,7 @@ impl Db {
 
     /// Single cell (`get_cell`). `v` is int, `"v123"` or a field name.
     pub fn get_cell(&self, realm: &Nat, u: &Nat, v: &Val, lane: Lane, dyn_address: bool) -> Result<Option<Val>> {
+        self.check_open()?;
         let mut u = u.clone();
         let vnum: Nat = match v {
             Val::Str(s) => {
@@ -136,6 +138,21 @@ impl Db {
         let v = vnum;
         if v.is_zero() || u.is_zero() {
             return Ok(None);
+        }
+        // P016: BASE field of a dense record without overlays – decode only that field
+        if let Some(seg) = self.resolve_segment(realm, &u, lane) {
+            let shape_id = seg.shape_id;
+            if let Some(value) = self.dense_base_value(seg, realm, &u, &v, lane)? {
+                let name = self.shape_of(shape_id)?.by_v(&v).map(|f| f.name.clone()).unwrap_or_default();
+                let mut out = vmap! {
+                    "_realm" => realm, "_u" => &u, "_lane" => lane as i64, "_lane_name" => lane_name(lane),
+                    "_v" => &v, "_shape" => shape_id as i64, "field" => name, "present" => true, "value" => value,
+                };
+                if dyn_address {
+                    self.dyn_address(realm, &u, &v)?.flatten_into(&mut out);
+                }
+                return Ok(Some(out));
+            }
         }
         let rec = self.get_internal(realm, &u, lane)?;
         let Some(rec) = rec else {
@@ -177,8 +194,14 @@ impl Db {
     /// Cell value only (fast Rust access): None = not occupied.
     /// Same occupancy/value rules as `get_cell`, without envelope and field name.
     pub fn get_cell_value(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Val>> {
+        self.check_open()?;
         if v.is_zero() || u.is_zero() {
             return Ok(None);
+        }
+        if let Some(seg) = self.resolve_segment(realm, u, lane) {
+            if let Some(value) = self.dense_base_value(seg, realm, u, v, lane)? {
+                return Ok(Some(value));
+            }
         }
         let Some(rec) = self.get_internal(realm, u, lane)? else {
             return Ok(match self.sparse_point(realm, u, v, lane)? {
@@ -197,6 +220,8 @@ impl Db {
     }
 
     pub fn get_cell_n(&self, n: &Nat, dyn_address: bool) -> Result<Option<Val>> {
+
+        self.check_open()?;
         let a = n_to_address(n)?;
         if !self.realms.contains_key(a.realm()) {
             return Ok(None);
@@ -209,6 +234,8 @@ impl Db {
     // ------------------------------------------------------------------
 
     pub fn get_object(&self, r: &LayoutRef, obj: &Nat, lane: Lane, include_addresses: bool) -> Result<Option<Val>> {
+
+        self.check_open()?;
         let lay = self.layout_by_ref(r)?;
         if lay.kind == LayoutKind::Classic {
             return self.get(&lay.realm_id, obj, lane, None, None, true);
@@ -428,6 +455,8 @@ impl Db {
     // ------------------------------------------------------------------
 
     pub fn get_record_view(&self, r: &LayoutRef, obj: &Nat, lane: Lane, request_n: Option<&Nat>) -> Result<Val> {
+
+        self.check_open()?;
         let lay = self.layout_by_ref(r)?;
         address::require_positive("object_id", obj)?;
         let anchor = self.logical_address_in(lay, obj, &Val::None, lane)?;
@@ -518,6 +547,8 @@ impl Db {
     }
 
     pub fn get_resolved_address(&self, addr: &CellAddress, mode: GetMode) -> Result<Val> {
+
+        self.check_open()?;
         let rid = addr.realm();
         let u = addr.u();
         let v = addr.v_local();
@@ -593,17 +624,21 @@ impl Db {
 
     /// GET via an N reference.
     pub fn get_n(&self, n: &Nat, mode: GetMode) -> Result<Val> {
+        self.check_open()?;
         let a = n_to_address(n)?;
         self.get_resolved_address(&a, mode)
     }
 
     /// GET via the structural address (R, u, v, lane).
     pub fn get_address(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane, mode: GetMode) -> Result<Val> {
+        self.check_open()?;
         let a = address::cell_address(realm, u, v, lane)?;
         self.get_resolved_address(&a, mode)
     }
 
     pub fn describe_n(&self, n: &Nat) -> Result<Val> {
+
+        self.check_open()?;
         let a = n_to_address(n)?;
         let mut out = a.to_n_val();
         let defined = self.realms.contains_key(a.realm());
@@ -632,6 +667,7 @@ impl Db {
 
     /// Occupied cells of a logical object as N numbers (`occupied_n`).
     pub fn occupied_n(&self, r: &LayoutRef, obj: &Nat, lane: Lane) -> Result<Vec<Nat>> {
+        self.check_open()?;
         let lay = self.layout_by_ref(r)?;
         let rid = &lay.realm_id;
         let mut out = Vec::new();
@@ -721,6 +757,8 @@ impl Db {
     }
 
     pub fn occupied_from_n(&self, n: &Nat, output: &str) -> Result<Val> {
+
+        self.check_open()?;
         let desc = self.describe_n(n)?;
         let lay_obj = desc.get("layout").cloned().unwrap_or(Val::None);
         let interp = desc.get("interpretation").cloned().unwrap_or(Val::None);
@@ -759,6 +797,48 @@ impl Db {
     // Range queries
     // ------------------------------------------------------------------
 
+    /// Smallest u ≥ `from` (and ≥ 1) covered by a dense segment of
+    /// `(realm, lane)` (P004: O(log segments) via the interval index; deleted
+    /// or overlaid u are resolved by the caller through `get`/`get_internal`).
+    pub(crate) fn next_dense_u(&self, realm: &Nat, lane: Lane, from: &Nat) -> Option<Nat> {
+        let idx = self.dense.get(&(realm.clone(), lane))?;
+        if from.is_zero() {
+            return idx.iv.first_covered_from(&Nat::ONE);
+        }
+        idx.iv.first_covered_from(from)
+    }
+
+    /// [`Db::next_dense_u`] for range reads up to `to` (F021 rest, G3-03):
+    /// if the range ends in an uncovered gap starting at `from`, the nearest
+    /// DATA segment above the gap is CRC-checked once per session (same rule
+    /// as for point accesses, see [`Db::check_uncovered_u`]), so a
+    /// manipulated `u_start` cannot make records vanish silently. A gap
+    /// followed by a covered u ≤ `to` needs no extra check: that u is read
+    /// next, and its block (the nearest segment above the gap) is
+    /// CRC-checked before use.
+    pub(crate) fn next_dense_u_checked(&self, realm: &Nat, lane: Lane, from: &Nat, to: &Nat) -> Result<Option<Nat>> {
+        let next = self.next_dense_u(realm, lane, from);
+        let start = if from.is_zero() { &Nat::ONE } else { from };
+        if start <= to && next.as_ref().is_none_or(|u| u > to) {
+            self.check_uncovered_u(realm, start, lane)?;
+        }
+        Ok(next)
+    }
+
+    /// Calls `f` for every u in `[u_from, u_to]` that lies in a dense segment,
+    /// in ascending order, skipping gaps (P004: no u-by-u iteration).
+    fn for_dense_us(&self, realm: &Nat, u_from: &Nat, u_to: &Nat, lane: Lane, mut f: impl FnMut(&Nat) -> Result<()>) -> Result<()> {
+        let mut next = u_from.clone();
+        while let Some(u) = self.next_dense_u_checked(realm, lane, &next, u_to)? {
+            if &u > u_to {
+                break;
+            }
+            f(&u)?;
+            next = u.add_u64(1);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
     pub fn range(
         &self,
@@ -770,21 +850,20 @@ impl Db {
         dyn_v: Option<&Nat>,
         include_extensions: bool,
     ) -> Result<Vec<Val>> {
+        self.check_open()?;
         let mut out = Vec::new();
-        let mut u = u_from.clone();
-        while &u <= u_to {
-            if !u.is_zero() {
-                if let Some(r) = self.get(realm, &u, lane, dyn_mode, dyn_v, include_extensions)? {
-                    out.push(r);
-                }
+        self.for_dense_us(realm, u_from, u_to, lane, |u| {
+            if let Some(r) = self.get(realm, u, lane, dyn_mode, dyn_v, include_extensions)? {
+                out.push(r);
             }
-            u = u.add_u64(1);
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
-    pub fn select(&self, realm: &Nat, u_from: &Nat, u_to: &Nat, columns: &[Val], lane: Lane) -> Result<Vec<Val>> {
-        let mut resolved = Vec::new();
+    /// Column resolution of `select` (labels and v), done once per call.
+    pub(crate) fn resolve_select_columns(&self, realm: &Nat, columns: &[Val]) -> Result<Vec<(String, Nat)>> {
+        let mut resolved = Vec::with_capacity(columns.len());
         for col in columns {
             let v = self.resolve_v(realm, col)?;
             let mut label = match col {
@@ -796,25 +875,37 @@ impl Db {
             }
             resolved.push((label, v));
         }
-        let mut out = Vec::new();
-        let mut u = u_from.clone();
-        while &u <= u_to {
-            if !u.is_zero() {
-                if let Some(rec) = self.get_internal(realm, &u, lane)? {
-                    let mut row: Vec<(String, Val)> = vec![
-                        ("_u".into(), Val::nat(&u)),
-                        ("_lane".into(), Val::Int(lane as i64)),
-                        ("_lane_name".into(), Val::str(lane_name(lane))),
-                    ];
-                    let by_v: BTreeMap<Nat, Val> = rec.by_v();
-                    for (label, v) in &resolved {
-                        set_or_push(&mut row, label, by_v.get(v).cloned().unwrap_or(Val::None));
-                    }
-                    out.push(Val::Map(row));
-                }
-            }
-            u = u.add_u64(1);
+        Ok(resolved)
+    }
+
+    /// One `select` row for `u` with already resolved columns.
+    pub(crate) fn select_row_resolved(&self, realm: &Nat, u: &Nat, resolved: &[(String, Nat)], lane: Lane) -> Result<Option<Val>> {
+        let Some(rec) = self.get_internal(realm, u, lane)? else {
+            return Ok(None);
+        };
+        let mut row: Vec<(String, Val)> = vec![
+            ("_u".into(), Val::nat(u)),
+            ("_lane".into(), Val::Int(lane as i64)),
+            ("_lane_name".into(), Val::str(lane_name(lane))),
+        ];
+        let by_v: BTreeMap<Nat, Val> = rec.by_v();
+        for (label, v) in resolved {
+            set_or_push(&mut row, label, by_v.get(v).cloned().unwrap_or(Val::None));
         }
+        Ok(Some(Val::Map(row)))
+    }
+
+    pub fn select(&self, realm: &Nat, u_from: &Nat, u_to: &Nat, columns: &[Val], lane: Lane) -> Result<Vec<Val>> {
+
+        self.check_open()?;
+        let resolved = self.resolve_select_columns(realm, columns)?;
+        let mut out = Vec::new();
+        self.for_dense_us(realm, u_from, u_to, lane, |u| {
+            if let Some(row) = self.select_row_resolved(realm, u, &resolved, lane)? {
+                out.push(row);
+            }
+            Ok(())
+        })?;
         Ok(out)
     }
 }

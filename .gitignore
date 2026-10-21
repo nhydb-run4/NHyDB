@@ -23,6 +23,11 @@ __pycache__/
 *.dnhydb-index
 /scratch/
 
+# Format golden test (T004): checked-in test database with plan and test-only key
+!/tests/python/golden/golden.nhydb
+!/tests/python/golden/golden.nhydb.layout.enc
+!/tests/python/golden/golden.nhydb.layout.key
+
 # OS / editor
 .DS_Store
 .idea/

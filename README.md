@@ -36,8 +36,8 @@ reach data by coordinates, by record or directly by number.
 ## Installation
 
 ```bash
-pip install nhydb
-pip install numpy        # optional, for the NumPy batch API
+python -m pip install nhydb
+python -m pip install numpy        # optional, for the NumPy batch API
 ```
 
 Prebuilt wheels are available for CPython 3.9–3.14 on Linux (x86_64,
@@ -98,8 +98,10 @@ the writer lock. Details:
   (read-only `SELECT`).
 * **NumPy batch API:** write and read whole columns; the loops run in Rust.
 * **Persistence and integrity:** append-only file with an explicit commit
-  boundary, crash recovery, verify, health, repair and compaction;
-  durability `fsync` or `full`; one writer with an exclusive lock.
+  boundary, crash recovery that never discards committed data, verify,
+  health, repair, compaction and backup restore; durability `fsync` or
+  `full`; one writer with an exclusive lock, any number of read-only
+  openings (`readonly=True`).
 * **Protected schema:** the layout plan is stored outside the data file,
   encrypted (AES-256-GCM, HMAC-SHA256); opening fails closed on any
   inconsistency.
@@ -123,8 +125,8 @@ the encrypted layout plan and its key (ENC/KEY), benchmarks on your own
 machine and a complete small application. You can execute every example,
 change its parameters and run your own experiments.
 
-The seven reference notebooks contain all 57 tested examples of the
-[Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)
+The seven reference notebooks contain the 57 tested examples of the
+0.27.1 [Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)
 as runnable cells, each followed by the output documented in the cookbook.
 The cookbook remains the authoritative reference; the notebooks let you run
 and explore its examples step by step.
@@ -185,17 +187,32 @@ The mathematical foundations (in German):
 
 ## Known limitations
 
-* **One writer at a time** per database (exclusive lock); there are no
+* **One writing object per database.** Every read-write open takes an
+  exclusive lock (also within one process). Further readers open with
+  `nhydb.open(path, readonly=True)`: no lock, the file is never changed, and
+  they see the committed state at the time of opening. There are no
   multi-process transactions.
+* **Threads.** Read-only queries may share an `NHyDB` object between
+  threads; a write on an object that another thread is using raises
+  `RuntimeError`. For parallel work give each thread its own object.
 * **The key file is required.** A lost `*.layout.key` cannot be recovered.
+* **Encryption scope.** Only the layout plan is encrypted; the data in the
+  `.nhydb` file is not. NHyDB is not a security product: while a database
+  is open, key material is kept in process memory and not every internal
+  copy is guaranteed to be erased.
 * **NHySQL is read-only** (`SELECT`); data is written through the API.
 * **File format:** only files with the identifier `NHYDB016` are read; there
-  is no converter for older format revisions.
+  is no converter for older format revisions. Databases created with NHyDB
+  0.27.1 or earlier carry the same identifier but an unkeyed schema digest
+  and do not open (`CorruptionError` naming 0.27.1): export the data with
+  0.27.1 and re-import it with 0.28.0.
 * **Durability `full`:** macOS uses `F_FULLFSYNC` and reports an error if the
   file system does not support it; Linux uses `fsync(2)`, Windows
   `FlushFileBuffers`.
-* **Configuration:** the `[cache]` keys are accepted but not yet used; the
-  open parameter `strict` currently has no effect.
+* **Configuration:** of the `[cache]` keys only `block_cache_bytes` is used
+  yet.
+* **Indexes** cover CLASSIC records and are rebuilt explicitly with
+  `build_indexes()`; rebuild existing indexes after updating NHyDB.
 * **Status:** alpha – the API may still change between minor versions.
 
 ## License

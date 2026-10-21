@@ -52,7 +52,7 @@ fn kq(n0: i64, count: usize) -> Cols {
 }
 
 fn setup(path: &std::path::Path, reserve: u64, define: bool, mode: SyncMode) -> Db {
-    let opts = OpenOptions { lock: Some(nhydb_core::LockConfig::default()), ..OpenOptions::default() }.with_sync(mode);
+    let opts = OpenOptions { lock: nhydb_core::platform::LockOverride { enabled: Some(true), timeout_ms: Some(0) }, ..OpenOptions::default() }.with_sync(mode);
     let mut db = Db::create(path, true, opts).unwrap();
     let r = Nat::S(REALM);
     db.create_realm(&r, "bench", "", None, &Nat::ZERO).unwrap();

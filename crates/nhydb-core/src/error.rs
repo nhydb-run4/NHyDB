@@ -62,7 +62,13 @@ pub enum Error {
     QueryDomain(String),
     /// NHySQL: syntax/semantic error (`SQLSyntaxError`).
     SqlSyntax(String),
+    /// Resource exhaustion (allocation would fail or exceed the physical
+    /// memory); Python `MemoryError`.
+    Memory(String),
     Io(std::io::Error),
+    /// OS error on a specific side file (layout plan, key file) – carries the
+    /// affected path so Python gets the right `OSError.filename` (F048).
+    IoPath(std::io::Error, std::path::PathBuf),
     /// Error raised by a runtime plugin (e.g. a Python exception from a
     /// CUSTOM layout plugin). The binding layer can unwrap the object and
     /// re-raise it unchanged.
@@ -101,8 +107,10 @@ impl fmt::Display for Error {
             | Error::Query(m)
             | Error::QueryPlan(m)
             | Error::QueryDomain(m)
-            | Error::SqlSyntax(m) => f.write_str(m),
+            | Error::SqlSyntax(m)
+            | Error::Memory(m) => f.write_str(m),
             Error::Io(e) => write!(f, "{e}"),
+            Error::IoPath(e, p) => write!(f, "{e}: '{}'", p.display()),
             Error::Foreign(_, m) => f.write_str(m),
         }
     }
@@ -117,6 +125,15 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
+    /// Attaches `path` to an OS error (`Io`/`IoPath` → `IoPath(_, path)`);
+    /// every other error is returned unchanged (F048).
+    pub fn at_path(self, path: &std::path::Path) -> Error {
+        match self {
+            Error::Io(e) | Error::IoPath(e, _) => Error::IoPath(e, path.to_path_buf()),
+            other => other,
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Error::NHyDB(_) => "NHyDBError",
@@ -147,7 +164,8 @@ impl Error {
             Error::QueryPlan(_) => "QueryPlanError",
             Error::QueryDomain(_) => "QueryDomainError",
             Error::SqlSyntax(_) => "SQLSyntaxError",
-            Error::Io(_) => "OSError",
+            Error::Memory(_) => "MemoryError",
+            Error::Io(_) | Error::IoPath(..) => "OSError",
             Error::Foreign(..) => "ForeignError",
         }
     }

@@ -10,25 +10,34 @@
 # cannot be configured. Never put secret keys into this file – only paths.
 
 [database]
-db_max_size_bytes = 53687091200   # 50 GiB; initial value for NEW databases
-durability = "fsync"              # "fsync" | "full"
+db_max_size_bytes = 53687091200   # 50 GiB; initial value for NEW databases (min. 65536)
+durability = "fsync"              # "fsync" | "full" (aliases: "default"/"normal", "fullfsync")
 
 [math]
 realm_auto_limit = 4096           # initial value for NEW MATH layouts
-math_max_intermediate_bits = 1048576   # 2^20 bits per intermediate result
+math_max_intermediate_bits = 1048576   # 2^20 bits per intermediate result; frozen per
+                                       # MATH layout when the layout is created
 
 [lock]
 enabled = true                    # exclusive write lock (lock file <db>.lock)
 timeout_ms = 0                    # 0 = fail immediately, otherwise wait time in ms
+# The API parameters lock=/lock_timeout_ms= override these keys individually.
 
 [paths]
-# Optional path templates; {db} = file name of the database, relative paths
-# are resolved against the directory of the database.
+# Optional path templates; {db} = file name of the database, {db_path_hash} =
+# first 16 hex digits of the SHA-256 of the absolute database path (use it when
+# several databases with the same file name share one key directory).
+# Relative paths are resolved against the directory of the database.
 # layout_path = "{db}.layout.enc"
-# key_path    = "/secure/location/{db}.layout.key"
+# key_path    = "/secure/location/{db}.{db_path_hash}.layout.key"
 
 [cache]
-# Note: the [cache] keys are accepted but not yet used by the engine.
+# block_cache_bytes is the budget of the block cache of each open database
+# object (LRU eviction; 0 = no cache, verified blocks are then read in parts).
+# The largest cached block is max(8 MiB, budget/8), at most the budget.
+# Every block is CRC-checked completely once per object before its first use;
+# stats()["block_cache"] shows budget, occupancy and counters.
+# The vindex_* keys are accepted and validated but not yet used (fixed values).
 block_cache_bytes = 67108864      # block cache (64 MiB)
 vindex_max_marks = 4000000        # budget of the v-index (COLUMN/PACKED)
 vindex_max_indexes = 4096

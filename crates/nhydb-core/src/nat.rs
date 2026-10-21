@@ -307,29 +307,29 @@ pub fn get_vu64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
 }
 
 /// Decodes a VarUInt of arbitrary size.
+///
+/// There is deliberately no fixed bit limit: coordinates (R, u) and
+/// varuint/varint values are unbounded in the NHyDB model (BigInt concept).
+/// The length is bounded only by the remaining bytes of the (CRC-checked)
+/// buffer; a missing terminator byte is reported as corruption. The digit
+/// buffer is reserved fallibly, so an allocation failure becomes an error
+/// instead of an abort.
 pub fn get_vu(buf: &[u8], pos: &mut usize) -> Result<Nat> {
     let start = *pos;
     if let Some(v) = get_vu64(buf, pos)? {
         return Ok(Nat::S(v));
     }
-    let mut p = start;
+    let tail = buf.get(start..).unwrap_or(&[]);
+    let Some(last) = tail.iter().position(|b| b & 0x80 == 0) else {
+        return Err(Error::Corruption("VarUInt ends prematurely".into()));
+    };
+    let raw = &tail[..=last];
     let mut digits: Vec<u8> = Vec::new();
-    let mut shift = 0usize;
-    loop {
-        let Some(&b) = buf.get(p) else {
-            return Err(Error::Corruption("VarUInt ends prematurely".into()));
-        };
-        p += 1;
-        digits.push(b & 0x7F);
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 16384 {
-            return Err(Error::Corruption("VarUInt implausibly large".into()));
-        }
-    }
-    *pos = p;
+    digits
+        .try_reserve_exact(raw.len())
+        .map_err(|_| Error::Memory(format!("VarUInt with {} bytes: memory allocation failed", raw.len())))?;
+    digits.extend(raw.iter().map(|b| b & 0x7F));
+    *pos = start + raw.len();
     let big = BigUint::from_radix_le(&digits, 128).unwrap_or_default();
     Ok(Nat::from(big))
 }
@@ -428,6 +428,33 @@ mod tests {
     fn truncated_is_error() {
         let mut p = 0;
         assert!(get_vu(&[0x80, 0x80], &mut p).is_err());
+    }
+
+    #[test]
+    fn vu_no_fixed_bit_limit() {
+        // F003/F014: no fixed decoder limit; only the buffer bounds the length.
+        for bits in [16_380u32, 16_385, 16_400, 20_000, 100_000, 1_000_000] {
+            let n = Nat::from(BigUint::from(1u32) << bits).add_u64(1);
+            let mut b = enc(&n);
+            assert_eq!(b.len(), n.vu_len());
+            b.push(0x55); // trailing data must stay untouched
+            let mut p = 0;
+            assert_eq!(get_vu(&b, &mut p).unwrap(), n);
+            assert_eq!(p, b.len() - 1);
+            let z = n.clone();
+            let mut p = 0;
+            assert_eq!(zigzag_decode(&get_vu(&b, &mut p).unwrap()), zigzag_decode(&z));
+            // truncated → corruption, never a panic
+            let cut = &b[..b.len() - 2];
+            let mut p = 0;
+            assert!(matches!(get_vu(cut, &mut p), Err(Error::Corruption(_))));
+            assert_eq!(p, 0);
+        }
+        // decode starting at an offset beyond the buffer
+        let mut p = 10;
+        assert!(get_vu(&[0x80; 4], &mut p).is_err());
+        let mut p = 0;
+        assert!(get_vu(&[0x80; 40], &mut p).is_err());
     }
 
     #[test]

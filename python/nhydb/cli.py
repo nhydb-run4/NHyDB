@@ -2,11 +2,19 @@
 
 Pure interface layer: parses arguments and formats results.
 All database operations run in the native core.
+
+Read commands open the database with ``readonly=True`` (the file is never
+changed). Exit codes: 0 = success, 1 = a check found problems
+(``verify``, ``health`` unhealthy, ``repair`` dry run with findings),
+2 = usage error or refused operation, 3 = error (message on stderr,
+no traceback).
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ._native import ENGINE_VERSION, NHyDB, cell_address, n_to_dynadron_address, normalize_lane
@@ -14,8 +22,25 @@ from ._native import ENGINE_VERSION, NHyDB, cell_address, n_to_dynadron_address,
 DEFAULT_BATCH_RECORDS = 10_000
 _UNSET = object()
 
+EXIT_OK = 0
+EXIT_PROBLEMS = 1
+EXIT_USAGE = 2
+EXIT_ERROR = 3
+
+
+def _json_default(obj):
+    """JSON form of values without a JSON type: bytes as ``{"$bytes_b64": ...}``."""
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return {"$bytes_b64": base64.b64encode(bytes(obj)).decode("ascii")}
+    if isinstance(obj, (set, frozenset, tuple)):
+        return list(obj)
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    return str(obj)
+
+
 def _pjson(obj):
-    print(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default))
 def _compact_int(n: int) -> str:
     n = int(n)
     if n <= 0:
@@ -327,8 +352,55 @@ def _evolution_kwargs(args) -> Dict[str, Any]:
     if kw["u_end"] is _UNSET:
         del kw["u_end"]
     return kw
-def main():
-    p = argparse.ArgumentParser(description=f"NHyDB {ENGINE_VERSION} -- command line interface")
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point: runs one command; errors are reported without traceback."""
+    try:
+        code = _run(argv)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("nhydb: interrupted", file=sys.stderr)
+        code = 130
+    except Exception as e:  # noqa: BLE001 - every error becomes a message + exit code
+        print(f"nhydb: error: {type(e).__name__}: {e}", file=sys.stderr)
+        code = EXIT_ERROR
+    return code
+
+
+# Commands that only read: opened with readonly=True.
+_WRITE_COMMANDS = {"evolve-layout", "rebuild-indexes"}
+
+
+def _verify(args) -> int:
+    """verify: also usable for damaged files (falls back to the physical
+    inspection if the database cannot be opened)."""
+    insp = NHyDB.inspect_tail(args.file)
+    try:
+        db = NHyDB(args.file, readonly=True)
+    except Exception as e:  # noqa: BLE001 - report instead of traceback
+        out = {"ok": False, "open_error": f"{type(e).__name__}: {e}", "inspect": insp}
+        _pjson(out)
+        return EXIT_PROBLEMS
+    try:
+        out = db.verify(deep=args.deep)
+    finally:
+        db.close()
+    problems = []
+    if insp.get("superblock_problem"):
+        problems.append(insp["superblock_problem"])
+    if insp.get("error"):
+        problems.append(f"after the commit boundary: {insp['error']}" if out["ok"] else insp["error"])
+    out["inspect"] = {k: insp[k] for k in ("clean", "committed_end", "uncommitted_bytes", "superblock_problem", "error")}
+    if not insp.get("clean") and insp.get("superblock_problem"):
+        out["ok"] = False
+        out["errors"] = list(out["errors"]) + [insp["superblock_problem"]]
+        out["error_count"] = len(out["errors"])
+    _pjson(out)
+    return EXIT_OK if out["ok"] else EXIT_PROBLEMS
+
+
+def _run(argv: Optional[Sequence[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="nhydb", description=f"NHyDB {ENGINE_VERSION} -- command line interface")
     sub = p.add_subparsers(dest="cmd", required=True)
     x = sub.add_parser("to-n", help="convert (Realm,u,v,lane) to a canonical N reference")
     x.add_argument("--realm", type=int, required=True)
@@ -427,34 +499,49 @@ def main():
     x.add_argument("--show", type=int, default=0)
     x.add_argument("--dyn-address", choices=["off", "once", "auto"], default="off")
     x.add_argument("--dyn-v", type=int)
-    x = sub.add_parser("verify")
+    x = sub.add_parser("verify", help="structural check (read-only; also for damaged files); exit 1 on problems")
     x.add_argument("file")
     x.add_argument("--deep", action="store_true")
     x = sub.add_parser("rebuild-indexes")
     x.add_argument("file")
-    x = sub.add_parser("repair")
+    x = sub.add_parser("repair", help="repair a damaged file (dry run unless --apply)")
     x.add_argument("file")
     x.add_argument("--apply", action="store_true")
     x.add_argument("--no-backup", action="store_true")
+    x.add_argument("--allow-data-loss", action="store_true",
+                   help="cut intact committed blocks behind damage (listed in lost_blocks)")
+    x.add_argument("--keep-uncommitted", action="store_true",
+                   help="keep complete blocks after the commit boundary")
+    x = sub.add_parser("restore", help="restore a backup of repair/compact (BACKUP plus BACKUP.layout.enc)")
+    x.add_argument("backup")
+    x.add_argument("file")
     x = sub.add_parser("compact")
     x.add_argument("file")
     x.add_argument("--output")
     x.add_argument("--no-backup", action="store_true")
     x.add_argument("--no-rebuild-indexes", action="store_true")
     x.add_argument("--batch-records", type=int, default=DEFAULT_BATCH_RECORDS)
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if args.cmd == "to-n":
         out=cell_address(args.realm, args.u, args.v, args.lane)
         _pjson(out) if args.json else print(_human_address(out))
-        return
+        return EXIT_OK
     if args.cmd == "from-n":
         out=n_to_dynadron_address(args.n)
         _pjson(out) if args.json else print(_human_address(out, "NHyDB FROM-N"))
-        return
+        return EXIT_OK
     if args.cmd == "repair":
-        _pjson(NHyDB.repair_file(args.file, apply=args.apply,
-                                  make_backup=not args.no_backup))
-        return
+        out = NHyDB.repair_file(args.file, apply=args.apply, make_backup=not args.no_backup,
+                                allow_data_loss=args.allow_data_loss,
+                                keep_uncommitted=args.keep_uncommitted)
+        _pjson(out)
+        if args.apply:
+            return EXIT_OK
+        return EXIT_OK if out.get("clean") and out.get("action") == "none" else EXIT_PROBLEMS
+    if args.cmd == "restore":
+        out = NHyDB.restore_backup(args.backup, args.file)
+        _pjson(out)
+        return EXIT_OK if out.get("ok") else EXIT_PROBLEMS
     if args.cmd == "compact":
         _pjson(NHyDB.compact_file(
             args.file, output=args.output,
@@ -462,8 +549,11 @@ def main():
             rebuild_indexes=not args.no_rebuild_indexes,
             batch_records=args.batch_records,
         ))
-        return
-    with NHyDB(args.file) as db:
+        return EXIT_OK
+    if args.cmd == "verify":
+        return _verify(args)
+    code = EXIT_OK
+    with NHyDB(args.file, readonly=args.cmd not in _WRITE_COMMANDS) as db:
         if args.cmd in {"layout", "get-layout"}:
             out = db.get_layout(realm_id=args.realm, u=args.u, layout_id=args.layout_id)
             if args.json:
@@ -486,7 +576,7 @@ def main():
                     _pjson(plan)
                 else:
                     print(_human_evolution_plan(plan))
-                raise SystemExit(2)
+                return EXIT_USAGE
             lay = db.evolve_layout(args.layout_id, **kwargs, commit=True)
             out = {"status": "applied", "plan": plan, "layout": db.get_layout(layout_id=lay.layout_id)}
             _pjson(out) if args.json else print(_human_evolution_plan(plan) + "\n\nApplied: YES")
@@ -507,6 +597,8 @@ def main():
         elif args.cmd == "health":
             out = db.health(deep=args.deep)
             _pjson(out) if args.json else print(_human_health(out))
+            if not out.get("ok"):
+                code = EXIT_PROBLEMS
         elif args.cmd in {"get", "get-n"}:
             if args.target:
                 if str(args.target).strip().upper().startswith("N") or str(args.target).strip().isdigit():
@@ -522,7 +614,8 @@ def main():
                 _pjson(db.get(args.realm, args.u, lane=args.lane,
                               dyn_address=args.dyn_address, dyn_v=args.dyn_v))
             else:
-                raise SystemExit("GET needs N..., R,u,v[,lane] or --realm/--u/--v")
+                print("nhydb: error: GET needs N..., R,u,v[,lane] or --realm/--u/--v", file=sys.stderr)
+                return EXIT_USAGE
         elif args.cmd == "address":
             _pjson(db.dyn_address(args.realm, args.u, args.v))
         elif args.cmd == "cell":
@@ -539,7 +632,6 @@ def main():
                                          dyn_address=args.dyn_address,
                                          dyn_v=args.dyn_v) for u in us[:args.show]]
             _pjson(out)
-        elif args.cmd == "verify":
-            _pjson(db.verify(deep=args.deep))
         elif args.cmd == "rebuild-indexes":
             _pjson(db.build_indexes(commit=True))
+    return code

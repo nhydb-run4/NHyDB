@@ -141,6 +141,8 @@ impl RawCellCursor {
     }
 
     pub fn next_batch(&mut self, db: &Db, max: usize) -> Result<Vec<RawCell>> {
+
+        db.check_open()?;
         let mut out = Vec::new();
         while out.len() < max {
             if let Some(c) = self.pending.pop_front() {
@@ -174,6 +176,7 @@ impl RawCellCursor {
 
     /// Callback variant; `f` returns `false` to stop early.
     pub fn for_each(mut self, db: &Db, mut f: impl FnMut(RawCell) -> Result<bool>) -> Result<()> {
+        db.check_open()?;
         loop {
             let batch = self.next_batch(db, 1024)?;
             if batch.is_empty() {
@@ -199,6 +202,8 @@ impl MaterializedCellCursor {
     }
 
     pub fn next_batch(&mut self, db: &Db, max: usize) -> Result<Vec<Val>> {
+
+        db.check_open()?;
         self.raw
             .next_batch(db, max)?
             .into_iter()
@@ -221,6 +226,7 @@ impl RecordNCursor {
 
     /// Next unique record_N (as a number), in order of first occurrence.
     pub fn next_batch_nat(&mut self, db: &Db, max: usize) -> Result<Vec<Nat>> {
+        db.check_open()?;
         let mut out = Vec::new();
         while out.len() < max {
             let batch = self.raw.next_batch(db, max)?;
@@ -250,6 +256,7 @@ impl RecordNCursor {
 
     /// Like `next_batch_nat`, as `"N…"` references.
     pub fn next_batch(&mut self, db: &Db, max: usize) -> Result<Vec<String>> {
+        db.check_open()?;
         Ok(self.next_batch_nat(db, max)?.into_iter().map(|n| format!("N{n}")).collect())
     }
 }
@@ -302,6 +309,7 @@ impl Db {
 
     /// `_materialized_cell_envelope`
     pub fn materialized_cell_envelope(&self, realm: &Nat, u: &Nat, v: &Nat, value: Val, lane: Lane) -> Result<Val> {
+        self.check_open()?;
         let addr = self.cell_address(realm, u, v, lane)?;
         let lay = self.layout_at(realm, u);
         let mut record_n = Val::None;
@@ -343,6 +351,7 @@ impl Db {
 
     /// `record_n_for_address`: geometric, without reading payload data.
     pub fn record_n_for_address(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<String>> {
+        self.check_open()?;
         Ok(self.record_n_nat(realm, u, v, lane)?.map(|n| format!("N{n}")))
     }
 
@@ -364,6 +373,7 @@ impl Db {
 
     /// `record_n_from_n`
     pub fn record_n_from_n(&self, n: &Nat) -> Result<Option<String>> {
+        self.check_open()?;
         Ok(self.record_n_from_n_nat(n)?.map(|r| format!("N{r}")))
     }
 

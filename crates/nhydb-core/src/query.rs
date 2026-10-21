@@ -35,6 +35,10 @@ use crate::vmap;
 
 pub const QUERY_VERSION: &str = "0.27";
 pub const OPTIMIZER: &str = "cardinality-cost-v1";
+/// Maximum nesting of query expressions (parentheses/NOT/AND/OR levels) in
+/// all parsers and converters (F015/F016). Flat AND/OR chains of any length
+/// count as one level.
+pub const MAX_EXPR_DEPTH: usize = 256;
 
 /// Up to this range width, STRUCT_RANGE visits every u directly.
 const STRUCT_RANGE_DIRECT_MAX: u64 = 4096;
@@ -326,6 +330,7 @@ pub fn parse_n_val(v: &Val) -> Result<Nat> {
             address::require_positive("N", &n)?;
             Ok(n)
         }
+        Val::Float(f) if f.fract() != 0.0 => Err(Error::Value(format!("N must be an integer, got {}", v.py_repr()))),
         other => {
             let b = py_int(other)?;
             match Nat::from_bigint(&b) {
@@ -413,6 +418,24 @@ pub enum Expr {
     All,
 }
 
+impl Drop for Expr {
+    /// Iterative drop: deep trees (e.g. long NOT chains built through the
+    /// Rust API) must not overflow the stack (F015).
+    fn drop(&mut self) {
+        if let Expr::Bool { children, .. } = self {
+            if !children.iter().any(|c| matches!(c, Expr::Bool { .. })) {
+                return;
+            }
+            let mut stack = std::mem::take(children);
+            while let Some(mut e) = stack.pop() {
+                if let Expr::Bool { children, .. } = &mut e {
+                    stack.append(children);
+                }
+            }
+        }
+    }
+}
+
 impl Expr {
     pub fn and(a: Expr, b: Expr) -> Expr {
         Expr::Bool { op: "and".into(), children: vec![a, b] }
@@ -447,8 +470,31 @@ fn dict_or_empty(v: Option<&Val>) -> Result<Val> {
     }
 }
 
-/// `expr_from_spec` (JSON specification).
+/// `expr_from_spec` (JSON specification). `and`/`or` lists become one
+/// n-ary node; nesting is limited to [`MAX_EXPR_DEPTH`] (F015).
 pub fn expr_from_spec(raw: &Val) -> Result<Expr> {
+    expr_from_spec_at(raw, 0)
+}
+
+/// Message of the nesting limit (F015). N5: planning and evaluation of an
+/// expression tree are recursive, so the limit stays at [`MAX_EXPR_DEPTH`];
+/// the hint shows how to stay within it.
+pub fn depth_message() -> String {
+    format!(
+        "query expression nested deeper than {MAX_EXPR_DEPTH} levels; every switch between AND, OR and NOT adds a level, \
+         while a chain of one operator counts once whatever its length – combine the conditions into flat AND/OR \
+         chains (e.g. an \"or\"/\"and\" list) instead of alternating (q & a) | b"
+    )
+}
+
+pub fn depth_error() -> Error {
+    plan_err(depth_message())
+}
+
+fn expr_from_spec_at(raw: &Val, depth: usize) -> Result<Expr> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(depth_error());
+    }
     if !matches!(raw, Val::Map(_)) {
         return Err(plan_err("query expression must be an object"));
     }
@@ -457,19 +503,16 @@ pub fn expr_from_spec(raw: &Val) -> Result<Expr> {
     }
     for op in ["and", "or"] {
         if let Some(items) = raw.get(op) {
-            let xs: Vec<Expr> = iter_items(items)?.iter().map(expr_from_spec).collect::<Result<_>>()?;
-            let mut it = xs.into_iter();
-            let Some(mut out) = it.next() else {
-                return Err(plan_err(format!("{op} must not be empty")));
+            let mut xs: Vec<Expr> = iter_items(items)?.iter().map(|x| expr_from_spec_at(x, depth + 1)).collect::<Result<_>>()?;
+            return match xs.len() {
+                0 => Err(plan_err(format!("{op} must not be empty"))),
+                1 => Ok(xs.pop().unwrap()),
+                _ => Ok(Expr::Bool { op: op.into(), children: xs }),
             };
-            for x in it {
-                out = if op == "and" { Expr::and(out, x) } else { Expr::or(out, x) };
-            }
-            return Ok(out);
         }
     }
     if let Some(x) = raw.get("not") {
-        return Ok(Expr::negate(expr_from_spec(x)?));
+        return Ok(Expr::negate(expr_from_spec_at(x, depth + 1)?));
     }
     let value_lo = || raw.get("value").or_else(|| raw.get("lo")).cloned().unwrap_or(Val::None);
     if let Some(f) = raw.get("field") {
@@ -621,6 +664,9 @@ pub struct ExecOptions {
     pub explain: bool,
     pub k1: f64,
     pub b: f64,
+    /// Restrict results to records routed to this layout (NHySQL
+    /// `FROM <layout>`, F027).
+    pub layout_id: Option<u64>,
 }
 
 impl Default for ExecOptions {
@@ -638,6 +684,7 @@ impl Default for ExecOptions {
             explain: false,
             k1: 1.2,
             b: 0.75,
+            layout_id: None,
         }
     }
 }
@@ -728,8 +775,15 @@ impl<'s> Aggregator<'s> {
     fn add(&mut self, get: &dyn Fn(&str) -> Val) -> Result<()> {
         let key: Vec<Val> = self.groups.iter().map(|g| get(g)).collect();
         let hk = group_key(&key)?;
-        let slot = match self.index.get(&hk) {
+        // F045: NaN != NaN – as with Python dict keys of separately decoded
+        // floats, every row with a NaN group value forms its own group.
+        let nan = key.iter().any(|v| matches!(v, Val::Float(f) if f.is_nan()));
+        let slot = match self.index.get(&hk).filter(|_| !nan) {
             Some(&i) => i,
+            None if nan => {
+                self.states.push((key, self.specs.iter().map(|s| agg_init(&s.op)).collect()));
+                self.states.len() - 1
+            }
             None => {
                 self.states.push((key, self.specs.iter().map(|s| agg_init(&s.op)).collect()));
                 self.index.insert(hk, self.states.len() - 1);
@@ -906,23 +960,66 @@ fn record_value(rec: &Val, name: &str) -> Val {
     }
 }
 
+/// Sort key of `row` for ORDER BY `name` (`_apply_order_limit`).
+fn order_key(row: &Val, name: &str) -> Val {
+    if matches!(row.get("result"), Some(Val::Str(s)) if s == "record") {
+        record_value(row, name)
+    } else {
+        row.get(name).cloned().unwrap_or(Val::None)
+    }
+}
+
 /// `_apply_order_limit`
 fn apply_order_limit(rows: Vec<Val>, order_by: Option<&Val>, limit: &Val, offset: &Val) -> Result<Vec<Val>> {
-    let mut out = rows;
+    let picked = order_limit_indices(rows.len(), order_by, limit, offset, &mut |i, name| Ok(order_key(&rows[i], name)))?;
+    let mut slots: Vec<Option<Val>> = rows.into_iter().map(Some).collect();
+    Ok(picked.into_iter().map(|i| slots[i].take().unwrap()).collect())
+}
+
+/// Ordering of `_apply_order_limit` on row indices (P007): one stable sort
+/// per ORDER BY key, from the last key to the first, with the comparator of
+/// the reference (None after values, Python `<`, TypeError → plan error),
+/// then OFFSET/LIMIT. Only the keys are moved, so callers can build the
+/// rows of the returned window afterwards. Keys that are all ints (or all
+/// strings), apart from None, form a total order; they are sorted with the
+/// standard stable sort, which yields exactly the same permutation.
+fn order_limit_indices(
+    n: usize,
+    order_by: Option<&Val>,
+    limit: &Val,
+    offset: &Val,
+    key: &mut dyn FnMut(usize, &str) -> Result<Val>,
+) -> Result<Vec<usize>> {
     let ordering = normalize_order_by(order_by)?;
+    let mut out: Vec<usize> = (0..n).collect();
     for (name, desc) in ordering.iter().rev() {
-        let keyed: Vec<(Val, Val)> = out
-            .into_iter()
-            .map(|row| {
-                let k = if matches!(row.get("result"), Some(Val::Str(s)) if s == "record") {
-                    record_value(&row, name)
-                } else {
-                    row.get(name).cloned().unwrap_or(Val::None)
-                };
-                (k, row)
-            })
-            .collect();
-        let mut lt = |a: &(Val, Val), b: &(Val, Val)| -> Result<bool> {
+        let mut keyed: Vec<(Val, usize)> = Vec::with_capacity(out.len());
+        for i in out {
+            keyed.push((key(i, name)?, i));
+        }
+        let total = keyed.iter().all(|(k, _)| matches!(k, Val::None | Val::Int(_)))
+            || keyed.iter().all(|(k, _)| matches!(k, Val::None | Val::Str(_)));
+        if total {
+            let cmp = |a: &Val, b: &Val| -> std::cmp::Ordering {
+                use std::cmp::Ordering::*;
+                match (a, b) {
+                    (Val::None, Val::None) => Equal,
+                    (Val::None, _) => Greater,
+                    (_, Val::None) => Less,
+                    (Val::Int(x), Val::Int(y)) => x.cmp(y),
+                    (Val::Str(x), Val::Str(y)) => x.cmp(y),
+                    _ => Equal,
+                }
+            };
+            if *desc {
+                keyed.sort_by(|a, b| cmp(&b.0, &a.0));
+            } else {
+                keyed.sort_by(|a, b| cmp(&a.0, &b.0));
+            }
+            out = keyed.into_iter().map(|(_, i)| i).collect();
+            continue;
+        }
+        let mut lt = |a: &(Val, usize), b: &(Val, usize)| -> Result<bool> {
             let (an, bn) = (a.0.is_none(), b.0.is_none());
             if an != bn {
                 return Ok(!an && bn);
@@ -933,7 +1030,7 @@ fn apply_order_limit(rows: Vec<Val>, order_by: Option<&Val>, limit: &Val, offset
             py_lt(&a.0, &b.0, "<")
         };
         out = match py_sort(keyed, *desc, &mut lt) {
-            Ok(v) => v.into_iter().map(|(_, r)| r).collect(),
+            Ok(v) => v.into_iter().map(|(_, i)| i).collect(),
             Err(Error::Type(_)) => return Err(plan_err(format!("ORDER BY {} compares incompatible values", repr(name)))),
             Err(e) => return Err(e),
         };
@@ -941,15 +1038,46 @@ fn apply_order_limit(rows: Vec<Val>, order_by: Option<&Val>, limit: &Val, offset
     slice_simple(out, limit, offset)
 }
 
+/// Leaves of a same-operator chain in left-to-right order (iterative, F015).
 fn flatten_bool<'e>(expr: &'e Expr, op: &str, out: &mut Vec<&'e Expr>) {
-    match expr {
-        Expr::Bool { op: o, children } if o == op => {
-            for c in children {
-                flatten_bool(c, op, out);
-            }
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Bool { op: o, children } if o == op => stack.extend(children.iter().rev()),
+            other => out.push(other),
         }
-        other => out.push(other),
     }
+}
+
+/// `plan_expr` cannot fail for these shapes (estimates of FIELD leaves are
+/// taken with `.ok()`, ALL only reads metadata), so planning them lazily
+/// does not change which error a query raises first.
+fn plan_is_infallible(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field { .. } | Expr::All => true,
+        Expr::Bool { op, .. } if op == "and" => {
+            let mut leaves = Vec::new();
+            flatten_bool(expr, "and", &mut leaves);
+            leaves.iter().all(|l| matches!(l, Expr::Field { .. }))
+        }
+        _ => false,
+    }
+}
+
+/// The single CLASSIC layout of a realm and its record u ranges (P007).
+type ClassicUniverse<'a> = (&'a LayoutDef, Vec<(Nat, Nat)>);
+
+/// All u of sorted, disjoint inclusive ranges (P007).
+fn expand_ranges(ranges: &[(Nat, Nat)]) -> Vec<Nat> {
+    let mut out = Vec::new();
+    for (a, b) in ranges {
+        let mut u = a.clone();
+        while &u <= b {
+            out.push(u.clone());
+            u = u.add_u64(1);
+        }
+    }
+    out
 }
 
 fn est_key(v: Option<&Val>) -> Option<Num> {
@@ -1009,10 +1137,60 @@ impl<'a> QueryEngine<'a> {
         Some(lays[0])
     }
 
+    /// F010: an index on `v` answers a predicate on `name` exactly like the
+    /// scan only if every layout of the realm is CLASSIC and shows `v` under
+    /// this name (and no other v under the same name). Otherwise the scan
+    /// (the reference semantics) is used.
+    fn index_semantics_ok(&self, realm: &Nat, name: &str, v: &Nat) -> bool {
+        let lays = self.db.realm_layouts(realm);
+        if lays.is_empty() {
+            return false;
+        }
+        let ext_label = self.db.extension_defs.get(&(realm.clone(), v.clone())).map(|e| e.field.name.clone());
+        for l in lays {
+            if l.kind != LayoutKind::Classic {
+                return false;
+            }
+            let shape = l.shape_id.and_then(|s| self.db.shapes.get(&s));
+            let label = match shape.and_then(|sh| sh.by_v(v)).map(|f| f.name.clone()).or_else(|| ext_label.clone()) {
+                Some(n) if !n.is_empty() => n,
+                _ => format!("v{v}"),
+            };
+            if label != name {
+                return false;
+            }
+            if shape.and_then(|sh| sh.by_name(name)).is_some_and(|f| &f.v != v) {
+                return false;
+            }
+        }
+        if self.db.extension_name_map.get(&(realm.clone(), name.to_string())).is_some_and(|ev| ev != v) {
+            return false;
+        }
+        true
+    }
+
+    /// Every u of the realm is routed to some layout (a layout starting at
+    /// u=1 without upper bound), so index postings need no routing filter.
+    fn routes_every_u(&self, realm: &Nat) -> bool {
+        self.db.realm_layouts(realm).iter().any(|l| l.u_start <= Nat::ONE && l.u_end.is_none())
+    }
+
+    /// Index postings restricted to u that the scan can see (routed to a
+    /// layout); no-op when every u is routed.
+    fn routed_us(&self, realm: &Nat, mut us: Vec<Nat>) -> Vec<Nat> {
+        if !self.routes_every_u(realm) {
+            us.retain(|u| self.db.layout_at(realm, u).is_some());
+        }
+        us
+    }
+
     /// `_find_usable_index`
     fn find_usable_index(&self, field: &str, ctx: &QueryContext, op: &str, options: &Val, value: &Val) -> Option<&'a IndexDef> {
         let realm = ctx.realm_nat()?;
         let v = self.db.resolve_v(&realm, &Val::str(field)).ok()?;
+        if !self.index_semantics_ok(&realm, field, &v) {
+            return None;
+        }
         for idx in self.db.index_defs.values() {
             if idx.realm_id != realm || idx.field_v() != &v {
                 continue;
@@ -1074,6 +1252,8 @@ impl<'a> QueryEngine<'a> {
             if idx.kind == IndexKind::Trigram && (op == "contains" || op == "icontains") {
                 us = self.verify_text(&realm, us, name, op, value, options, ctx.lane)?;
             }
+            let lay = self.plain_classic_layout(ctx).unwrap();
+            us.retain(|u| lay.contains_u(u));
             acc = Some(match acc {
                 None => us,
                 Some(a) => setops::intersect_sorted(&a, &us),
@@ -1083,6 +1263,54 @@ impl<'a> QueryEngine<'a> {
             }
         }
         Ok(Some(acc.unwrap_or_default()))
+    }
+
+    /// Rows of CLASSIC records `us` with the values of `names` under the
+    /// general-path semantics (`_record_value`): data columns via
+    /// `select_us_ext`, structural names (`u`, `record_N`, …) and unknown
+    /// columns via the light record envelope (F046).
+    fn classic_rows(&self, realm: &Nat, lay: &LayoutDef, us: &[Nat], names: &[String], lane: Lane) -> Result<Vec<Val>> {
+        let (mut known, mut other) = (Vec::new(), Vec::new());
+        for n in names {
+            if self.db.resolve_v(realm, &Val::str(n.as_str())).is_ok() {
+                known.push(Val::str(n.as_str()));
+            } else if !other.contains(n) {
+                other.push(n.clone());
+            }
+        }
+        let mut rows = self.db.select_us_ext(realm, us, &known, lane, true)?;
+        if !other.is_empty() {
+            for row in rows.iter_mut() {
+                let u = row.get("_u").and_then(|x| x.as_nat()).unwrap_or(Nat::ZERO);
+                let rn = self.db.logical_address_in(lay, &u, &Val::None, lane)?.n;
+                let rec = self.record_envelope_light(&rn)?;
+                for n in &other {
+                    row.set(n.clone(), record_value(&rec, n));
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// `classic_rows` streamed in chunks of 4096 u (P007: bounded memory for
+    /// ALL over large realms). Only when every name is a resolvable column;
+    /// otherwise (structural or unknown names via the record envelope) the
+    /// rows are built at once, exactly as `classic_rows`, so the order of
+    /// errors is unchanged.
+    fn classic_rows_chunked(&self, realm: &Nat, lay: &LayoutDef, us: &[Nat], names: &[String], lane: Lane, f: &mut dyn FnMut(Val) -> Result<()>) -> Result<()> {
+        let all_known = names.iter().all(|n| self.db.resolve_v(realm, &Val::str(n.as_str())).is_ok());
+        if !all_known {
+            for raw in self.classic_rows(realm, lay, us, names, lane)? {
+                f(raw)?;
+            }
+            return Ok(());
+        }
+        for chunk in us.chunks(4096) {
+            for raw in self.classic_rows(realm, lay, chunk, names, lane)? {
+                f(raw)?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1099,6 +1327,79 @@ impl<'a> QueryEngine<'a> {
         Ok(verified)
     }
 
+    /// P007: the materialized RECORD universe of `ctx` as sorted, disjoint
+    /// u ranges, read from the segment metadata only. `Some` only when the
+    /// result is provably identical to the scan: one plain CLASSIC layout in
+    /// the realm, no overlays on `(realm, lane)` (no sparse cells, no
+    /// DELETE, no overlapping segments – every u of a segment is then a live
+    /// record with at least one cell), every segment shape has fields, and
+    /// the anchor N of both ends of every range is computable (CLASSIC
+    /// record_N = anchor of u, strictly increasing in u). With `strict_shape`
+    /// additionally every segment uses the realm's current BASE shape (=
+    /// layout shape) and the realm has no extensions, so that the CLASSIC
+    /// row builder shows exactly the columns of the general record envelope.
+    fn classic_universe_ranges(&self, ctx: &QueryContext, strict_shape: bool) -> Result<Option<ClassicUniverse<'a>>> {
+        let Some(lay) = self.plain_classic_layout(ctx) else { return Ok(None) };
+        let realm = ctx.realm_nat().unwrap();
+        let key = (realm.clone(), ctx.lane);
+        if self.db.overlay_keys.contains(&key) || self.db.sparse.contains_key(&key) {
+            return Ok(None);
+        }
+        if strict_shape {
+            let base = self.db.realms.get(&realm).and_then(|r| r.default_shape_id);
+            if lay.shape_id.is_none() || base != lay.shape_id || self.db.extension_defs.keys().any(|(r, _)| r == &realm) {
+                return Ok(None);
+            }
+        }
+        let mut ranges = Vec::new();
+        let Some(idx) = self.db.dense.get(&key) else { return Ok(Some((lay, ranges))) };
+        for seg in idx.sorted() {
+            match self.db.shapes.get(&seg.shape_id) {
+                Some(sh) if !sh.fields.is_empty() => {}
+                _ => return Ok(None),
+            }
+            if strict_shape && Some(seg.shape_id) != lay.shape_id {
+                return Ok(None);
+            }
+            if seg.count == 0 {
+                continue;
+            }
+            let a = seg.u_start.clone().max(lay.u_start.clone());
+            let b = match &lay.u_end {
+                Some(e) => seg.u_end.clone().min(e.clone()),
+                None => seg.u_end.clone(),
+            };
+            if a > b {
+                continue;
+            }
+            for u in [&a, &b] {
+                if self.db.logical_address_in(lay, u, &Val::None, ctx.lane).is_err() {
+                    return Ok(None);
+                }
+            }
+            ranges.push((a, b));
+        }
+        // without overlays the segments are disjoint; check anyway
+        for w in ranges.windows(2) {
+            if w[1].0 <= w[0].1 {
+                return Ok(None);
+            }
+        }
+        // G3-01: the segment metadata (u_start, count) comes from the DATA
+        // prefixes, which are not CRC-covered on open. Every DATA block of
+        // the realm/lane is CRC-checked once per handle (verified registry,
+        // P001) before its metadata is used, as the general path would read
+        // (and check) them; later calls only look up the registry.
+        let mut last = None;
+        for seg in &idx.segs {
+            if last != Some(seg.block_offset) {
+                self.db.ensure_verified(seg.block_offset)?;
+                last = Some(seg.block_offset);
+            }
+        }
+        Ok(Some((lay, ranges)))
+    }
+
     fn record_anchor_ref(&self, lay: &LayoutDef, u: &Nat, lane: Lane) -> Result<String> {
         Ok(self.db.logical_address_in(lay, u, &Val::None, lane)?.n_ref())
     }
@@ -1107,6 +1408,7 @@ impl<'a> QueryEngine<'a> {
 
     /// `explain`
     pub fn explain(&self, expr: &Expr, realm: Option<BigInt>, lane: Lane, return_mode: &str) -> Result<Val> {
+        self.db.check_open()?;
         let domain = domain_for_return(&unicode::lower(return_mode), return_mode)?;
         let ctx = QueryContext { realm, lane };
         Ok(vmap! {
@@ -1125,6 +1427,7 @@ impl<'a> QueryEngine<'a> {
 
     /// `execute`
     pub fn execute(&self, expr: &Expr, o: &ExecOptions) -> Result<Val> {
+        self.db.check_open()?;
         let rm0 = unicode::lower(&o.return_mode);
         if rm0 == "ranked" {
             return self.search(expr, o.realm.clone(), o.lane, o.select.as_ref(), &o.limit, &o.offset, o.explain, o.k1, o.b);
@@ -1133,12 +1436,28 @@ impl<'a> QueryEngine<'a> {
         let rm = if agg_mode { "aggregate".to_string() } else { rm0 };
         let domain = domain_for_return(&rm, &rm)?;
         let ctx = QueryContext { realm: o.realm.clone(), lane: o.lane };
-        let plan = self.plan_expr(expr, &ctx, domain)?;
+        // The plan is needed for `explain` and by the general path. Expressions
+        // whose planning cannot fail (FIELD leaves, AND of FIELD leaves, ALL)
+        // are planned lazily, so the index fast paths below skip it; all
+        // others are planned up front as before (same first error).
+        let mut plan: Option<Val> = if plan_is_infallible(expr) { None } else { Some(self.plan_expr(expr, &ctx, domain)?) };
+        let take_plan = |plan: &mut Option<Val>| -> Result<Val> {
+            match plan.take() {
+                Some(p) => Ok(p),
+                None => self.plan_expr(expr, &ctx, domain),
+            }
+        };
+        // F027: a layout filter matters only if the realm has other layouts.
+        let layout_filter = match (o.layout_id, ctx.realm_nat()) {
+            (Some(id), Some(r)) if self.db.realm_layouts(&r).iter().any(|l| l.layout_id != id) => Some(id),
+            _ => None,
+        };
 
         // POSTING_COUNT: exact posting metadata answers COUNT directly.
-        if rm == "count" {
+        if rm == "count" && layout_filter.is_none() {
             if let Expr::Field { name, op, value, value2, options } = expr {
-                if let Some(idx) = self.find_usable_index(name, &ctx, op, options, value) {
+                let routed = ctx.realm_nat().is_some_and(|r| self.routes_every_u(&r));
+                if let Some(idx) = self.find_usable_index(name, &ctx, op, options, value).filter(|_| routed) {
                     let est = self.db.index_candidate_estimate(idx.index_id, op, value, value2, ctx.lane, options)?;
                     if est.get("exact").is_some_and(|e| e.is_truthy()) {
                         let count = match est.get("estimated_rows") {
@@ -1151,7 +1470,7 @@ impl<'a> QueryEngine<'a> {
                             "fastpath" => "POSTING_COUNT",
                         };
                         if o.explain {
-                            r.set("plan", plan);
+                            r.set("plan", take_plan(&mut plan)?);
                         }
                         return Ok(r);
                     }
@@ -1159,13 +1478,47 @@ impl<'a> QueryEngine<'a> {
             }
         }
 
+        // P007: ALL over a plain CLASSIC realm without overlays – the record
+        // universe comes from the segment metadata (no record decoding); the
+        // result is identical to the general path, so no fastpath marker.
+        let mut all_us: Option<Vec<Nat>> = None;
+        if domain == Domain::Record && layout_filter.is_none() && matches!(expr, Expr::All) {
+            if rm == "count" {
+                if let Some((_, ranges)) = self.classic_universe_ranges(&ctx, false)? {
+                    let mut total = Nat::ZERO;
+                    for (a, b) in &ranges {
+                        total = total.add(&b.checked_sub(a).unwrap().add_u64(1));
+                    }
+                    if let Some(n) = total.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                        let mut r = self.base_result(Domain::Record, &rm, n);
+                        r.set("returned", Val::Int(1));
+                        if o.explain {
+                            r.set("plan", take_plan(&mut plan)?);
+                        }
+                        return Ok(r);
+                    }
+                }
+            } else if let Some((_, ranges)) = self.classic_universe_ranges(&ctx, true)? {
+                all_us = Some(expand_ranges(&ranges));
+            }
+        }
+        let fast_marker = all_us.is_none();
+
         // CLASSIC_U: indexed predicates stay in compact u space.
-        let fast = if domain == Domain::Record { self.fast_classic_index_us(expr, &ctx)? } else { None };
+        let fast = if all_us.is_some() {
+            all_us
+        } else if domain == Domain::Record && layout_filter.is_none() {
+            self.fast_classic_index_us(expr, &ctx)?
+        } else {
+            None
+        };
         if let Some(us) = fast {
             let lay = self.plain_classic_layout(&ctx).unwrap();
             let realm = ctx.realm_nat().unwrap();
             let mut r = self.base_result(Domain::Record, &rm, us.len());
-            r.set("fastpath", Val::str("CLASSIC_U"));
+            if fast_marker {
+                r.set("fastpath", Val::str("CLASSIC_U"));
+            }
             let ordered = has_order(o.order_by.as_ref());
             match rm.as_str() {
                 "count" => r.set("returned", Val::Int(1)),
@@ -1181,10 +1534,20 @@ impl<'a> QueryEngine<'a> {
                             needed.push(n);
                         }
                     }
-                    let cols: Vec<Val> = needed.iter().map(|n| Val::str(n.as_str())).collect();
                     let mut agg = Aggregator::new(&specs, &groups);
-                    for raw in self.db.select_us_ext(&realm, &us, &cols, ctx.lane, true)? {
-                        agg.add(&|k: &str| raw.get(k).cloned().unwrap_or(Val::None))?;
+                    // P007: rows in chunks (bounded memory); an aggregation
+                    // error is reported after every row was built, as before
+                    let mut agg_err: Option<Error> = None;
+                    self.classic_rows_chunked(&realm, lay, &us, &needed, ctx.lane, &mut |raw| {
+                        if agg_err.is_none() {
+                            if let Err(e) = agg.add(&|k: &str| raw.get(k).cloned().unwrap_or(Val::None)) {
+                                agg_err = Some(e);
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    if let Some(e) = agg_err {
+                        return Err(e);
                     }
                     let rows = apply_order_limit(agg.rows(), o.order_by.as_ref(), &o.limit, &o.offset)?;
                     r.set("aggregate", Val::List(specs.iter().map(|s| s.to_val()).collect()));
@@ -1199,38 +1562,83 @@ impl<'a> QueryEngine<'a> {
                     if fields.is_empty() {
                         return Err(plan_err("return_mode='fields' requires at least one select field"));
                     }
-                    let cols: Vec<Val> = fields.iter().map(|n| Val::str(n.as_str())).collect();
-                    let rows = if ordered {
-                        let rows = self.db.select_us_ext(&realm, &us, &cols, ctx.lane, true)?;
+                    // F046: same row shape and column semantics as the general
+                    // path (`record_N` + `_record_value` per field; unknown
+                    // columns are None); ordering applies to the output rows.
+                    let build = |raws: Vec<Val>| -> Result<Vec<Val>> {
+                        let mut out = Vec::with_capacity(raws.len());
+                        for row in raws {
+                            let u = row.get("_u").and_then(|x| x.as_nat()).unwrap_or(Nat::ZERO);
+                            let mut o2 = vmap! {"record_N" => self.record_anchor_ref(lay, &u, ctx.lane)?};
+                            for f in &fields {
+                                o2.set(f.clone(), row.get(f).cloned().unwrap_or(Val::None));
+                            }
+                            out.push(o2);
+                        }
+                        Ok(out)
+                    };
+                    let rows = if ordered && fields.iter().any(|f| f == "result") {
+                        // a selected column named `result` can make a row look
+                        // like a record envelope to the ordering: keep the full build
+                        let rows = build(self.classic_rows(&realm, lay, &us, &fields, ctx.lane)?)?;
                         apply_order_limit(rows, o.order_by.as_ref(), &o.limit, &o.offset)?
+                    } else if ordered {
+                        // P007: sort on the keys of the would-be output rows
+                        // (record_N + selected fields), collected chunk-wise,
+                        // and build only the window.
+                        let names: Vec<String> = match normalize_order_by(o.order_by.as_ref()) {
+                            Ok(v) => v.into_iter().map(|(n, _)| n).collect(),
+                            Err(_) => Vec::new(), // reported by order_limit_indices below
+                        };
+                        let mut row_us: Vec<Nat> = Vec::with_capacity(us.len());
+                        let mut keys: Vec<Vec<Val>> = Vec::with_capacity(us.len());
+                        self.classic_rows_chunked(&realm, lay, &us, &fields, ctx.lane, &mut |raw| {
+                            keys.push(
+                                names
+                                    .iter()
+                                    .map(|n| if fields.iter().any(|f| f == n) { raw.get(n).cloned().unwrap_or(Val::None) } else { Val::None })
+                                    .collect(),
+                            );
+                            row_us.push(raw.get("_u").and_then(|x| x.as_nat()).unwrap_or(Nat::ZERO));
+                            Ok(())
+                        })?;
+                        // same first error as building every row (anchor N per u)
+                        for u in &row_us {
+                            self.db.logical_address_in(lay, u, &Val::None, ctx.lane)?;
+                        }
+                        let mut key = |i: usize, name: &str| -> Result<Val> {
+                            let pos = names.iter().position(|n| n == name);
+                            if fields.iter().any(|f| f == name) {
+                                Ok(pos.map(|p| keys[i][p].clone()).unwrap_or(Val::None))
+                            } else if name == "record_N" {
+                                Ok(Val::Str(self.record_anchor_ref(lay, &row_us[i], ctx.lane)?))
+                            } else {
+                                Ok(Val::None)
+                            }
+                        };
+                        let picked = order_limit_indices(row_us.len(), o.order_by.as_ref(), &o.limit, &o.offset, &mut key)?;
+                        let window: Vec<Nat> = picked.into_iter().map(|i| row_us[i].clone()).collect();
+                        build(self.classic_rows(&realm, lay, &window, &fields, ctx.lane)?)?
                     } else {
                         let sl = slice_simple(us.clone(), &o.limit, &o.offset)?;
-                        self.db.select_us_ext(&realm, &sl, &cols, ctx.lane, true)?
+                        build(self.classic_rows(&realm, lay, &sl, &fields, ctx.lane)?)?
                     };
-                    let mut out = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let u = row.get("_u").and_then(|x| x.as_nat()).unwrap_or(Nat::ZERO);
-                        let mut o2 = vmap! {"record_N" => self.record_anchor_ref(lay, &u, ctx.lane)?};
-                        for f in &fields {
-                            o2.set(f.clone(), row.get(f).cloned().unwrap_or(Val::None));
-                        }
-                        out.push(o2);
-                    }
                     r.set("select", Val::List(fields.iter().map(|f| Val::str(f.as_str())).collect()));
-                    r.set("rows", Val::List(out));
+                    r.set("rows", Val::List(rows));
                     let n = r.get("rows").and_then(|x| x.as_list()).map(|l| l.len()).unwrap_or(0);
                     r.set("returned", Val::Int(n as i64));
                 }
                 "record" => {
-                    let lr = LayoutRef::Id(lay.layout_id);
+                    // F046: the same record envelope as `get_n` in the general path.
+                    let get = |u: &Nat| -> Result<Val> {
+                        let rn = self.db.logical_address_in(lay, u, &Val::None, ctx.lane)?.n;
+                        self.db.get_n(&rn, GetMode::Record)
+                    };
                     let rows = if ordered {
-                        let rows = us.iter().map(|u| self.db.get_record_view(&lr, u, ctx.lane, None)).collect::<Result<Vec<_>>>()?;
+                        let rows = us.iter().map(get).collect::<Result<Vec<_>>>()?;
                         apply_order_limit(rows, o.order_by.as_ref(), &o.limit, &o.offset)?
                     } else {
-                        slice_simple(us.clone(), &o.limit, &o.offset)?
-                            .iter()
-                            .map(|u| self.db.get_record_view(&lr, u, ctx.lane, None))
-                            .collect::<Result<Vec<_>>>()?
+                        slice_simple(us.clone(), &o.limit, &o.offset)?.iter().map(get).collect::<Result<Vec<_>>>()?
                     };
                     r.set("returned", Val::Int(rows.len() as i64));
                     r.set("rows", Val::List(rows));
@@ -1246,12 +1654,18 @@ impl<'a> QueryEngine<'a> {
                 _ => return Err(plan_err(format!("unknown return_mode {}", repr(&rm)))),
             }
             if o.explain {
-                r.set("plan", plan);
+                r.set("plan", take_plan(&mut plan)?);
             }
             return Ok(r);
         }
 
-        let c = self.eval(expr, &ctx, domain)?;
+        let plan = take_plan(&mut plan)?;
+        let mut c = self.eval_planned(expr, Some(&plan), &ctx, domain)?;
+        if let Some(id) = layout_filter {
+            c.ns.retain(|n| {
+                n_to_address(n).ok().and_then(|a| self.db.layout_at(a.realm(), a.u()).map(|l| l.layout_id)) == Some(id)
+            });
+        }
         let mut r = self.base_result(c.domain, &rm, c.ns.len());
         let ordered = has_order(o.order_by.as_ref());
         match rm.as_str() {
@@ -1405,6 +1819,7 @@ impl<'a> QueryEngine<'a> {
     /// `search`: BM25 over exactly one FULLTEXT/PHRASE predicate plus AND filters.
     #[allow(clippy::too_many_arguments)]
     pub fn search(&self, expr: &Expr, realm: Option<BigInt>, lane: Lane, select: Option<&Val>, limit: &Val, offset: &Val, explain: bool, k1: f64, b: f64) -> Result<Val> {
+        self.db.check_open()?;
         let ctx = QueryContext { realm, lane };
         if ctx.realm.is_none() {
             return Err(plan_err("FULLTEXT search requires a realm"));
@@ -1434,6 +1849,7 @@ impl<'a> QueryEngine<'a> {
             textindex::fulltext_candidate_docs(&tp, &mode)?
         };
         let mut scores = textindex::bm25_scores(&tp, &corpus, Some(&candidates), k1, b)?;
+        scores.retain(|(u, _)| lay.contains_u(u));
         let realm_n = ctx.realm_nat().unwrap();
         if let Some(f) = &filter_expr {
             if !scores.is_empty() {
@@ -1750,38 +2166,64 @@ impl<'a> QueryEngine<'a> {
 
     /// `_eval`
     pub fn eval(&self, expr: &Expr, ctx: &QueryContext, domain: Domain) -> Result<CandidateSet> {
+        self.eval_planned(expr, None, ctx, domain)
+    }
+
+    /// Child plan `i` of a BOOL plan node (same flattened order as `eval`).
+    fn child_plan(plan: Option<&Val>, i: usize) -> Option<&Val> {
+        match plan?.get("children")? {
+            Val::List(l) => l.get(i),
+            _ => None,
+        }
+    }
+
+    /// `eval` with the plan of `expr` already computed by `plan_expr` for the
+    /// same context and domain (P022): AND nodes take the estimates of their
+    /// children from it instead of re-planning every subtree on every level
+    /// (quadratic in the nesting depth). Without a plan the children are
+    /// planned on demand, exactly as before.
+    fn eval_planned(&self, expr: &Expr, plan: Option<&Val>, ctx: &QueryContext, domain: Domain) -> Result<CandidateSet> {
         match expr {
             Expr::Bool { op, children } => {
                 if op == "not" {
-                    let child = self.eval(&children[0], ctx, domain)?;
+                    let child = self.eval_planned(&children[0], Self::child_plan(plan, 0), ctx, domain)?;
                     let universe = self.universe(ctx, domain)?;
                     return Ok(CandidateSet::new(domain, setops::difference_sorted(&universe.ns, &child.ns), "NOT"));
                 }
                 if children.is_empty() {
                     return Ok(CandidateSet::new(domain, Vec::new(), &op.to_uppercase()));
                 }
-                let mut kids: Vec<&Expr> = if op == "and" || op == "or" {
+                let kids: Vec<&Expr> = if op == "and" || op == "or" {
                     let mut v = Vec::new();
                     flatten_bool(expr, op, &mut v);
                     v
                 } else {
                     children.iter().collect()
                 };
+                let given: Vec<Option<&Val>> = (0..kids.len()).map(|i| Self::child_plan(plan, i)).collect();
+                let mut computed: Vec<Option<Val>> = vec![None; kids.len()];
+                let mut order: Vec<usize> = (0..kids.len()).collect();
                 if op == "and" {
-                    let mut ranked = Vec::with_capacity(kids.len());
                     for (i, k) in kids.iter().enumerate() {
-                        let plan = self.plan_expr(k, ctx, domain)?;
-                        ranked.push((est_key(plan.get("estimated_rows")), est_key(plan.get("estimated_cost")), i, *k));
+                        if given[i].is_none() {
+                            computed[i] = Some(self.plan_expr(k, ctx, domain)?);
+                        }
+                    }
+                    let mut ranked = Vec::with_capacity(kids.len());
+                    for i in 0..kids.len() {
+                        let p = given[i].or(computed[i].as_ref()).unwrap();
+                        ranked.push((est_key(p.get("estimated_rows")), est_key(p.get("estimated_cost")), i));
                     }
                     ranked.sort_by(|a, b| cmp_est(&a.0, &b.0).then_with(|| cmp_est(&a.1, &b.1)).then(a.2.cmp(&b.2)));
-                    kids = ranked.into_iter().map(|x| x.3).collect();
+                    order = ranked.into_iter().map(|x| x.2).collect();
                 }
-                let mut acc = self.eval(kids[0], ctx, domain)?;
-                for k in &kids[1..] {
+                let kid_plan = |i: usize| given[i].or(computed[i].as_ref());
+                let mut acc = self.eval_planned(kids[order[0]], kid_plan(order[0]), ctx, domain)?;
+                for &i in &order[1..] {
                     if op == "and" && acc.ns.is_empty() {
                         break;
                     }
-                    let child = self.eval(k, ctx, domain)?;
+                    let child = self.eval_planned(kids[i], kid_plan(i), ctx, domain)?;
                     acc = match op.as_str() {
                         "and" => CandidateSet::new(domain, setops::intersect_sorted(&acc.ns, &child.ns), "AND"),
                         "or" => CandidateSet::new(domain, setops::union_sorted(&acc.ns, &child.ns), "OR"),
@@ -1811,6 +2253,7 @@ impl<'a> QueryEngine<'a> {
             if access == "TRIGRAM_INDEX" {
                 us = self.verify_text(&realm, us, name, op, value, options, ctx.lane)?;
             }
+            let us = self.routed_us(&realm, us);
             let sv = idx.field_v();
             let mut refs = Vec::with_capacity(us.len());
             for u in &us {
@@ -1916,14 +2359,7 @@ impl<'a> QueryEngine<'a> {
             let span = &hi - &lo + BigInt::from(1);
             let us: Vec<Nat> = if span > BigInt::from(STRUCT_RANGE_DIRECT_MAX) {
                 let realm = ctx.realm_nat().unwrap();
-                let mut seen: Vec<Nat> = Vec::new();
-                RawCellCursor::new(self.db, Some(&realm), Some(ctx.lane)).for_each(self.db, |c| {
-                    if c.u >= lo_n && c.u <= hi_n && seen.last() != Some(&c.u) {
-                        seen.push(c.u);
-                    }
-                    Ok(true)
-                })?;
-                setops::sorted_unique(seen)
+                self.stored_us_in(&realm, ctx.lane, &lo_n, &hi_n)?
             } else {
                 let mut v = Vec::new();
                 let mut u = lo_n.clone();
@@ -1969,6 +2405,55 @@ impl<'a> QueryEngine<'a> {
             })?;
         }
         Ok(CandidateSet::new(domain, setops::sorted_unique(refs), "STRUCTURAL_SCAN"))
+    }
+
+    /// P006: every u in `[lo, hi]` that has a dense segment or a sparse u
+    /// group in `(realm, lane)`, sorted and unique, found via the interval
+    /// indexes (no scan of the whole realm). A superset of the u that
+    /// `get_record_view` reports as present (it needs a dense record or a
+    /// sparse group); the caller still decides presence per u, so the result
+    /// equals iterating every u of the range.
+    fn stored_us_in(&self, realm: &Nat, lane: Lane, lo: &Nat, hi: &Nat) -> Result<Vec<Nat>> {
+        let key = (realm.clone(), lane);
+        let mut out: Vec<Nat> = Vec::new();
+        let mut ids = Vec::new();
+        if let Some(ix) = self.db.dense.get(&key) {
+            ix.iv.overlapping(lo, hi, &mut ids);
+            let mut ranges: Vec<(Nat, Nat)> = ids
+                .iter()
+                .map(|&i| {
+                    let s = &ix.segs[i];
+                    (s.u_start.clone().max(lo.clone()), s.u_end.clone().min(hi.clone()))
+                })
+                .collect();
+            ranges.sort();
+            let mut next = Nat::ZERO;
+            for (a, b) in ranges {
+                let mut u = if a < next { next.clone() } else { a };
+                while u <= b {
+                    out.push(u.clone());
+                    u = u.add_u64(1);
+                }
+                if u > next {
+                    next = u;
+                }
+            }
+        }
+        if let Some(sx) = self.db.sparse.get(&key) {
+            ids.clear();
+            sx.iv.overlapping(lo, hi, &mut ids);
+            for &i in &ids {
+                let bi = self.db.sparse_block_index(&sx.segs[i])?;
+                let start = bi.partition_point(|(u, _, _)| u < lo);
+                for (u, _, _) in bi[start..].iter() {
+                    if u > hi {
+                        break;
+                    }
+                    out.push(u.clone());
+                }
+            }
+        }
+        Ok(setops::sorted_unique(out))
     }
 
     fn eval_math(&self, provider: &str, params: &Val, ctx: &QueryContext, domain: Domain) -> Result<CandidateSet> {
@@ -2020,6 +2505,13 @@ impl<'a> QueryEngine<'a> {
         let realm_f = ctx.realm_nat();
         let mut refs = Vec::new();
         if domain == Domain::Record {
+            // P007: record_N straight from the segment metadata (no decoding)
+            if let Some((lay, ranges)) = self.classic_universe_ranges(ctx, false)? {
+                for u in expand_ranges(&ranges) {
+                    refs.push(self.db.logical_address_in(lay, &u, &Val::None, ctx.lane)?.n);
+                }
+                return Ok(CandidateSet::new(domain, setops::sorted_unique(refs), "MATERIALIZED_UNIVERSE"));
+            }
             let mut cur = RecordNCursor::new(self.db, realm_f.as_ref(), Some(ctx.lane));
             loop {
                 let batch = cur.next_batch_nat(self.db, 4096)?;
@@ -2369,12 +2861,42 @@ pub fn exec_options_from_spec(spec: &Val) -> Result<ExecOptions> {
         explain: spec.get("explain").is_some_and(|e| e.is_truthy()),
         k1: py_float(spec.get("k1").unwrap_or(&Val::Float(1.2)))?,
         b: py_float(spec.get("b").unwrap_or(&Val::Float(0.75)))?,
+        layout_id: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F015: deep trees built through the Rust API flatten and drop without
+    /// recursion; JSON specs are limited to MAX_EXPR_DEPTH.
+    #[test]
+    fn deep_expressions_without_recursion() {
+        let leaf = || Expr::field("x", "eq", Val::Int(1), Val::None, Val::map());
+        let mut chain = leaf();
+        for _ in 0..200_000 {
+            chain = Expr::and(chain, leaf());
+        }
+        let mut leaves = Vec::new();
+        flatten_bool(&chain, "and", &mut leaves);
+        assert_eq!(leaves.len(), 200_001);
+        drop(chain);
+        let mut nots = leaf();
+        for _ in 0..200_000 {
+            nots = Expr::negate(nots);
+        }
+        drop(nots);
+        let mut spec = vmap! {"field" => "x", "value" => 1i64};
+        for _ in 0..MAX_EXPR_DEPTH {
+            spec = vmap! {"not" => spec};
+        }
+        assert!(expr_from_spec(&spec).is_ok());
+        let deeper = vmap! {"not" => spec};
+        assert!(matches!(expr_from_spec(&deeper), Err(Error::QueryPlan(_))));
+        let flat = vmap! {"and" => Val::List(vec![vmap! {"field" => "x", "value" => 1i64}; 3])};
+        assert!(matches!(expr_from_spec(&flat).unwrap(), Expr::Bool { ref children, .. } if children.len() == 3));
+    }
 
     #[test]
     fn helpers() {

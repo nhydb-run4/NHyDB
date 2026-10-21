@@ -8,12 +8,15 @@ pub fn intersect_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     if small.len() * 16 < big.len() {
         let mut lo = 0usize;
         for x in small {
-            match big[lo..].binary_search(x) {
-                Ok(i) => {
-                    out.push(x.clone());
-                    lo += i + 1;
-                }
-                Err(i) => lo += i,
+            // first element >= x (F044: with duplicates `binary_search` may hit
+            // a later equal element and skip matches; multiset semantics as in
+            // the merge path / reference)
+            let i = big[lo..].partition_point(|y| y < x);
+            if big.get(lo + i) == Some(x) {
+                out.push(x.clone());
+                lo += i + 1;
+            } else {
+                lo += i;
             }
             if lo >= big.len() {
                 break;
@@ -92,5 +95,46 @@ mod tests {
         let big: Vec<i32> = (0..10000).collect();
         assert_eq!(intersect_sorted(&[5, 77, 20000], &big), vec![5, 77]);
         assert_eq!(sorted_unique(vec![7, 1, 7, 3]), vec![1, 3, 7]);
+    }
+}
+
+#[cfg(test)]
+mod stab_tests {
+    use super::*;
+
+    fn merge_ref(a: &[i64], b: &[i64]) -> Vec<i64> {
+        let (mut i, mut j, mut out) = (0, 0, Vec::new());
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn intersect_with_duplicates_f044() {
+        let mut seed = 12345u64;
+        let mut rnd = |m: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for _ in 0..3000 {
+            let mut a: Vec<i64> = (0..rnd(6)).map(|_| rnd(20) as i64).collect();
+            let mut b: Vec<i64> = (0..rnd(200)).map(|_| rnd(20) as i64).collect();
+            a.sort();
+            b.sort();
+            assert_eq!(intersect_sorted(&a, &b), merge_ref(&a, &b), "{a:?} {b:?}");
+            assert_eq!(intersect_sorted(&b, &a), merge_ref(&a, &b), "{a:?} {b:?}");
+        }
+        let mut big: Vec<i64> = (0..100).chain([10, 10, 10]).collect();
+        big.sort();
+        assert_eq!(intersect_sorted(&[10, 10], &big), vec![10, 10]);
     }
 }

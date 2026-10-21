@@ -42,6 +42,8 @@ the format changes (`crates/nhydb-core/src/format.rs`).
 
 6. The tag starts `.github/workflows/release.yml`:
    * checks that tag, `Cargo.toml` version and `CHANGELOG.md` section match,
+   * runs the Rust tests (`cargo test --workspace --release`) on Linux,
+     macOS and Windows,
    * builds wheels for CPython 3.9–3.14 on Linux (x86_64, aarch64;
      manylinux_2_28), macOS (x86_64, arm64) and Windows (x64) plus the
      source distribution,
@@ -52,6 +54,15 @@ the format changes (`crates/nhydb-core/src/format.rs`).
    * creates a **draft** GitHub release with all files. If a release for
      the tag already exists, the job fails and changes nothing.
 7. Check the draft release on GitHub and publish it.
+
+## Supply chain
+
+`.github/dependabot.yml` proposes weekly update pull requests for the GitHub
+Actions and the Cargo dependencies; CI tests them before they are merged.
+Recommended before a release, run locally: `cargo audit` (RustSec advisories)
+or `cargo deny check advisories licenses sources`. Pinning the actions to
+commit SHAs can be done with the SHAs of the reviewed action releases;
+Dependabot keeps pinned SHAs up to date as well.
 
 ## Publishing on PyPI
 

@@ -74,9 +74,15 @@ pub fn block_name(bt: u8) -> Option<&'static str> {
     })
 }
 
+/// Rounds up to a multiple of 8. Never wraps (F056): values that cannot be
+/// rounded up within u64 yield `u64::MAX`, which is still >= `n`, so every
+/// size/limit check fails closed.
 #[inline]
 pub fn align8(n: u64) -> u64 {
-    (n + 7) & !7
+    match n.checked_add(7) {
+        Some(x) => x & !7,
+        None => u64::MAX,
+    }
 }
 
 #[inline]

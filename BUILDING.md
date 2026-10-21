@@ -24,14 +24,14 @@ maturin build --release --out dist
 ```
 
 The wheel is written to `dist/`, e.g.
-`nhydb-0.27.1-cp313-cp313-macosx_11_0_arm64.whl`. It is specific to the
+`nhydb-<version>-cp313-cp313-macosx_11_0_arm64.whl`. It is specific to the
 operating system, the CPU architecture and the Python version it was built
 with.
 
 ## Install
 
 ```bash
-pip install dist/nhydb-0.27.1-*.whl
+pip install dist/nhydb-*.whl
 pip install numpy                    # optional, NumPy batch API
 ```
 
@@ -46,7 +46,25 @@ python -m pytest tests/python                 # Python package (installed wheel)
 ```
 
 The Python tests import the *installed* package, not the sources in
-`python/`.
+`python/`. The test run prints a fingerprint of the Rust sources
+(`nhydb._native.BUILD_SOURCE_HASH`) and warns if the installed module was
+built from different sources.
+
+Longer runs of the robustness tests are controlled by environment
+variables (the defaults keep the suite fast):
+
+| Variable | Effect |
+|---|---|
+| `NHYDB_FUZZ_SCALE` | scale factor for the number of fuzz cases (byte flips, truncation, mutated payloads) |
+| `NHYDB_FUZZ_SEED` | start seed of the fuzz tests (reproduce a run) |
+| `NHYDB_CRASH_ROUNDS` | number of rounds of the crash simulator (process killed while committing) |
+
+The format golden file (SHA-256 per block of a deterministic scenario) is
+regenerated only after an intended format change:
+
+```bash
+python tests/python/test_stab_format_golden.py --update
+```
 
 ## Disk space
 

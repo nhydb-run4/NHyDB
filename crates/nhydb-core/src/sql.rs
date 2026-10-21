@@ -17,7 +17,7 @@ use crate::db::layout::LayoutRef;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::nat::Nat;
-use crate::query::{self, Expr, ExecOptions, QueryEngine, QUERY_VERSION};
+use crate::query::{self, Expr, ExecOptions, QueryEngine, MAX_EXPR_DEPTH, QUERY_VERSION};
 use crate::schema::{LayoutDef, LayoutKind};
 use crate::unicode;
 use crate::val::Val;
@@ -375,6 +375,14 @@ impl Ref {
     }
 }
 
+/// One child stays itself; several become an n-ary boolean node.
+fn n_ary(op: &str, mut items: Vec<Expr>) -> Expr {
+    if items.len() == 1 {
+        return items.pop().unwrap();
+    }
+    Expr::Bool { op: op.into(), children: items }
+}
+
 struct Parser<'p> {
     chars: Vec<char>,
     text: String,
@@ -383,6 +391,8 @@ struct Parser<'p> {
     params: &'p Params,
     source: Vec<String>,
     source_alias: Option<String>,
+    /// Current nesting of parentheses and NOT (F016).
+    depth: usize,
 }
 
 fn tval(t: &SqlToken) -> String {
@@ -662,35 +672,62 @@ impl Parser<'_> {
         Ok(out)
     }
 
+    /// `OR` chains are collected n-ary (no left-deep tree, F016).
     fn or_expr(&mut self) -> Result<Expr> {
-        let mut out = self.and_expr()?;
+        let mut items = vec![self.and_expr()?];
         while self.match_kw("OR") {
-            out = Expr::or(out, self.and_expr()?);
+            items.push(self.and_expr()?);
         }
-        Ok(out)
+        Ok(n_ary("or", items))
     }
 
     fn and_expr(&mut self) -> Result<Expr> {
-        let mut out = self.not_expr()?;
+        let mut items = vec![self.not_expr()?];
         while self.match_kw("AND") {
-            out = Expr::and(out, self.not_expr()?);
+            items.push(self.not_expr()?);
         }
-        Ok(out)
+        Ok(n_ary("and", items))
+    }
+
+    fn nest(&mut self, levels: usize) -> Result<()> {
+        if self.depth + levels > MAX_EXPR_DEPTH {
+            return Err(self.error(&format!("expression nested deeper than {MAX_EXPR_DEPTH} levels"), None));
+        }
+        self.depth += levels;
+        Ok(())
     }
 
     fn not_expr(&mut self) -> Result<Expr> {
-        if self.match_kw("NOT") {
-            return Ok(Expr::negate(self.not_expr()?));
+        let mut negs = 0usize;
+        while self.match_kw("NOT") {
+            negs += 1;
+            self.nest(1)?;
         }
-        self.predicate_primary()
+        let inner = self.predicate_primary();
+        self.depth -= negs;
+        let mut e = inner?;
+        for _ in 0..negs {
+            e = Expr::negate(e);
+        }
+        Ok(e)
     }
 
     fn predicate_primary(&mut self) -> Result<Expr> {
         if self.match_sym("(") {
-            let out = self.or_expr()?;
+            self.nest(1)?;
+            let out = self.or_expr();
+            self.depth -= 1;
+            let out = out?;
             self.expect_sym(")")?;
             return Ok(out);
         }
+        self.predicate_atom()
+    }
+
+    /// Non-parenthesized predicate; kept out of the recursive frame of
+    /// `predicate_primary` so that deep nesting needs little stack.
+    #[inline(never)]
+    fn predicate_atom(&mut self) -> Result<Expr> {
         let t = self.tok(0).clone();
         let next = self.tok(1).clone();
         if t.kind == TokKind::Ident && TEXT_FUNCS.contains(&unicode::upper(&tval(&t)).as_str()) && next.kind == TokKind::Symbol && tval(&next) == "(" {
@@ -820,7 +857,7 @@ fn canonical_struct_name(name: &str) -> String {
 /// `parse_sql(text, parameters=None)`
 pub fn parse_sql(text: &str, params: &Params) -> Result<SelectStatement> {
     let toks = scan(text)?;
-    let mut p = Parser { chars: text.chars().collect(), text: text.to_string(), toks, i: 0, params, source: Vec::new(), source_alias: None };
+    let mut p = Parser { chars: text.chars().collect(), text: text.to_string(), toks, i: 0, params, source: Vec::new(), source_alias: None, depth: 0 };
     p.parse()
 }
 
@@ -988,6 +1025,7 @@ fn out_name(item: &SelectItem) -> String {
 
 /// `compile_sql(text, parameters=None, *, lane=0)`
 pub fn compile_sql(db: &Db, text: &str, params: &Params, lane: Lane) -> Result<CompiledQuery> {
+    db.check_open()?;
     let stmt = parse_sql(text, params)?;
     let lay = resolve_source(db, &stmt.source)?;
     let fields = layout_fields(db, lay)?;
@@ -1152,6 +1190,7 @@ fn opt_big(v: &Option<BigInt>) -> Val {
 
 /// `execute_sql(text, parameters=None, *, lane=0)`
 pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: Lane) -> Result<Val> {
+    engine.db.check_open()?;
     let cq = compile_sql(engine.db, text, params, lane)?;
     let columns = output_columns(&cq);
     let source = vmap! {"realm" => &cq.realm, "layout_id" => cq.layout_id as i64, "layout_name" => cq.layout_name.as_str()};
@@ -1165,7 +1204,14 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
         });
     }
     let only_count = cq.output.len() == 1 && cq.output[0].kind == "aggregate" && cq.output[0].op == "count" && cq.output[0].name == "*" && cq.group_by.is_empty();
-    let base = ExecOptions { realm, lane: cq.lane, limit: opt_big(&cq.limit), offset: Val::from_bigint(cq.offset.clone()), ..Default::default() };
+    let base = ExecOptions {
+        realm,
+        lane: cq.lane,
+        limit: opt_big(&cq.limit),
+        offset: Val::from_bigint(cq.offset.clone()),
+        layout_id: Some(cq.layout_id),
+        ..Default::default()
+    };
     let order_val = || Val::List(cq.order_by.iter().map(|(k, d)| Val::List(vec![Val::str(k.as_str()), Val::str(d.as_str())])).collect());
     let select_val = || Val::List(cq.select.iter().map(|s| Val::str(s.as_str())).collect());
     let (engine_res, rows) = if only_count {
@@ -1228,6 +1274,20 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F016: parentheses/NOT nesting is limited, AND/OR chains are n-ary.
+    #[test]
+    fn nesting_limit_and_flat_chains() {
+        let deep = format!("SELECT a FROM t WHERE {}a = 1{}", "(".repeat(MAX_EXPR_DEPTH + 1), ")".repeat(MAX_EXPR_DEPTH + 1));
+        assert!(matches!(parse_sql(&deep, &Params::None), Err(Error::SqlSyntax(m)) if m.contains("nested deeper")));
+        let ok = format!("SELECT a FROM t WHERE {}a = 1{}", "(".repeat(MAX_EXPR_DEPTH), ")".repeat(MAX_EXPR_DEPTH));
+        assert!(parse_sql(&ok, &Params::None).is_ok());
+        let nots = format!("SELECT a FROM t WHERE {}a = 1", "NOT ".repeat(100_000));
+        assert!(matches!(parse_sql(&nots, &Params::None), Err(Error::SqlSyntax(_))));
+        let chain = format!("SELECT a FROM t WHERE {}", vec!["a = 1"; 50_000].join(" AND "));
+        let st = parse_sql(&chain, &Params::None).unwrap();
+        assert!(matches!(st.where_, Expr::Bool { ref op, ref children } if op == "and" && children.len() == 50_000));
+    }
 
     #[test]
     fn lexer_and_errors() {

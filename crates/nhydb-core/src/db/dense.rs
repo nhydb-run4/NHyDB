@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use num_bigint::BigInt;
 
 use crate::address::{lane_flags, lane_name, Lane};
-use crate::codec::{decode_value, encode_value, FieldDef, TypeCode};
+use crate::codec::{decode_value, encode_value, skip_value, FieldDef, TypeCode};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::nat::{put_vi64, put_vu64, Nat};
@@ -120,6 +120,12 @@ pub enum DenseRows<'a> {
     Flat { vals: &'a [Val], width: usize },
     /// Columns in shape field order, all with `count` rows.
     Columns { cols: &'a [ColData<'a>], count: usize },
+    /// Already encoded BASE records (compaction, P002): `offsets` has one
+    /// entry more than records (`offsets[0] == 0`), record `i` is
+    /// `area[offsets[i]..offsets[i+1]]`. The caller copies CRC-checked bytes
+    /// of the same shape; every record is decoded again by the deep verify
+    /// of the compaction target.
+    Raw { area: &'a [u8], offsets: &'a [u32] },
 }
 
 impl DenseRows<'_> {
@@ -129,6 +135,7 @@ impl DenseRows<'_> {
             DenseRows::Dicts(r) => r.len(),
             DenseRows::Flat { vals, width } => if *width == 0 { 0 } else { vals.len() / width },
             DenseRows::Columns { count, .. } => *count,
+            DenseRows::Raw { offsets, .. } => offsets.len().saturating_sub(1),
         }
     }
 
@@ -255,7 +262,9 @@ fn encode_col_fast(f: &FieldDef, col: &ColData, i: usize, out: &mut Vec<u8>) -> 
 
 impl Db {
     /// Encodes rows according to the shape. Returns: (record area, offsets).
-    pub(crate) fn encode_dense_rows(shape: &ShapeDef, rows: &DenseRows) -> Result<(Vec<u8>, Vec<u32>)> {
+    /// `ignored(key)`: dict keys outside the shape that are not an error
+    /// (see `ignorable_record_key`).
+    pub(crate) fn encode_dense_rows(shape: &ShapeDef, rows: &DenseRows, ignored: &dyn Fn(&str) -> bool) -> Result<(Vec<u8>, Vec<u32>)> {
         let n = rows.len();
         let nf = shape.fields.len();
         let mut out: Vec<u8> = Vec::with_capacity(n * (nf * 2 + 4));
@@ -282,6 +291,22 @@ impl Db {
             }
             DenseRows::Dicts(rs) => {
                 for row in rs.iter() {
+                    // F039: unknown keys would be dropped silently; keys starting
+                    // with '_' are output metadata (`_realm`, `_u`, ...) and ignored.
+                    // Extension/sparse keys are ignored only in a record that
+                    // recognisably comes from get() (N4, G2-3: `_shape`, `_u` or
+                    // `_realm` present); in any other dict they stay an error.
+                    if let Some(m) = row.as_map() {
+                        let from_get = m.iter().any(|(k, _)| matches!(k.as_str(), "_shape" | "_u" | "_realm"));
+                        if let Some((k, _)) =
+                            m.iter().find(|(k, _)| !k.starts_with('_') && shape.by_name(k).is_none() && !(from_get && ignored(k)))
+                        {
+                            return Err(Error::Schema(format!(
+                                "unknown field '{k}' for shape {} (extensions are passed via extensions=)",
+                                shape.shape_id
+                            )));
+                        }
+                    }
                     for f in &shape.fields {
                         let v = row.get(&f.name).ok_or_else(|| Error::Schema(format!("Required field '{}' missing", f.name)))?;
                         encode_value(f, v, &mut out)?;
@@ -323,8 +348,41 @@ impl Db {
                     check(&out, &mut offsets)?;
                 }
             }
+            DenseRows::Raw { area, offsets: raw_offsets } => return Self::copy_raw_rows(area, raw_offsets),
         }
         Ok((out, offsets))
+    }
+
+    /// P002: already encoded BASE records (compaction) – kept out of line so
+    /// that the encoding loops of `encode_dense_rows` stay as compact as
+    /// before (bulk-write throughput).
+    #[inline(never)]
+    #[cold]
+    fn copy_raw_rows(area: &[u8], raw_offsets: &[u32]) -> Result<(Vec<u8>, Vec<u32>)> {
+        if raw_offsets.first() != Some(&0)
+            || raw_offsets.last().map(|e| *e as usize) != Some(area.len())
+            || raw_offsets.windows(2).any(|w| w[1] < w[0])
+        {
+            return Err(Error::Value("raw DATA rows: offset table does not match the record area".into()));
+        }
+        Ok((area.to_vec(), raw_offsets.to_vec()))
+    }
+
+    /// N4: keys of a `get()` record that `put`/`put_dense_batch` ignore
+    /// besides the `_` metadata: names of extensions registered for the
+    /// realm and the `v<n>` labels of unnamed extensions/sparse cells. This
+    /// keeps the `put(realm, u, get(realm, u2))` round trip working; only the
+    /// shape fields are written (extensions are passed via `extensions=`).
+    /// G2-3: they are ignored only if the dict carries `get()` metadata
+    /// (`_shape`, `_u` or `_realm`); otherwise, like any other unknown key,
+    /// they raise `SchemaError` (F039).
+    pub(crate) fn ignorable_record_key(&self, realm: &Nat, k: &str) -> bool {
+        if let Some(d) = k.strip_prefix('v') {
+            if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) && !d.starts_with('0') {
+                return true;
+            }
+        }
+        self.extension_name_map.contains_key(&(realm.clone(), k.to_string()))
     }
 
     /// Writes a batch of contiguous BASE records starting at `u_start`
@@ -353,7 +411,7 @@ impl Db {
             _ => return Err(Error::Schema("Shape missing/does not match".into())),
         };
         let count = rows.len();
-        let (record_area, offsets) = Self::encode_dense_rows(shape, rows)?;
+        let (record_area, offsets) = Self::encode_dense_rows(shape, rows, &|k| self.ignorable_record_key(realm, k))?;
         // Fully validate/encode extensions before anything is written.
         let mut sparse_enc = None;
         if !extensions_by_u.is_empty() {
@@ -404,9 +462,7 @@ impl Db {
         self.register_segment(seg);
         let sparse_result = match sparse_enc {
             Some(enc) => {
-                let r = self.write_sparse_segment(realm, enc, lane)?;
-                self.cache().sparse_record.clear();
-                r
+                self.write_sparse_segment(realm, enc, lane)?
             }
             None => Val::None,
         };
@@ -470,27 +526,59 @@ impl Db {
         Some(best)
     }
 
-    /// Raw bytes of a record within the (cached) block payload.
+    /// Raw bytes of a record: from the cached block payload, or – for a
+    /// block CRC-verified earlier in this session – read directly (offset
+    /// table entry + record, P001/P003).
     pub(crate) fn with_record_bytes<T>(&self, seg: &DenseSegment, u: &Nat, f: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
         let idx = u.checked_sub(&seg.u_start).and_then(|d| d.as_u64()).filter(|d| *d < seg.count);
         let Some(idx) = idx else {
-            return Err(Error::Index(u.to_string()));
+            return Err(Error::Corruption(format!(
+                "DATA block {}: u={u} outside the segment (u_start={}, count={})",
+                seg.block_id, seg.u_start, seg.count
+            )));
         };
-        let payload = self.block_payload(seg.block_offset)?;
+        let acc = self.block_access(seg.block_offset)?;
+        let plen = acc.payload_len() as usize;
         let t = (seg.offsets_offset - seg.payload_offset) as usize + idx as usize * 4;
-        if t + 8 > payload.len() {
+        if t + 8 > plen {
             return Err(Error::Corruption("DATA offset table incomplete".into()));
         }
-        let start = u32::from_le_bytes(payload[t..t + 4].try_into().unwrap()) as usize;
-        let end = u32::from_le_bytes(payload[t + 4..t + 8].try_into().unwrap()) as usize;
+        let tab = self.access_range(&acc, seg.block_offset, t, 8)?;
+        let start = u32::from_le_bytes(tab[0..4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(tab[4..8].try_into().unwrap()) as usize;
         if end < start {
             return Err(Error::Corruption("DATA record offsets go backwards".into()));
         }
         let rbase = (seg.records_offset - seg.payload_offset) as usize;
-        if rbase + end > payload.len() {
+        if rbase + end > plen {
             return Err(Error::Corruption("DATA record incomplete".into()));
         }
-        f(&payload[rbase + start..rbase + end])
+        let rec = self.access_range(&acc, seg.block_offset, rbase + start, end - start)?;
+        f(&rec)
+    }
+
+    /// P016: value of one BASE field of the dense record at `u` without
+    /// decoding the whole record (fields before it are skipped). `None`: no
+    /// fast answer – sparse overlays exist for this realm/lane or `v` is no
+    /// field of the stored shape; the caller then uses the general path.
+    pub(crate) fn dense_base_value(&self, seg: &DenseSegment, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Val>> {
+        if self.sparse.contains_key(&(realm.clone(), lane)) {
+            return Ok(None);
+        }
+        let shape = self.shape_of(seg.shape_id)?;
+        if shape.by_v(v).is_none() {
+            return Ok(None);
+        }
+        self.with_record_bytes(seg, u, |raw| {
+            let mut p = 0usize;
+            for f in &shape.fields {
+                if &f.v == v {
+                    return decode_value(f, raw, &mut p).map(Some);
+                }
+                skip_value(f, raw, &mut p)?;
+            }
+            Ok(None)
+        })
     }
 
     /// `_decode_dense_record`
@@ -522,9 +610,31 @@ impl Db {
         })
     }
 
+    /// F021 rest: the DATA prefixes that route u to blocks are not covered
+    /// by a CRC on open. A u that no DATA segment covers can be the victim
+    /// of a manipulated prefix of the next block (e.g. a shifted `u_start`
+    /// with the same varint length), so the nearest segment above u is
+    /// CRC-checked once per session (verified registry) before "not found"
+    /// is answered; a mismatch raises `CorruptionError`.
+    pub(crate) fn check_uncovered_u(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<()> {
+        let Some(idx) = self.dense.get(&(realm.clone(), lane)) else {
+            return Ok(());
+        };
+        let mut hits = Vec::new();
+        idx.iv.stab(u, &mut hits);
+        if !hits.is_empty() {
+            return Ok(()); // covered (deleted records are no prefix question)
+        }
+        match idx.iv.first_start_after(u) {
+            Some(i) => self.ensure_verified(idx.segs[i].block_offset),
+            None => Ok(()),
+        }
+    }
+
     /// Record including sparse overlays (`get_internal`).
     pub fn get_internal(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<Option<DenseRecord>> {
         let Some(seg) = self.resolve_segment(realm, u, lane) else {
+            self.check_uncovered_u(realm, u, lane)?;
             return Ok(None);
         };
         let mut rec = self.with_record_bytes(seg, u, |raw| self.decode_dense_record(seg, raw))?;

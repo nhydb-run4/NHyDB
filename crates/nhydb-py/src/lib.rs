@@ -11,6 +11,7 @@
 // Nested conditions are kept on purpose: they mirror the structure of the
 // Python API logic and keep the code easy to compare line by line.
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
+mod batch;
 mod conv;
 mod exceptions;
 mod iter;
@@ -32,7 +33,7 @@ use pyo3::IntoPyObjectExt;
 use nhydb_core::address;
 use nhydb_core::codec::{FieldDef, TypeCode};
 use nhydb_core::db::layout::{EvolveSpec, LayoutRef, LayoutSpec};
-use nhydb_core::db::maint::CompactOptions;
+use nhydb_core::db::maint::{CompactOptions, RepairOptions};
 use nhydb_core::schema::field_from_val;
 use nhydb_core::{CellInput, Cond, Db, DenseRows, GetMode, Nat, OpenOptions, SyncMode, Val};
 
@@ -198,34 +199,58 @@ fn evolve_spec(
     })
 }
 
-/// Open options from the Python keyword arguments.
+/// Open options from the Python keyword arguments. `lock=` and
+/// `lock_timeout_ms=` override the `[lock]` configuration field by field.
 #[allow(clippy::too_many_arguments)]
 fn open_opts(
-    strict: bool,
+    readonly: bool,
     durability: Option<&str>,
     layout_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     config: Option<PathBuf>,
     lock: Option<bool>,
     lock_timeout_ms: Option<u64>,
-    base_lock: nhydb_core::LockConfig,
 ) -> PyResult<OpenOptions> {
     let sync_mode = durability.map(SyncMode::parse).transpose().py()?;
-    let lock = if lock.is_some() || lock_timeout_ms.is_some() {
-        Some(nhydb_core::LockConfig {
-            enabled: lock.unwrap_or(base_lock.enabled),
-            timeout_ms: lock_timeout_ms.unwrap_or(base_lock.timeout_ms),
-        })
-    } else {
-        None
-    };
-    Ok(OpenOptions { strict, sync_mode, layout_path, key_path, config: None, config_path: config, lock, internal_compaction: false })
+    let lock = nhydb_core::platform::LockOverride { enabled: lock, timeout_ms: lock_timeout_ms };
+    Ok(OpenOptions { readonly, sync_mode, layout_path, key_path, config: None, config_path: config, lock, internal_compaction: false })
+}
+
+/// F048: OS errors of open/create/maintenance carry errno and the file name
+/// (`OSError(errno, strerror, filename)` → Python picks the subclass, e.g.
+/// `PermissionError`, `IsADirectoryError`). Errors the core already bound to
+/// a side file (`Error::IoPath`: layout plan, key file) keep that file; a
+/// plain `Error::Io` is attributed to the database path.
+fn with_path<T>(r: nhydb_core::Result<T>, path: &std::path::Path) -> PyResult<T> {
+    match r {
+        Err(nhydb_core::Error::Io(e)) if e.raw_os_error().is_some() => Err(conv::io_err(e, Some(path.display().to_string()))),
+        other => other.py(),
+    }
+}
+
+/// Reports open warnings (superblock fallback, key file permissions) as
+/// Python `RuntimeWarning`.
+fn emit_open_warnings(py: Python<'_>, db: &Db) -> PyResult<()> {
+    for w in &db.open_warnings {
+        let msg = std::ffi::CString::new(w.replace('\0', " ")).unwrap_or_default();
+        PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(), &msg, 1)?;
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
 // NHyDB
 // ----------------------------------------------------------------------
 
+/// NHyDB database handle.
+///
+/// Thread use (R003): one object must not be used by several threads at the
+/// same time. Long operations release the GIL while they hold the object;
+/// a concurrent call from another thread is then rejected immediately with
+/// `RuntimeError` ("Already borrowed" / "Already mutably borrowed") – it
+/// does not wait and does not change the data. Use one object per thread
+/// (each opened read-only or in another process) or guard the object with
+/// a `threading.Lock`.
 #[pyclass(name = "NHyDB", module = "nhydb", weakref, dict)]
 pub struct NHyDB {
     pub(crate) db: Db,
@@ -241,14 +266,18 @@ impl NHyDB {
 
 #[pymethods]
 impl NHyDB {
-    /// Opens an existing database.
+    /// Opens an existing database. `readonly=True` opens the file with
+    /// `O_RDONLY` and without lock: nothing in the file is changed (no tail
+    /// truncation, no commit on close), write APIs raise `NHyDBError`; a
+    /// database with an ambiguous commit boundary can be read at the state
+    /// of the usable superblock.
     #[new]
-    #[pyo3(signature = (path, *, strict=true, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
+    #[pyo3(signature = (path, *, readonly=false, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         path: PathBuf,
-        strict: bool,
+        readonly: bool,
         layout_path: Option<PathBuf>,
         key_path: Option<PathBuf>,
         config: Option<PathBuf>,
@@ -256,8 +285,9 @@ impl NHyDB {
         lock: Option<bool>,
         lock_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
-        let opts = open_opts(strict, durability, layout_path, key_path, config, lock, lock_timeout_ms, Default::default())?;
-        let db = py.detach(|| Db::open_with(&path, opts)).py()?;
+        let opts = open_opts(readonly, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
+        let db = with_path(py.detach(|| Db::open_with(&path, opts)), &path)?;
+        emit_open_warnings(py, &db)?;
         Ok(NHyDB { db, fpos: Default::default() })
     }
 
@@ -277,8 +307,8 @@ impl NHyDB {
         lock: Option<bool>,
         lock_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
-        let opts = open_opts(true, durability, layout_path, key_path, config, lock, lock_timeout_ms, Default::default())?;
-        let db = py.detach(|| Db::create(&path, overwrite, opts)).py()?;
+        let opts = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
+        let db = with_path(py.detach(|| Db::create(&path, overwrite, opts)), &path)?;
         Ok(NHyDB { db, fpos: Default::default() })
     }
 
@@ -392,7 +422,7 @@ impl NHyDB {
             explain: explain.map(|x| x.is_truthy()).transpose()?.unwrap_or(false),
             ..Default::default()
         };
-        let r = queryapi::run_core(&self.db, |eng| eng.execute(&e, &opts))?;
+        let r = queryapi::run_core(py, &self.db, |eng| eng.execute(&e, &opts))?;
         from_val(py, &r)
     }
 
@@ -400,7 +430,7 @@ impl NHyDB {
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn sql(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
-        let r = queryapi::run_core(&self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
+        let r = queryapi::run_core(py, &self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
         from_val(py, &r)
     }
 
@@ -410,7 +440,7 @@ impl NHyDB {
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn sql_numpy(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
-        let r = queryapi::run_core(&self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
+        let r = queryapi::run_core(py, &self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
         queryapi::rows_to_numpy(py, &r)
     }
 
@@ -441,7 +471,7 @@ impl NHyDB {
             None => "record".into(),
         };
         let lane = to_lane(lane)?;
-        let r = queryapi::run_core(&self.db, |eng| eng.explain(&e, realm, lane, &rm))?;
+        let r = queryapi::run_core(py, &self.db, |eng| eng.explain(&e, realm, lane, &rm))?;
         from_val(py, &r)
     }
 
@@ -634,7 +664,7 @@ impl NHyDB {
         let lane = to_lane(lane)?;
         let mut cand = Vec::new();
         for x in us.try_iter()? {
-            let b: num_bigint::BigInt = x?.extract()?;
+            let b: num_bigint::BigInt = to_int(&x?)?;
             if b > num_bigint::BigInt::from(0) {
                 cand.push(Nat::from_bigint(&b).unwrap());
             }
@@ -774,14 +804,45 @@ impl NHyDB {
         Ok(d.into_any().unbind())
     }
 
-    fn __enter__(slf: Py<Self>) -> Py<Self> {
-        slf
+    fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
+        if slf.borrow(py).db.closed {
+            return Err(NHyDBError::new_err("database is closed"));
+        }
+        Ok(slf)
     }
 
-    #[pyo3(signature = (*_args))]
-    fn __exit__(&mut self, _args: &Bound<'_, PyTuple>) -> PyResult<bool> {
-        self.db.close(true).py()?;
+    /// Commits on exit – also after an exception (v0.14 semantics). If that
+    /// commit fails, handle and lock are released anyway and the commit
+    /// error is raised, chained to the original exception (`__cause__`).
+    #[pyo3(signature = (*args))]
+    fn __exit__(&mut self, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<bool> {
+        if self.db.closed {
+            return Ok(false);
+        }
+        let db = &mut self.db;
+        if let Err(e) = py.detach(|| db.close(true)) {
+            let _ = self.db.close(false);
+            let err = Err::<(), _>(e).py().unwrap_err();
+            if let Ok(exc) = args.get_item(1) {
+                if !exc.is_none() {
+                    err.set_cause(py, Some(PyErr::from_value(exc)));
+                }
+            }
+            return Err(err);
+        }
         Ok(false)
+    }
+
+    /// Opened with `readonly=True`.
+    #[getter]
+    fn readonly(&self) -> bool {
+        self.db.readonly
+    }
+
+    /// Warnings of the open (superblock fallback, key file permissions, …).
+    #[getter]
+    fn open_warnings(&self) -> Vec<String> {
+        self.db.open_warnings.clone()
     }
 
     #[getter]
@@ -831,6 +892,28 @@ impl NHyDB {
     fn commit(&mut self, py: Python<'_>) -> PyResult<u64> {
         let db = &mut self.db;
         py.detach(|| db.commit()).py()
+    }
+
+    /// `rollback()` (P024, opt-in): discards every write and schema change
+    /// since the last commit of this handle and restores the committed state.
+    /// Returns the commit boundary. Read-only handles raise `NHyDBError`.
+    fn rollback(&mut self, py: Python<'_>) -> PyResult<u64> {
+        let db = &mut self.db;
+        py.detach(|| db.rollback()).py()
+    }
+
+    /// `batch(*, commit=False, u_window=10_000)` (P011): context manager that
+    /// collects `put_cell`/`delete_cell` calls (validated immediately) and
+    /// writes them on leaving the block with one `put_points` per realm and
+    /// lane; `commit=True` commits afterwards. No read-your-writes inside the
+    /// block; on an exception nothing is written, a failed write rolls the
+    /// whole batch back (G3-04).
+    #[pyo3(signature = (*, commit=false, u_window=10_000))]
+    fn batch(slf: &Bound<'_, Self>, commit: bool, u_window: i64) -> PyResult<batch::WriteBatch> {
+        if u_window < 1 {
+            return Err(PyValueError::new_err("u_window must be >= 1"));
+        }
+        Ok(batch::WriteBatch::new(slf.clone().unbind(), commit, u_window as u64))
     }
 
     // ------------------------------------------------------------------
@@ -1426,6 +1509,13 @@ impl NHyDB {
         Ok(iter::ResultIterator::new(slf.clone().unbind(), iter::Pending::Sparse { realm: opt_nat(realm_id)?, lane }))
     }
 
+    /// Writes contiguous BASE records from `u_start` (rows: tuples/lists or dicts).
+    /// Dict rows: keys must be shape fields; `_` metadata keys are ignored.
+    /// In a `get()` record (dict with `_shape`, `_u` or `_realm`) the names of
+    /// the realm's extensions and `v<n>` labels of unnamed extensions/sparse
+    /// cells are ignored too, so `put(r, u, get(r, u2))` copies the shape
+    /// fields (pass extensions via `extensions=`); any other unknown key –
+    /// also an extension name in a plain dict – raises `SchemaError`.
     #[pyo3(signature = (realm_id, u_start, rows, *, shape_id=None, extensions_by_u=None, lane=None, commit=false))]
     #[allow(clippy::too_many_arguments)]
     fn put_dense_batch(
@@ -1492,6 +1582,13 @@ impl NHyDB {
         from_val(py, &r)
     }
 
+    /// Writes one BASE record (`values`: list/tuple or dict).
+    /// Dict rows: keys must be shape fields; `_` metadata keys are ignored.
+    /// In a `get()` record (dict with `_shape`, `_u` or `_realm`) the names of
+    /// the realm's extensions and `v<n>` labels of unnamed extensions/sparse
+    /// cells are ignored too, so `put(r, u, get(r, u2))` copies the shape
+    /// fields (pass extensions via `extensions=`); any other unknown key –
+    /// also an extension name in a plain dict – raises `SchemaError`.
     #[pyo3(signature = (realm_id, u, values, *, shape_id=None, extensions=None, lane=None, commit=false))]
     #[allow(clippy::too_many_arguments)]
     fn put(
@@ -1836,6 +1933,9 @@ impl NHyDB {
     ) -> PyResult<Py<PyAny>> {
         let lane = to_lane(lane)?;
         let f = filters_from_py(filters)?;
+        // P009: get/find_u keep the GIL – single calls take ~1–3 µs; releasing
+        // it per call costs ~3–8 % single-threaded and halves the throughput
+        // of several threads (measured: GIL hand-over per call).
         let us = self.db.find_u(&to_nat(realm_id)?, &f, lane, opt_nat(u_from)?.as_ref(), opt_nat(u_to)?.as_ref()).py()?;
         let l = PyList::empty(py);
         for u in us {
@@ -1889,11 +1989,13 @@ impl NHyDB {
 
     #[pyo3(signature = (*, deep=false))]
     fn health(&self, py: Python<'_>, deep: bool) -> PyResult<Py<PyAny>> {
-        from_val(py, &self.db.health(deep).py()?)
+        let db = &self.db;
+        from_val(py, &py.detach(|| db.health(deep)).py()?)
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        from_val(py, &self.db.stats().py()?)
+        let db = &self.db;
+        from_val(py, &py.detach(|| db.stats()).py()?)
     }
 
     #[staticmethod]
@@ -1913,19 +2015,24 @@ impl NHyDB {
         lock: Option<bool>,
         lock_timeout_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
-        let open = open_opts(true, durability, layout_path, key_path, config, lock, lock_timeout_ms, Default::default())?;
+        let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
         let opts = CompactOptions { output, make_backup, rebuild_indexes, batch_records, open };
-        let r = py.detach(|| Db::compact_file(&path, &opts)).py()?;
+        let r = with_path(py.detach(|| Db::compact_file(&path, &opts)), &path)?;
         from_val(py, &r)
     }
 
     #[staticmethod]
     fn inspect_tail(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyAny>> {
-        from_val(py, &Db::inspect_tail(&path).py()?)
+        from_val(py, &with_path(Db::inspect_tail(&path), &path)?)
     }
 
+    /// Repairs a database file. Default is a dry run (`apply=False`).
+    /// Intact committed blocks are never cut without `allow_data_loss=True`
+    /// (otherwise `CorruptionError`); uncommitted blocks are discarded unless
+    /// `keep_uncommitted=True`. The backup (`<db>.bak_<ts>` plus
+    /// `<db>.bak_<ts>.layout.enc`) can be restored with `restore_backup()`.
     #[staticmethod]
-    #[pyo3(signature = (path, *, apply=false, make_backup=true, rebuild_indexes=true, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
+    #[pyo3(signature = (path, *, apply=false, make_backup=true, rebuild_indexes=true, allow_data_loss=false, keep_uncommitted=false, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn repair_file(
         py: Python<'_>,
@@ -1933,6 +2040,8 @@ impl NHyDB {
         apply: bool,
         make_backup: bool,
         rebuild_indexes: bool,
+        allow_data_loss: bool,
+        keep_uncommitted: bool,
         layout_path: Option<PathBuf>,
         key_path: Option<PathBuf>,
         config: Option<PathBuf>,
@@ -1940,8 +2049,31 @@ impl NHyDB {
         lock: Option<bool>,
         lock_timeout_ms: Option<u64>,
     ) -> PyResult<Py<PyAny>> {
-        let open = open_opts(true, durability, layout_path, key_path, config, lock, lock_timeout_ms, Default::default())?;
-        let r = py.detach(|| Db::repair_file_with(&path, apply, make_backup, rebuild_indexes, &open)).py()?;
+        let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
+        let o = RepairOptions { apply, make_backup, rebuild_indexes, allow_data_loss, keep_uncommitted, open };
+        let r = with_path(py.detach(|| Db::repair_file_opts(&path, &o)), &path)?;
+        from_val(py, &r)
+    }
+
+    /// Restores a backup of `repair_file`/`compact_file` (`backup` plus
+    /// `backup + ".layout.enc"`) as database `path` (key file of `path`
+    /// unchanged). Both files are verified, copied durably and swapped in.
+    #[staticmethod]
+    #[pyo3(signature = (backup, path, *, layout_path=None, key_path=None, config=None, durability=None, lock=None, lock_timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn restore_backup(
+        py: Python<'_>,
+        backup: PathBuf,
+        path: PathBuf,
+        layout_path: Option<PathBuf>,
+        key_path: Option<PathBuf>,
+        config: Option<PathBuf>,
+        durability: Option<&str>,
+        lock: Option<bool>,
+        lock_timeout_ms: Option<u64>,
+    ) -> PyResult<Py<PyAny>> {
+        let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
+        let r = with_path(py.detach(|| Db::restore_backup(&backup, &path, &open)), &path)?;
         from_val(py, &r)
     }
 
@@ -1971,24 +2103,48 @@ impl NHyDB {
         from_val(py, &self.db.put_points(&realm, vec![cell], lane, commit, 10_000).py()?)
     }
 
-    /// Value of a cell (None if not occupied).
+    /// Value of a cell (None if not occupied). `v` may also be a column
+    /// name (field/extension/COLUMN field, `"v<n>"`), resolved like `get_cell` (F055).
     #[pyo3(signature = (realm_id, u, v, *, lane=None))]
     fn get_value(&self, py: Python<'_>, realm_id: &Bound<'_, PyAny>, u: &Bound<'_, PyAny>, v: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let lane = to_lane(lane)?;
-        opt_from_val(py, self.db.get_cell_value(&to_nat(realm_id)?, &to_nat(u)?, &to_nat(v)?, lane).py()?)
+        let (realm, u) = (to_nat(realm_id)?, to_nat(u)?);
+        if v.is_instance_of::<PyString>() {
+            let cell = self.db.get_cell(&realm, &u, &to_val(v)?, lane, false).py()?;
+            return opt_from_val(py, cell.and_then(|c| c.get("value").cloned()));
+        }
+        opt_from_val(py, self.db.get_cell_value(&realm, &u, &to_nat(v)?, lane).py()?)
     }
 
+    /// Deletes a cell (tombstone). Returns `True` if the cell had a value,
+    /// `False` if it was empty – then nothing is written (F047; same
+    /// convention as `delete`, `delete_record` returns the number of
+    /// deleted elements). `commit=True` commits in both cases.
     #[pyo3(signature = (realm_id, u, v, *, lane=None, commit=false))]
     fn delete_cell(
         &mut self,
-        py: Python<'_>,
         realm_id: &Bound<'_, PyAny>,
         u: &Bound<'_, PyAny>,
         v: &Bound<'_, PyAny>,
         lane: Option<&Bound<'_, PyAny>>,
         commit: bool,
-    ) -> PyResult<Py<PyAny>> {
-        self.delete_point(py, realm_id, u, v, lane, commit)
+    ) -> PyResult<bool> {
+        let lane = to_lane(lane)?;
+        let (realm, u, v) = (to_nat(realm_id)?, to_nat(u)?, to_nat(v)?);
+        if !self.db.has_realm(&realm) {
+            return Err(SchemaError::new_err("realm missing"));
+        }
+        address::require_positive("u", &u).py()?;
+        address::validate_local_v(&v, Some(&realm)).py()?;
+        let exists = !matches!(self.db.get_cell_value(&realm, &u, &v, lane).py()?, None | Some(Val::None));
+        if exists {
+            self.db.delete_point(&realm, &u, &v, lane, commit).py()?;
+        } else {
+            if commit {
+                self.db.commit().py()?;
+            }
+        }
+        Ok(exists)
     }
 
     /// Writes a logical record via a layout.
@@ -2059,6 +2215,12 @@ impl NHyDB {
             columns.try_iter()?.map(|c| numpy_io::col_from_py(&c?)).collect::<PyResult<_>>()?
         };
         let count = owned.first().map(|c| c.len()).unwrap_or(0);
+        for (f, c) in shape.fields.iter().zip(owned.iter()) {
+            if c.len() != count {
+                return Err(PyValueError::new_err(format!("Column '{}' has {} values, expected {}", f.name, c.len(), count)));
+            }
+            numpy_io::check_col_type(c, f.typ, f.enum_map.is_some(), &f.name)?;
+        }
         if count == 0 {
             return from_val(py, &nhydb_core::vmap! {"records" => 0i64, "block_offset" => Val::None});
         }
@@ -2091,6 +2253,9 @@ impl NHyDB {
         }
         let typ = r#type.map(|t| type_code(&t)).transpose()?;
         let vals = numpy_io::col_from_py(values)?;
+        if let Some(t) = typ {
+            numpy_io::check_col_type(&vals, t, false, "values")?;
+        }
         let n = vals.len();
         let us = numpy_io::nats_from_py(u, Some(n), "u")?;
         let vs = numpy_io::nats_from_py(v, Some(n), "v")?;
@@ -2132,7 +2297,25 @@ impl NHyDB {
             owned.push((k.str()?.to_str()?.to_owned(), numpy_io::col_from_py(&v)?));
         }
         let n = owned.first().map(|(_, c)| c.len()).unwrap_or(0);
-        let oids: Vec<Nat> = if object_ids.is_instance_of::<pyo3::types::PyInt>() {
+        if let Some((name, c)) = owned.iter().find(|(_, c)| c.len() != n) {
+            return Err(PyValueError::new_err(format!("Column '{name}' has {} values, expected {n}", c.len())));
+        }
+        {
+            // dtype check against the target field types (F033)
+            let lay = self.db.layout_by_ref(&r).py()?;
+            let shape = lay.shape_id.and_then(|sid| self.db.shapes.get(&sid));
+            let lfields = lay.fields();
+            for (name, c) in &owned {
+                if let Some(f) = shape.and_then(|s| s.by_name(name)) {
+                    numpy_io::check_col_type(c, f.typ, f.enum_map.is_some(), name)?;
+                } else if let Some(f) = lfields.iter().find(|f| &f.name() == name) {
+                    if let Ok(t) = type_code(&f.type_name()) {
+                        numpy_io::check_col_type(c, t, false, name)?;
+                    }
+                }
+            }
+        }
+        let oids: Vec<Nat> = if numpy_io::is_scalar(object_ids)? {
             let start = to_nat(object_ids)?;
             (0..n as u64).map(|i| start.add_u64(i)).collect()
         } else {
@@ -2148,16 +2331,23 @@ impl NHyDB {
 
     /// Reads `count` CLASSIC records starting at `u_start` as dict field name → NumPy array
     /// plus `"_present"` (bool array). Missing values: 0, NaN or None respectively.
-    #[pyo3(signature = (realm_id, u_start, count, fields=None, *, lane=None))]
+    /// The result has exactly `count` rows; each dtype depends only on the field
+    /// type. A stored value that does not fit it raises `ValueError` unless
+    /// `object_fallback=True` (then that column has dtype object). A `count`
+    /// whose result exceeds the physical memory raises `MemoryError`.
+    #[pyo3(signature = (realm_id, u_start, count, fields=None, *, lane=None, object_fallback=false))]
+    #[allow(clippy::too_many_arguments)]
     fn read_numpy(
         &self,
         py: Python<'_>,
         realm_id: &Bound<'_, PyAny>,
         u_start: &Bound<'_, PyAny>,
-        count: usize,
+        count: &Bound<'_, PyAny>,
         fields: Option<&Bound<'_, PyAny>>,
         lane: Option<&Bound<'_, PyAny>>,
+        object_fallback: bool,
     ) -> PyResult<Py<PyAny>> {
+        let count = conv::to_count(count, "count")?;
         let lane = to_lane(lane)?;
         let fs: Option<Vec<Val>> = match fields.filter(|f| !f.is_none()) {
             None => None,
@@ -2166,12 +2356,12 @@ impl NHyDB {
         let realm = to_nat(realm_id)?;
         let us = to_nat(u_start)?;
         let db = &self.db;
-        let out = py.detach(|| db.read_columns(&realm, &us, count, fs.as_deref(), lane)).py()?;
+        let out = py.detach(|| db.read_columns(&realm, &us, count, fs.as_deref(), lane, object_fallback)).py()?;
         let d = PyDict::new(py);
-        for (name, col) in out.names.iter().zip(out.cols.iter()) {
+        for (name, col) in out.names.iter().zip(out.cols) {
             d.set_item(name, numpy_io::out_to_numpy(py, col)?)?;
         }
-        d.set_item("_present", numpy_io::out_to_numpy(py, &nhydb_core::db::columns::OutCol::Bool(out.present))?)?;
+        d.set_item("_present", numpy_io::out_to_numpy(py, nhydb_core::db::columns::OutCol::Bool(out.present))?)?;
         Ok(d.into_any().unbind())
     }
 }
@@ -2283,7 +2473,7 @@ fn cell_address(py: Python<'_>, realm_id: &Bound<'_, PyAny>, u: &Bound<'_, PyAny
 
 #[pyfunction]
 fn enc_vu<'py>(py: Python<'py>, n: &Bound<'py, PyAny>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let b: num_bigint::BigInt = n.extract()?;
+    let b: num_bigint::BigInt = to_int(n)?;
     if b.sign() == num_bigint::Sign::Minus {
         return Err(PyValueError::new_err("varuint expects n>=0"));
     }
@@ -2302,7 +2492,7 @@ fn dec_vu(py: Python<'_>, buf: &[u8], pos: usize) -> PyResult<(Py<PyAny>, usize)
 
 #[pyfunction]
 fn enc_vi<'py>(py: Python<'py>, n: &Bound<'py, PyAny>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let b: num_bigint::BigInt = n.extract()?;
+    let b: num_bigint::BigInt = to_int(n)?;
     let mut out = Vec::new();
     nhydb_core::nat::put_vi_big(&mut out, &b);
     Ok(pyo3::types::PyBytes::new(py, &out))
@@ -2417,6 +2607,7 @@ impl FileView {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add_class::<NHyDB>()?;
+    m.add_class::<batch::WriteBatch>()?;
     m.add_class::<PyLayoutDef>()?;
     m.add_class::<PyIndexDef>()?;
     m.add_class::<iter::ResultIterator>()?;
@@ -2448,6 +2639,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("REALM_SPAN", nat_py(py, address::realm_span())?)?;
     m.add("ENGINE_VERSION", nhydb_core::format::ENGINE_VERSION)?;
     m.add("FILE_FORMAT_VERSION", nhydb_core::format::FILE_FORMAT_VERSION)?;
+    // T024: fingerprint of the Rust sources this module was built from (build.rs)
+    m.add("BUILD_SOURCE_HASH", env!("NHYDB_BUILD_SOURCE_HASH"))?;
     m.add("TYPE_CODES", {
         let d = PyDict::new(py);
         for t in nhydb_core::codec::ALL_TYPES {

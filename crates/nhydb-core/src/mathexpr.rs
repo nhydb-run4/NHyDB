@@ -163,6 +163,9 @@ pub enum Node {
     Const(Const),
     Name(String),
     Bin(Box<Node>, BinK, Box<Node>),
+    /// Left-associative chain of one precedence level (`a + b - c`), kept
+    /// n-ary so that long chains do not create deep trees (F017).
+    Chain(Box<Node>, Vec<(BinK, Node)>),
     Un(UnK, Box<Node>),
     And(Vec<Node>),
     Or(Vec<Node>),
@@ -199,6 +202,19 @@ const KEYWORDS: [&str; 35] = [
     "pass", "raise", "return", "try", "while", "with", "yield",
 ];
 
+/// Bracket nesting limit (CPython tokenizer `MAXLEVEL`).
+const MAX_PAREN_DEPTH: i32 = 200;
+/// Limit for recursive grammar levels (brackets, unary operators, `not`,
+/// right-associative `**`), like CPython's 200 levels (F017).
+const MAX_NESTING: usize = 200;
+/// Limit for the depth of the syntax tree; guarantees bounded recursion in
+/// validation, evaluation, the fast path and `Drop` (F017).
+const MAX_AST_DEPTH: usize = 1000;
+
+fn too_deep() -> Error {
+    syn(format!("expression too deeply nested (more than {MAX_NESTING} levels)"))
+}
+
 fn invalid() -> Error {
     syn("invalid syntax (<unknown>, line 1)")
 }
@@ -219,8 +235,13 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
         if c == '\n' || c == '\r' {
-            // end of line outside brackets terminates the expression
-            if cs[i..].iter().all(|x| x.is_whitespace()) {
+            // end of line outside brackets terminates the expression; only
+            // blank or comment lines may follow (as in `ast.parse`, F042)
+            let rest: String = cs[i..].iter().collect();
+            if rest.lines().all(|l| {
+                let t = l.trim_start_matches([' ', '\t', '\x0c']);
+                t.is_empty() || t.starts_with('#') || t.chars().all(|x| x.is_whitespace())
+            }) {
                 break;
             }
             return Err(invalid());
@@ -244,11 +265,15 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
                 };
                 i += 2;
                 let ds = i;
-                while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                while i < cs.len() && (cs[i].is_digit(radix) || cs[i] == '_') {
                     i += 1;
                 }
                 let digits: String = cs[ds..i].iter().collect();
-                if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') || digits.contains("__") {
+                // `0x_ff` is valid Python (one underscore after the prefix, F042)
+                if digits.trim_start_matches('_').is_empty() || digits.ends_with('_') || digits.contains("__") {
+                    return Err(invalid());
+                }
+                if !number_end_ok(&cs, i) {
                     return Err(invalid());
                 }
                 let clean = digits.replace('_', "");
@@ -285,7 +310,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
                 i += 1;
                 is_int = false;
             }
-            if i < cs.len() && (unicode::is_word(cs[i])) {
+            if !number_end_ok(&cs, i) {
                 return Err(invalid());
             }
             let text: String = cs[start..i].iter().collect();
@@ -337,6 +362,10 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             Some(op) => {
                 if matches!(*op, "(" | "[" | "{") {
                     depth += 1;
+                    if depth > MAX_PAREN_DEPTH {
+                        // same limit and message as the CPython tokenizer (MAXLEVEL)
+                        return Err(syn("too many nested parentheses (<unknown>, line 1)"));
+                    }
                 }
                 if matches!(*op, ")" | "]" | "}") {
                     depth -= 1;
@@ -349,6 +378,22 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
     }
     out.push(Tok::End);
     Ok(out)
+}
+
+/// CPython's `verify_end_of_number`: a number may be directly followed by
+/// the keywords `and else for if in is not or` (e.g. `1if x else 2`), but
+/// not by other identifier characters (F042).
+fn number_end_ok(cs: &[char], i: usize) -> bool {
+    let Some(&c) = cs.get(i) else { return true };
+    if !unicode::is_word(c) {
+        return true;
+    }
+    ["and", "else", "for", "if", "in", "is", "not", "or"].iter().any(|kw| {
+        let n = kw.len();
+        cs.len() >= i + n
+            && cs[i..i + n].iter().copied().eq(kw.chars())
+            && cs.get(i + n).is_none_or(|x| !unicode::is_word(*x))
+    })
 }
 
 fn skip_string(cs: &[char], mut i: usize) -> Result<usize> {
@@ -387,6 +432,8 @@ fn skip_string(cs: &[char], mut i: usize) -> Result<usize> {
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    /// Current recursion level (see `MAX_NESTING`).
+    nest: usize,
 }
 
 impl Parser {
@@ -422,8 +469,24 @@ impl Parser {
         if self.eat_op(op) { Ok(()) } else { Err(invalid()) }
     }
 
+    /// Runs `f` one recursion level deeper; fails cleanly beyond `MAX_NESTING`.
+    /// The top-level expression is level 1, so 200 nested brackets are allowed.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Parser) -> Result<T>) -> Result<T> {
+        if self.nest > MAX_NESTING {
+            return Err(too_deep());
+        }
+        self.nest += 1;
+        let r = f(self);
+        self.nest -= 1;
+        r
+    }
+
     /// expression: lambda | disjunction ['if' disjunction 'else' expression]
     fn expression(&mut self) -> Result<Node> {
+        self.nested(Parser::expression_inner)
+    }
+
+    fn expression_inner(&mut self) -> Result<Node> {
         if self.eat_kw("lambda") {
             while !self.is_op(":") {
                 if matches!(self.peek(), Tok::End) {
@@ -473,7 +536,7 @@ impl Parser {
 
     fn inversion(&mut self) -> Result<Node> {
         if self.eat_kw("not") {
-            return Ok(Node::Un(UnK::Not, Box::new(self.inversion()?)));
+            return Ok(Node::Un(UnK::Not, Box::new(self.nested(Parser::inversion)?)));
         }
         self.comparison()
     }
@@ -514,19 +577,22 @@ impl Parser {
         if ops.is_empty() { Ok(left) } else { Ok(Node::Cmp(Box::new(left), ops)) }
     }
 
+    /// One left-associative precedence level, collected n-ary (iterative,
+    /// no tree depth per operator).
     fn bin_level(&mut self, ops: &[(&str, BinK)], next: fn(&mut Parser) -> Result<Node>) -> Result<Node> {
-        let mut left = next(self)?;
+        let first = next(self)?;
+        let mut rest: Vec<(BinK, Node)> = Vec::new();
         'outer: loop {
             for (o, k) in ops {
                 if self.is_op(o) {
                     self.i += 1;
-                    let right = next(self)?;
-                    left = Node::Bin(Box::new(left), *k, Box::new(right));
+                    rest.push((*k, next(self)?));
                     continue 'outer;
                 }
             }
-            return Ok(left);
+            break;
         }
+        Ok(if rest.is_empty() { first } else { Node::Chain(Box::new(first), rest) })
     }
 
     fn bitor(&mut self) -> Result<Node> {
@@ -561,7 +627,7 @@ impl Parser {
         } else {
             return self.power();
         };
-        Ok(Node::Un(k, Box::new(self.factor()?)))
+        Ok(Node::Un(k, Box::new(self.nested(Parser::factor)?)))
     }
 
     fn power(&mut self) -> Result<Node> {
@@ -571,7 +637,7 @@ impl Parser {
         }
         let base = self.primary()?;
         if self.eat_op("**") {
-            let exp = self.factor()?;
+            let exp = self.nested(Parser::factor)?;
             return Ok(Node::Bin(Box::new(base), BinK::Pow, Box::new(exp)));
         }
         Ok(base)
@@ -765,7 +831,7 @@ impl Parser {
 
 fn parse(source: &str) -> Result<Node> {
     let toks = lex(source)?;
-    let mut p = Parser { toks, i: 0 };
+    let mut p = Parser { toks, i: 0, nest: 0 };
     let node = p.expression()?;
     if !matches!(p.peek(), Tok::End) {
         if p.is_op(",") {
@@ -774,7 +840,41 @@ fn parse(source: &str) -> Result<Node> {
         }
         return Err(invalid());
     }
+    if ast_depth(&node) > MAX_AST_DEPTH {
+        return Err(syn(format!("expression too complex (syntax tree deeper than {MAX_AST_DEPTH} levels)")));
+    }
     Ok(node)
+}
+
+/// Depth of the syntax tree, computed iteratively.
+fn ast_depth(root: &Node) -> usize {
+    let mut max = 0;
+    let mut stack: Vec<(&Node, usize)> = vec![(root, 1)];
+    while let Some((n, d)) = stack.pop() {
+        max = max.max(d);
+        match n {
+            Node::Const(_) | Node::Name(_) | Node::Other(_) => {}
+            Node::Bin(l, _, r) => {
+                stack.push((l, d + 1));
+                stack.push((r, d + 1));
+            }
+            Node::Chain(first, rest) => {
+                stack.push((first, d + 1));
+                stack.extend(rest.iter().map(|(_, x)| (x, d + 1)));
+            }
+            Node::Un(_, x) => stack.push((x, d + 1)),
+            Node::And(v) | Node::Or(v) => stack.extend(v.iter().map(|x| (x, d + 1))),
+            Node::Cmp(l, ops) => {
+                stack.push((l, d + 1));
+                stack.extend(ops.iter().map(|(_, x)| (x, d + 1)));
+            }
+            Node::Call { func, args, .. } => {
+                stack.push((func, d + 1));
+                stack.extend(args.iter().map(|x| (x, d + 1)));
+            }
+        }
+    }
+    max
 }
 
 // ----------------------------------------------------------------------
@@ -797,6 +897,17 @@ fn validate(n: &Node, params: &HashSet<String>) -> Result<()> {
                 return Err(not_allowed(k.name()));
             }
             validate(r, params)
+        }
+        Node::Chain(first, rest) => {
+            // same visiting order as the left-deep BinOp tree of Python's ast
+            validate(first, params)?;
+            for (k, x) in rest {
+                if !k.allowed() {
+                    return Err(not_allowed(k.name()));
+                }
+                validate(x, params)?;
+            }
+            Ok(())
         }
         Node::Un(k, x) => {
             if *k == UnK::Invert {
@@ -892,30 +1003,19 @@ impl Eval<'_> {
                 }
                 let a = self.visit(l)?;
                 let b = self.visit(r)?;
-                if a.is_bool() || b.is_bool() {
-                    return Err(dom("boolean values are not allowed in arithmetic"));
+                self.binop(*k, a, b)
+            }
+            Node::Chain(first, rest) => {
+                // the outermost BinOp of the left-deep tree is checked first
+                if let Some((k, _)) = rest.iter().rev().find(|(k, _)| !k.allowed()) {
+                    return Err(syn(format!("operator {} is not allowed", k.name())));
                 }
-                let (a, b) = (a.as_int(), b.as_int());
-                let res = match k {
-                    BinK::Add | BinK::Sub => {
-                        self.guard(bits(&a).max(bits(&b)) + 1)?;
-                        if *k == BinK::Add { a + b } else { a - b }
-                    }
-                    BinK::Mult => {
-                        self.guard(bits(&a) + bits(&b))?;
-                        a * b
-                    }
-                    BinK::FloorDiv | BinK::Mod => {
-                        if b.is_zero() {
-                            return Err(dom("division by zero"));
-                        }
-                        if *k == BinK::FloorDiv { a.div_floor(&b) } else { a.mod_floor(&b) }
-                    }
-                    BinK::Pow => self.pow(&a, &b)?,
-                    _ => unreachable!(),
-                };
-                self.guard(bits(&res))?;
-                Ok(MV::Int(res))
+                let mut acc = self.visit(first)?;
+                for (k, x) in rest {
+                    let b = self.visit(x)?;
+                    acc = self.binop(*k, acc, b)?;
+                }
+                Ok(acc)
             }
             Node::Un(k, x) => {
                 let v = self.visit(x)?;
@@ -980,6 +1080,34 @@ impl Eval<'_> {
             }
             Node::Other(name) => Err(syn(format!("unsupported syntax element: {name}"))),
         }
+    }
+
+    /// One arithmetic operation with the intermediate-result guard.
+    fn binop(&self, k: BinK, a: MV, b: MV) -> Result<MV> {
+        if a.is_bool() || b.is_bool() {
+            return Err(dom("boolean values are not allowed in arithmetic"));
+        }
+        let (a, b) = (a.as_int(), b.as_int());
+        let res = match k {
+            BinK::Add | BinK::Sub => {
+                self.guard(bits(&a).max(bits(&b)) + 1)?;
+                if k == BinK::Add { a + b } else { a - b }
+            }
+            BinK::Mult => {
+                self.guard(bits(&a) + bits(&b))?;
+                a * b
+            }
+            BinK::FloorDiv | BinK::Mod => {
+                if b.is_zero() {
+                    return Err(dom("division by zero"));
+                }
+                if k == BinK::FloorDiv { a.div_floor(&b) } else { a.mod_floor(&b) }
+            }
+            BinK::Pow => self.pow(&a, &b)?,
+            other => return Err(syn(format!("operator {} is not allowed", other.name()))),
+        };
+        self.guard(bits(&res))?;
+        Ok(MV::Int(res))
     }
 
     fn pow(&self, a: &BigInt, b: &BigInt) -> Result<BigInt> {
@@ -1091,6 +1219,12 @@ enum FNode {
     Bool(bool),
     Var(usize),
     Bin(Box<FNode>, BinK, Box<FNode>),
+    /// n-ary left-associative chain (see `Node::Chain`)
+    Chain(Box<FNode>, Vec<(BinK, FNode)>),
+    /// Constant folded at compile time together with the largest bit limit
+    /// its computation needed; below that limit the fast path yields `None`
+    /// so that the exact path raises the same error (F029).
+    Folded(F64v, u64),
     Pos(Box<FNode>),
     Neg(Box<FNode>),
     Not(Box<FNode>),
@@ -1160,30 +1294,38 @@ impl F64v {
 fn to_fast(n: &Node, params: &[String]) -> FNode {
     let b = |x: &Node| Box::new(to_fast(x, params));
     match n {
-        Node::Const(Const::Int(i)) => i.to_i64().map(FNode::Int).unwrap_or(FNode::Unsupported),
+        Node::Const(Const::Int(i)) => i.to_i64().map(FNode::Int).unwrap_or_else(|| FNode::BigConst(i.clone())),
         Node::Const(Const::Bool(v)) => FNode::Bool(*v),
         Node::Const(Const::Other) | Node::Other(_) => FNode::Unsupported,
         Node::Name(id) => params.iter().position(|p| p == id).map(FNode::Var).unwrap_or(FNode::Unsupported),
         Node::Bin(l, k, r) => {
-            if !matches!(k, BinK::Add | BinK::Sub | BinK::Mult | BinK::FloorDiv | BinK::Mod | BinK::Pow) {
+            if !fast_op(*k) {
                 return FNode::Unsupported;
             }
-            let node = FNode::Bin(b(l), *k, b(r));
-            // constant folding (e.g. 10**100) with a generous folding limit; the
-            // runtime bit limit is checked again by `fast_eval` on the folded value.
-            if let FNode::Bin(fl, _, fr) = &node {
-                let is_const = |x: &FNode| matches!(x, FNode::Int(_) | FNode::BigConst(_));
-                if is_const(fl) && is_const(fr) {
-                    if let Some(v) = fast_eval(&node, &[], FOLD_MAX_BITS) {
-                        return match v {
-                            F64v::Int(i) => FNode::Int(i),
-                            F64v::Big(bi) => FNode::BigConst(bi),
-                            F64v::Bool(x) => FNode::Bool(x),
-                        };
+            fold(FNode::Bin(b(l), *k, b(r)))
+        }
+        Node::Chain(first, rest) => {
+            if rest.iter().any(|(k, _)| !fast_op(*k)) {
+                return FNode::Unsupported;
+            }
+            // fold the leading constant operands (e.g. `10**100 * 3 + x`)
+            let mut acc = to_fast(first, params);
+            let mut tail = Vec::with_capacity(rest.len());
+            let mut it = rest.iter();
+            for (k, x) in it.by_ref() {
+                let fx = to_fast(x, params);
+                if is_const(&acc) && is_const(&fx) {
+                    let folded = fold(FNode::Bin(Box::new(acc.clone()), *k, Box::new(fx.clone())));
+                    if is_const(&folded) {
+                        acc = folded;
+                        continue;
                     }
                 }
+                tail.push((*k, fx));
+                break;
             }
-            node
+            tail.extend(it.map(|(k, x)| (*k, to_fast(x, params))));
+            if tail.is_empty() { acc } else { FNode::Chain(Box::new(acc), tail) }
         }
         Node::Un(UnK::UAdd, x) => FNode::Pos(b(x)),
         Node::Un(UnK::USub, x) => FNode::Neg(b(x)),
@@ -1218,6 +1360,36 @@ fn to_fast(n: &Node, params: &[String]) -> FNode {
 /// Upper limit for constants folded at compile time (bits).
 const FOLD_MAX_BITS: u64 = 1 << 16;
 
+fn fast_op(k: BinK) -> bool {
+    matches!(k, BinK::Add | BinK::Sub | BinK::Mult | BinK::FloorDiv | BinK::Mod | BinK::Pow)
+}
+
+fn is_const(x: &FNode) -> bool {
+    matches!(x, FNode::Int(_) | FNode::BigConst(_) | FNode::Folded(..))
+}
+
+/// Constant folding of a binary node with constant operands. The folded
+/// value keeps the smallest bit limit under which its computation succeeds
+/// (`fast_eval` is monotone in the limit), so folding never bypasses
+/// `math_max_intermediate_bits` (F029).
+fn fold(node: FNode) -> FNode {
+    let FNode::Bin(fl, _, fr) = &node else { return node };
+    if !(is_const(fl) && is_const(fr)) {
+        return node;
+    }
+    let Some(v) = fast_eval(&node, &[], FOLD_MAX_BITS) else { return node };
+    let (mut lo, mut hi) = (0u64, FOLD_MAX_BITS);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if fast_eval(&node, &[], mid).is_some() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    FNode::Folded(v, lo)
+}
+
 fn floor_div(a: i64, b: i64) -> Option<i64> {
     let q = a.checked_div(b)?;
     Some(if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q })
@@ -1239,6 +1411,68 @@ fn isqrt_u64(x: u64) -> u64 {
     r
 }
 
+/// One fast-path arithmetic operation (`None` ⇒ exact path).
+fn fast_binop(k: BinK, a: F64v, b: F64v, max_bits: u64) -> Option<F64v> {
+    let guard = |est: u64| if est > max_bits { None } else { Some(()) };
+    if a.is_bool() || b.is_bool() {
+        return None;
+    }
+    if let (F64v::Int(x), F64v::Int(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
+        let small = match k {
+            BinK::Add => x.checked_add(y),
+            BinK::Sub => x.checked_sub(y),
+            BinK::Mult => x.checked_mul(y),
+            BinK::FloorDiv => {
+                if y == 0 {
+                    return None;
+                }
+                floor_div(x, y)
+            }
+            BinK::Mod => {
+                if y == 0 {
+                    return None;
+                }
+                floor_mod(x, y)
+            }
+            BinK::Pow => {
+                if y < 0 {
+                    return None;
+                }
+                u32::try_from(y).ok().and_then(|e| x.checked_pow(e))
+            }
+            _ => return None,
+        };
+        if let Some(v) = small {
+            return Some(F64v::Int(v));
+        }
+    }
+    let (x, y) = (a.big(), b.big());
+    let res = match k {
+        BinK::Add | BinK::Sub => {
+            guard(a.bits().max(b.bits()) + 1)?;
+            if k == BinK::Add { x + y } else { x - y }
+        }
+        BinK::Mult => {
+            guard(a.bits() + b.bits())?;
+            x * y
+        }
+        BinK::FloorDiv | BinK::Mod => {
+            if y.is_zero() {
+                return None;
+            }
+            if k == BinK::FloorDiv { x.div_floor(&y) } else { x.mod_floor(&y) }
+        }
+        BinK::Pow => {
+            let dummy = HashMap::new();
+            Eval { vars: &dummy, max_bits }.pow(&x, &y).ok()?
+        }
+        _ => return None,
+    };
+    guard(res.bits())?;
+    Some(F64v::norm(res))
+}
+
 /// Fast evaluation with bit limit `max_bits` (>= 128, see caller).
 fn fast_eval(n: &FNode, vars: &[i64], max_bits: u64) -> Option<F64v> {
     let guard = |est: u64| if est > max_bits { None } else { Some(()) };
@@ -1252,63 +1486,21 @@ fn fast_eval(n: &FNode, vars: &[i64], max_bits: u64) -> Option<F64v> {
         FNode::Var(i) => F64v::Int(*vars.get(*i)?),
         FNode::Bin(l, k, r) => {
             let (a, b) = (fast_eval(l, vars, max_bits)?, fast_eval(r, vars, max_bits)?);
-            if a.is_bool() || b.is_bool() {
+            fast_binop(*k, a, b, max_bits)?
+        }
+        FNode::Chain(first, rest) => {
+            let mut acc = fast_eval(first, vars, max_bits)?;
+            for (k, x) in rest {
+                let b = fast_eval(x, vars, max_bits)?;
+                acc = fast_binop(*k, acc, b, max_bits)?;
+            }
+            acc
+        }
+        FNode::Folded(v, need) => {
+            if *need > max_bits {
                 return None;
             }
-            if let (F64v::Int(x), F64v::Int(y)) = (&a, &b) {
-                let (x, y) = (*x, *y);
-                let small = match k {
-                    BinK::Add => x.checked_add(y),
-                    BinK::Sub => x.checked_sub(y),
-                    BinK::Mult => x.checked_mul(y),
-                    BinK::FloorDiv => {
-                        if y == 0 {
-                            return None;
-                        }
-                        floor_div(x, y)
-                    }
-                    BinK::Mod => {
-                        if y == 0 {
-                            return None;
-                        }
-                        floor_mod(x, y)
-                    }
-                    BinK::Pow => {
-                        if y < 0 {
-                            return None;
-                        }
-                        u32::try_from(y).ok().and_then(|e| x.checked_pow(e))
-                    }
-                    _ => return None,
-                };
-                if let Some(v) = small {
-                    return Some(F64v::Int(v));
-                }
-            }
-            let (x, y) = (a.big(), b.big());
-            let res = match k {
-                BinK::Add | BinK::Sub => {
-                    guard(a.bits().max(b.bits()) + 1)?;
-                    if *k == BinK::Add { x + y } else { x - y }
-                }
-                BinK::Mult => {
-                    guard(a.bits() + b.bits())?;
-                    x * y
-                }
-                BinK::FloorDiv | BinK::Mod => {
-                    if y.is_zero() {
-                        return None;
-                    }
-                    if *k == BinK::FloorDiv { x.div_floor(&y) } else { x.mod_floor(&y) }
-                }
-                BinK::Pow => {
-                    let dummy = HashMap::new();
-                    Eval { vars: &dummy, max_bits }.pow(&x, &y).ok()?
-                }
-                _ => return None,
-            };
-            guard(res.bits())?;
-            F64v::norm(res)
+            v.clone()
         }
         FNode::Pos(x) => match fast_eval(x, vars, max_bits)? {
             F64v::Bool(b) => F64v::Int(b as i64),
@@ -1427,6 +1619,13 @@ pub fn check_parameters(params: &[String]) -> Result<()> {
     for name in params {
         if !unicode::is_identifier(name) || name.starts_with('_') {
             return Err(syn(format!("invalid parameter name {}", Val::str(name.as_str()).py_repr())));
+        }
+        if unicode::identifier_needs_nfkc(name) {
+            // F043: Python normalizes names in the source, so such a parameter could never match
+            return Err(syn(format!(
+                "parameter name {} is not NFKC-normalized (please use the normalized form)",
+                Val::str(name.as_str()).py_repr()
+            )));
         }
         if SAFE_FUNCTIONS.contains(&name.as_str()) {
             return Err(syn(format!("parameter name {} collides with a math function", Val::str(name.as_str()).py_repr())));
@@ -1929,6 +2128,67 @@ mod tests {
         assert!(matches!(eval("x**x", 10_000_000), Err(Error::MathDomain(_))));
         assert!(t.elapsed().as_millis() < 500);
         assert!(eval("2**1000000", 1).is_ok());
+    }
+
+    fn compile_x(src: &str) -> Result<MathExpression> {
+        MathExpression::compile(src, &p(&["x"]))
+    }
+
+    #[test]
+    fn nesting_limits_f017() {
+        // run on a thread with a modest stack: the limits must keep recursion bounded
+        std::thread::Builder::new()
+            .stack_size(4 << 20)
+            .spawn(|| {
+                let par = |n: usize| format!("{}x{}", "(".repeat(n), ")".repeat(n));
+                assert_eq!(eval(&par(200), 3).unwrap(), MV::Int(BigInt::from(3)));
+                assert!(matches!(compile_x(&par(201)), Err(Error::MathSyntax(m)) if m.contains("too many nested parentheses")));
+                assert!(matches!(compile_x(&par(100_000)), Err(Error::MathSyntax(_))));
+                let neg = |n: usize| format!("{}x", "-".repeat(n));
+                assert_eq!(eval(&neg(200), 3).unwrap(), MV::Int(BigInt::from(3)));
+                assert!(matches!(compile_x(&neg(201)), Err(Error::MathSyntax(m)) if m.contains("too deeply nested")));
+                assert!(matches!(compile_x(&neg(100_000)), Err(Error::MathSyntax(_))));
+                assert!(matches!(compile_x(&format!("{}x", "not ".repeat(100_000))), Err(Error::MathSyntax(_))));
+                assert!(matches!(compile_x(&vec!["x"; 100_000].join("**")), Err(Error::MathSyntax(_))));
+                assert!(matches!(compile_x(&format!("{}x{}", "abs(".repeat(5000), ")".repeat(5000))), Err(Error::MathSyntax(_))));
+                // long chains are n-ary: evaluated iteratively, fast and exact path agree
+                let sum = format!("x{}", "+x".repeat(99_999));
+                assert_eq!(eval(&sum, 3).unwrap(), MV::Int(BigInt::from(300_000)));
+                let e = compile_x(&sum).unwrap();
+                assert_eq!(e.evaluate_fast(&[3], 1 << 20), Some(F64v::Int(300_000)));
+                let mixed = format!("x{}", "-1+2".repeat(50_000));
+                assert_eq!(eval(&mixed, 0).unwrap(), MV::Int(BigInt::from(50_000)));
+                assert_eq!(eval("10 - 3 - 2 + 1 * 4 // 3 % 5", 0).unwrap(), MV::Int(BigInt::from(6)));
+                assert_eq!(eval("x - 1 - 1 - 1", 0).unwrap(), MV::Int(BigInt::from(-3)));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn constant_folding_respects_bit_limit_f029() {
+        let m = MathMap::compile("t", &p(&["x"]), "2**200//2**190 + x", "1", &Val::str("NL"), &crate::address::realm_span().to_bigint()).unwrap();
+        for x in [Val::Int(5), Val::Big(BigInt::from(1u8) << 70)] {
+            assert!(matches!(m.target(std::slice::from_ref(&x), 128), Err(Error::MathDomain(_))), "{x:?}");
+            assert!(m.target(&[x], 201).is_ok());
+        }
+        // differential fast vs exact over several limits
+        let srcs = ["10**100 * 3 + x", "2**127 + x - 2**127", "x * 2**64 // 2**64", "(2**130 - 2**130) + x", "3**80 % 7 + x"];
+        for src in srcs {
+            let e = compile_x(src).unwrap();
+            for bits in [128u64, 129, 130, 131, 200, 256, 400, 1 << 20] {
+                for x in [1i64, 5, -7, i64::MAX] {
+                    let mut v = HashMap::new();
+                    v.insert("x".to_string(), BigInt::from(x));
+                    match (e.evaluate(&v, bits), e.evaluate_fast(&[x], bits)) {
+                        (Ok(s), Some(f)) => assert_eq!(MV::Int(f.big()), s, "{src} {bits} {x}"),
+                        (Err(_), Some(f)) => panic!("fast path bypasses the limit: {src} {bits} {x} -> {f:?}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     #[test]

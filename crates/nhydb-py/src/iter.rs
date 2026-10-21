@@ -91,6 +91,13 @@ impl ResultIterator {
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        // F028: a closed database ends every open iterator with the same
+        // error, independent of what is still buffered.
+        if self.db.borrow(py).db.closed && !(self.buf.is_empty() && matches!(self.state, State::Done)) {
+            self.buf.clear();
+            self.state = State::Done;
+            return Err(crate::exceptions::NHyDBError::new_err("database is closed"));
+        }
         if self.buf.is_empty() && !matches!(self.state, State::Done) {
             self.fill(py)?;
         }

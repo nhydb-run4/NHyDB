@@ -57,16 +57,18 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-/// Constant-time comparison (like `hmac.compare_digest`).
+/// Constant-time comparison (like `hmac.compare_digest`). The length is not
+/// secret; every byte is compared, and `black_box` keeps the optimizer from
+/// turning the accumulation into an early-exit comparison (G2-7).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut d = 0u8;
     for (x, y) in a.iter().zip(b) {
-        d |= x ^ y;
+        d = std::hint::black_box(d | (x ^ y));
     }
-    d == 0
+    std::hint::black_box(d) == 0
 }
 
 pub fn b64encode(b: &[u8]) -> String {
@@ -122,12 +124,48 @@ pub fn layout_open(key: &[u8], nonce_b64: &str, ciphertext_b64: &str, aad: &[u8]
 pub fn layout_mac(key: &[u8], payload: &[u8]) -> String {
     let mut dk = b"NHYDB027-LAYOUT-MAC:".to_vec();
     dk.extend_from_slice(key);
-    hex(&hmac_sha256(&sha256(&dk), payload))
+    let mut mk = sha256(&dk);
+    wipe(&mut dk);
+    let out = hex(&hmac_sha256(&mk, payload));
+    wipe(&mut mk);
+    out
+}
+
+/// Keyed schema digest (R013): `HMAC-SHA256(SHA256("NHYDB027-SCHEMA-DIGEST:" ‖ key), snapshot)`
+/// as hex. Binds R0,u1,v6 and the plan entry to the snapshot without
+/// revealing a plain hash of it (a plain SHA-256 would let anyone holding only
+/// the DB file confirm a guessed schema). Domain-separated from `layout_mac`.
+pub fn schema_digest(key: &[u8], snapshot: &[u8]) -> String {
+    let mut dk = b"NHYDB027-SCHEMA-DIGEST:".to_vec();
+    dk.extend_from_slice(key);
+    let mut mk = sha256(&dk);
+    wipe(&mut dk);
+    let out = hex(&hmac_sha256(&mk, snapshot));
+    wipe(&mut mk);
+    out
+}
+
+/// Overwrites secret bytes with zeros (volatile writes, not optimized away).
+pub fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusive reference.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ct_eq_compares_all_bytes() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"xbc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+    }
 
     #[test]
     fn known_answers() {

@@ -540,7 +540,8 @@ pub fn phrase_candidate_docs(seq: &[String], postings: &TermPostings<'_>) -> Vec
 
 /// `bm25_scores`: summation per term in query order.
 pub fn bm25_scores(postings: &TermPostings<'_>, corpus: &FtCorpus, candidates: Option<&[Nat]>, k1: f64, b: f64) -> Result<Vec<(Nat, f64)>> {
-    if k1 <= 0.0 {
+    // F056: NaN/inf would silently produce NaN scores.
+    if !(k1.is_finite() && k1 > 0.0) {
         return Err(cfg_err("BM25 k1 must be > 0".into()));
     }
     if !(0.0..=1.0).contains(&b) {

@@ -50,6 +50,21 @@ jobs:
             fi
           fi
 
+  # Rust unit and integration tests of the workspace on the release
+  # platforms (R015: a release never relies on the CI status alone).
+  rust-tests:
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust tests
+        run: cargo test --workspace --release
+
   linux:
     needs: check-version
     runs-on: ${{ matrix.runner }}
@@ -186,7 +201,7 @@ jobs:
 
   # Merges all build artifacts and checks that exactly the expected files exist.
   verify:
-    needs: [check-version, linux, macos, windows, sdist]
+    needs: [check-version, rust-tests, linux, macos, windows, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

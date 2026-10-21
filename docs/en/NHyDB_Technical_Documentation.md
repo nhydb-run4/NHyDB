@@ -1,14 +1,14 @@
-# NHyDB 0.27.1 – Technical Documentation
+# NHyDB 0.28.0 – Technical Documentation
 
 | Metadata | Value |
 |---|---|
-| Document | Technical reference documentation NHyDB 0.27.1 (native Rust engine with Python binding) |
+| Document | Technical reference documentation NHyDB 0.28.0 (native Rust engine with Python binding) |
 | Language | English |
 | German version | `../de/NHyDB_Technische_Dokumentation.md` |
-| Document date | 2026-10-18 |
-| Product | NHyDB 0.27.1, Python package `nhydb` |
-| Engine version (`ENGINE_VERSION`) | `0.27.1` |
-| File identifier | `NHYDB016` (format revision 16, `FILE_FORMAT_VERSION = "0.16"`) – internal identifier of the file format; it changes only when the on-disk format changes and is independent of the product version |
+| Document date | 2026-10-21 – release 0.28.0 (changes since 0.27.1: `CHANGELOG.md`) |
+| Product | NHyDB 0.28.0, Python package `nhydb` |
+| Engine version (`ENGINE_VERSION`) | `0.28.0` |
+| File identifier | `NHYDB016` (format revision 16, `FILE_FORMAT_VERSION = "0.16"`) – internal identifier of the file format; it changes only when the on-disk format changes and is independent of the product version. Databases of NHyDB 0.27.1 or earlier do not open with 0.28.0 (keyed schema digest, section 7) |
 | Platforms | macOS, Linux, Windows |
 | License | NHyDB / dNHyDB Experimental Software License 1.0, see file `LICENSE.md` (source-available, not an open-source license; no production use) |
 | Contact | achim.meissner@nhydb.de |
@@ -68,12 +68,12 @@ via PyO3.
 | Storage core | dense BASE records, sparse cells, two lanes, tombstones and null values as separate states |
 | Logical interpretation | layouts CLASSIC, COLUMN, PACKED, CUSTOM; mixed-realm routing; safe layout evolution |
 | Reading | `get`, `get_cell`, object APIs, geometric GET (`cell`/`record`/`auto`), DESCRIBE, occupancy queries |
-| Persistence | append-only container, alternating superblocks, commit boundary, tail recovery, durability `fsync`/`full` |
+| Persistence | append-only container, alternating superblocks, commit boundary, tail recovery (never at the expense of committed data), durability `fsync`/`full`, read-only mode `readonly=True` |
 | Security | system address space R0,u1, encrypted external layout plan (AES-256-GCM, HMAC-SHA256), fail-closed opening, write lock, DB size limit |
 | Indexes | VALUE, TOKEN, TRIGRAM, FULLTEXT (positions, BM25) |
 | MATH_MAP | safe expression language, mapping of input tuples to cells, realm planner, exclusive MATH realms |
 | Queries | QueryEngine (cost planner, providers, aggregation, ranking) and NHySQL-0.24 (read-only `SELECT`) |
-| Maintenance | checkpoint, verify, health, stats, repair, compaction (in-place and export) |
+| Maintenance | checkpoint, verify, health, stats, repair, compaction (in-place and export), restoring backups |
 | Python | Python API (single operations) and NumPy batch API |
 
 ### 1.3 Scope
@@ -81,7 +81,8 @@ via PyO3.
 NHyDB is **not** a relational database system, **not** a server and
 **not** a multi-process transaction system. There is exactly one writing
 process per database (secured by a lock file), no network interface and no
-explicit transaction API with `BEGIN`/`ROLLBACK`. NHySQL is a read-only query
+transaction API with `BEGIN`; `rollback()` only discards the uncommitted
+changes of one object (section 9.7). NHySQL is a read-only query
 language; writes are performed exclusively through the API.
 
 ---
@@ -109,8 +110,8 @@ or are test cases from `crates/nhydb-core/src/address.rs` and
 | `N` | canonical cell number | `N ≥ 3`; GZ and N0 numbers excluded | `n` |
 
 All quantities are **unbounded** natural numbers. There is no floating-point
-arithmetic and no limitation to 64 bits for mathematical coordinates (for the
-physical decoding limit see section 3.6).
+arithmetic and no limitation to 64 bits for mathematical coordinates (for
+limits imposed by resources and configuration see section 3.6).
 
 > **Naming pitfall `v`:** Functions receive the *local* `v`. In the result
 > dicts of `dynadron_address`, `cell_address` and `n_to_dynadron_address`,
@@ -349,6 +350,20 @@ The logical realm is mapped to a physical realm via the RealmMap
 the cell `(R_phys, u, v, side)` is what is stored and addressed. The `N`
 of a MATH cell is therefore `N(R_phys, u, v, side)`.
 
+Three levels have to be distinguished:
+
+| Level | Meaning | Size |
+|---|---|---|
+| logical realm `R_log` | result of splitting `V`; part of the mathematics of the layout | unbounded (e.g. ≈ 10^5000 is possible) |
+| physical realm `R_phys` | realm ID assigned by the realm planner, densely from 1, under which the cell is stored; the mapping `R_log → R_phys` is kept in the encrypted layout plan | small (number of occupied realms) |
+| `N` of the stored cell | `N(R_phys, u, v, side)` | – |
+
+The huge logical realm number is never stored as a cell coordinate. The
+physical `N` of a MATH cell equals the "mathematical" `N(R_log, u, v, side)`
+only if `R_log` is mapped to the same physical realm (e.g. `R_log = 1 →
+R_phys = 1`). `get_math_cell` returns `_logical_realm` and `_V_global` in
+addition to the physical address.
+
 ### 2.12 Derived Number Sequences in the Query Layer
 
 * **Provider `n_sequence`** (`provider_n_sequence`): iterates over
@@ -513,15 +528,44 @@ Implementation: `put_vu64` for `u64`, `put_vu_big` via
 `get_vu_u64` is used for physical fields (lengths, counters, IDs) and
 rejects values > `u64::MAX` with `CorruptionError("…: value too large")`.
 
-### 3.6 Physical Limit of Large Coordinates
+### 3.6 Large Numbers: BigInt Capability and Limits
 
-`get_vu` aborts as soon as the shift width exceeds 16,384 bits
-(`CorruptionError("VarUInt implausibly large")`). A single VarUInt stored in a
-file can therefore be at most 2,341 bytes (≈ 16,387 bits) long. This is a
-**protective limit of the decoder** against manipulated files, not a
-restriction of the address mathematics itself; coordinates of the
-order of magnitude `T = 10^100` (333 bits)
-lie far below it (the 203-digit `N` of example C has about 672 bits).
+Addressing, storage and reopening are designed throughout for arbitrarily
+large natural numbers: `R`, `u`, `V`, `N` and values of the types
+`varuint`/`varint` are taken over exactly (Python ↔ Rust in binary via
+`BigInt`, without intermediate strings), stored and read again after
+reopening. `get_vu` has **no fixed bit limit**; the length of a VarUInt is
+bounded only by the remaining bytes of the CRC-checked block payload
+(truncated values ⇒ `CorruptionError("VarUInt ends prematurely")`).
+Allocations are requested with `try_reserve`; if memory runs out, a clean
+`MemoryError` is raised instead of a crash. Coordinates and values with
+2^16,380, 2^16,400, 10^5 and 10^6 bits are tested via the single-item API,
+`put_points`, `create_realm`, dense batches and MATH pass-through, each with
+commit, reopen, read and `verify(deep=True)`
+(`tests/python/test_stab_bigint.py`).
+
+| Kind | Limit | Scope |
+|---|---|---|
+| Mathematical (Dynadron) | `u, v, R ≥ 1`; GZ/N0 excluded; `v_local ≤ 10^100` per realm | part of the concept |
+| Configuration | `realm_auto_limit` (**number** of logical realms of a MATH layout, not their size) | MATH layouts only (section 13.4) |
+| | `math_max_intermediate_bits` | only arithmetic operations in formulas (section 13.2), never passed-through inputs |
+| | IDs (`shape_id`, `layout_id`, `index_id`, `default_shape_id`) ≤ 2^63 − 1 | administrative IDs only (`ValueError`) |
+| Technical | NumPy batch APIs: coordinate arrays `uint64` | NumPy path only; single-item and list APIs are unbounded |
+| | Python display: `str(int)` with more than 4,300 decimal digits is refused | output in Python only (`print`, `json`, f-strings) |
+| Physical | memory, disk (`db_max_size_bytes`), computing time | one address computation with 10^6 bits takes ≈ 0.1 s |
+
+**Displaying very large numbers in Python:** since Python 3.11 (also in
+security updates of older versions), `str(int)` refuses numbers with more
+than 4,300 decimal digits (`ValueError: Exceeds the limit (4300 digits) for
+integer string conversion`). This affects only the
+display, not NHyDB: values come back as `int`, and address dicts also contain
+`N_ref` as text. For output, set `sys.set_int_max_str_digits(0)` (0 = no
+limit) or work with `int.bit_length()`.
+
+```python
+import sys
+sys.set_int_max_str_digits(0)      # only for displaying huge numbers
+```
 
 ### 3.7 Fixed System Constants per Database
 
@@ -601,7 +645,11 @@ flowchart TB
 and can be tested on its own with `cargo test -p nhydb-core`. Address
 mathematics, encoding, routing and commit reside exclusively in the core; the
 PyO3 layer only converts types, releases the GIL for purely native sections
-and bridges Python plugins.
+(queries, SQL, batch writes, commit, maintenance) and bridges Python plugins
+and providers, which take the GIL back for their callback. Reading calls
+share an `NHyDB` object (several threads may query at the same time); a
+writing call needs the object exclusively, a conflict is rejected
+immediately (section 16.7, "Threads").
 
 ### 4.2 Modules of the Rust Core
 
@@ -646,6 +694,8 @@ including comments and unit tests); they serve for orientation only.
 | `db/index.rs` | 1,155 | index construction, directories, candidates |
 | `db/math.rs` | 553 | MATH API in the core, rollback |
 | `db/maint.rs` | 1,060 | checkpoint, verify, health, stats, repair, compaction |
+| `db/blockcache.rs` | new in 0.28.0 (609) | block cache (LRU), "verified" registry, partial reads of verified blocks, cache budgets (section 9.8) |
+| `db/batch.rs` | new in 0.28.0 (116) | single-cell check for `batch()`, `rollback()` |
 
 ### 4.3 PyO3 Layer `nhydb-py`
 
@@ -654,7 +704,8 @@ including comments and unit tests); they serve for orientation only.
 | `lib.rs` | class `NHyDB`, `LayoutDef`, `IndexDef`, module functions, registration |
 | `conv.rs` | conversion Python ↔ `Val`/`Nat` (arbitrarily large `int`) |
 | `exceptions.rs` | exception hierarchy |
-| `numpy_io.rs` | buffer protocol for NumPy arrays, output via `numpy.frombuffer` |
+| `numpy_io.rs` | buffer protocol for NumPy arrays, output without a copy via `ColumnBuffer` and `numpy.frombuffer` |
+| `batch.rs` | `WriteBatch` for `NHyDB.batch()` |
 | `iter.rs` | `ResultIterator` (lazy, block-wise) |
 | `pyplugin.rs` | bridge for Python CUSTOM plugins (weak reference to the DB object) |
 | `kernel.rs` | stateless kernel functions for `nhydb.kernel` |
@@ -664,7 +715,7 @@ including comments and unit tests); they serve for orientation only.
 
 ### 4.4 External Dependencies
 
-Versions according to `Cargo.lock` of NHyDB 0.27.1:
+Versions according to `Cargo.lock` of NHyDB 0.28.0:
 
 | Crate | Version | Usage |
 |---|---|---|
@@ -672,13 +723,13 @@ Versions according to `Cargo.lock` of NHyDB 0.27.1:
 | `crc32fast` | 1.5.2 | CRC32 for superblocks, block headers, payloads |
 | `miniz_oxide` | 0.8.9 | zlib decompression; compression on Windows |
 | `aes-gcm` | 0.11.1 | AEAD encryption of the layout plan |
-| `sha2` | 0.11.1 | SHA-256 (snapshot hash, fingerprints, MAC key derivation) |
-| `hmac` | 0.13.0 | HMAC-SHA256 over the plan envelope |
+| `sha2` | 0.11.1 | SHA-256 (fingerprints, key derivation for MAC and schema digest) |
+| `hmac` | 0.13.0 | HMAC-SHA256 over the plan envelope and the schema snapshot |
 | `base64` | 0.23.1 | encoding of key, nonce and ciphertext |
 | `getrandom` | 0.4.3 | operating system random numbers (keys, nonces, UUID) |
 | `toml` | 1.1.8 | configuration file |
-| `libc` (Unix only) | 0.2.190 | `fsync`, `fcntl(F_FULLFSYNC)` |
-| `windows-sys` (Windows only) | 0.61.2 | `FlushFileBuffers`, `MoveFileExW` |
+| `libc` (Unix only) | 0.2.190 | `fsync`, `fcntl(F_BARRIERFSYNC/F_FULLFSYNC)`, `O_NOFOLLOW`, `sysconf` (physical memory), `localtime_r` |
+| `windows-sys` (Windows only) | 0.61.2 | `GlobalMemoryStatusEx` (physical memory), `GetLocalTime`; file sync (`FlushFileBuffers`) and rename via the standard library |
 | `pyo3` (`nhydb-py` only) | 0.29.3 | Python binding, feature `num-bigint` |
 | system `libz` (Unix, via FFI) | – | zlib compression byte-identical to CPython |
 
@@ -745,6 +796,19 @@ Three states are strictly separated:
 
 The **newest** state in each case (highest block ID) wins.
 
+**Deleting dense and sparse data.** The delete commands act differently:
+
+| Command | Effect |
+|---|---|
+| `delete(realm, u)` | `DELETE` block; hides **only the dense record** at `(realm, u, lane)` as written by `put`/`put_dense_batch`. Sparse cells of the same u group remain – single cells on BASE fields (`put_cell`, `put_points`, `put_cells_numpy`, `batch().put_cell`), whether written before or after the `delete`, as well as extensions: they stay visible through `get_value`/`get_cell`, the geometric GET, QueryEngine/NHySQL and indexes. `get`, `get_record`, `range` and `read_numpy`, in contrast, no longer return the record (no dense record). Returns `True` if a dense record existed, otherwise `False` (then nothing is written) |
+| `delete_record(layout_id, object_id)` | complete deletion of a logical record: CLASSIC – `DELETE` block for the dense record and tombstones for all live sparse cells of the u group (BASE single cells and extensions); COLUMN/PACKED/CUSTOM – tombstones for all occupied cells of the object. Returns the number of deleted elements |
+| `delete_cell(realm, u, v)` | tombstone for exactly one cell, also for a BASE field of a dense record (the field then reads as `None`); `False` without a write if the cell is empty or null |
+| `delete_point(realm, u, v)` | tombstone for exactly one cell; always written, returns write statistics (dict) |
+
+Deleted data stays in the file as older blocks (append-only). Hidden dense
+records and deleted cells are removed physically only by `compact_file()`
+(section 15.5).
+
 ### 5.3 Extensions and the BASE Boundary
 
 Extensions are declared additional fields of a realm at a `v` above
@@ -787,8 +851,9 @@ The type codes are available as `nhydb.TYPE_CODES`.
 * **VarInt (`vi`):** ZigZag mapping `n ≥ 0 → 2n`, `n < 0 → −2n−1`,
   followed by VarUInt.
 * Decoding errors result in `CorruptionError` with fixed texts
-  (`VarUInt ends prematurely`, `VarUInt implausibly large`,
-  `length value ends beyond the payload`, `fixed-width value incomplete`).
+  (`VarUInt ends prematurely`, `length value ends beyond the payload`,
+  `fixed-width value incomplete`). There is no fixed bit limit
+  (section 3.6).
 
 ### 6.3 Enums
 
@@ -825,6 +890,20 @@ The engine writes and reads the file format with the identifier `NHYDB016`
 (format revision 16, `FILE_FORMAT_VERSION = "0.16"`). Older format revisions
 are not read; there is no converter. All integers are little-endian.
 
+**Compatibility with NHyDB 0.27.1.** The file identifier `NHYDB016`,
+superblocks, block headers and data payloads are unchanged from 0.27.1.
+Since 0.28.0, however, the schema digest in the layout plan (field `sha256`)
+and in R0,u1,v6 is an HMAC-SHA256 with a key derived from the layout key
+(section 8.3) instead of a plain SHA-256 of the schema snapshot; in addition,
+the MATH layout state contains the field `max_intermediate_bits`. Databases
+created with NHyDB 0.27.1 or earlier therefore do not open – not even with
+`readonly=True`: opening fails closed with a `CorruptionError` whose text
+names NHyDB 0.27.1 and the export/re-import route. The `repair_file` dry run
+reports `action: "abort"` with `plan_error`, `repair_file(apply=True)` refuses
+with `CorruptionError`; the files stay unchanged. There is no migration: read
+out (export) the data with NHyDB 0.27.1, create a new database with 0.28.0,
+import the data there and build the indexes with `build_indexes()`.
+
 ### 7.1 Files of a Database
 
 | File | Content | Note |
@@ -846,7 +925,8 @@ Offset 8192   Block 1: SYSTEM (R0,u1, generation 0)
               Block 2: DB_CONFIG
               Block …: DATA_DENSE | SPARSE_CELLS | DELETE | SECONDARY | CHECKPOINT | SYSTEM | DB_CONFIG
               ── commit boundary last_valid_end ──
-              (optional: uncommitted tail, truncated on open)
+              (optional: uncommitted tail, truncated on open if the
+               commit boundary is unambiguous – section 8.4)
 ```
 
 ### 7.3 Superblock
@@ -866,8 +946,9 @@ Offset 8192   Block 1: SYSTEM (R0,u1, generation 0)
 | 64 | u32 | `flags` |
 | 4092 | u32 | CRC32 over bytes 0 … 4091 |
 
-On opening, the valid superblock with the highest generation wins. A
-commit always writes the **other** slot.
+On opening, the valid superblock with the highest generation wins,
+provided its commit boundary lies inside the file (assessment of both slots:
+section 8.4). A commit always writes the **other** slot.
 
 ### 7.4 Block Header
 
@@ -952,7 +1033,7 @@ Keys are in Python sort order (for mixed types by `repr`).
 
 | Codec | Content |
 |---:|---|
-| 4 / 8 | `u` values as a u32 or u64 array |
+| 4 / 8 | `u` values as a u32 or u64 array (width from the largest indexed `u`, at least from the lane maximum) |
 | 0 | VarUInt deltas (for `u ≥ 2^64`) |
 | 1 | FULLTEXT positions: `FTP1 vu(n) (vu(Δu) vu(tf) vu(pos0) vu(Δpos)…)*` |
 | 2 | FULLTEXT document lengths: `FTD1 vu(n) vu(total_tokens) (vu(Δu) vu(len))*`, key `"\u0000NHYDB_FULLTEXT_DOCUMENT_LENGTHS"` |
@@ -960,7 +1041,9 @@ Keys are in Python sort order (for mixed types by `repr`).
 Postings are zlib-compressed (level 1; Unix: system `libz`, byte-identical to
 CPython; Windows: `miniz_oxide`, a valid but not necessarily byte-identical
 stream). `count` is the document frequency or document count. Directories
-are not decoded on open but on first access.
+are not decoded on open but on first access; the whole payload is then read
+once and its CRC is checked before directory or postings are used (a damaged
+index block results in `CorruptionError`, never in silently wrong hits).
 
 ### 7.9 CHECKPOINT Block
 
@@ -1002,7 +1085,7 @@ generation does not match, opening is refused.
 | v3 | file name of the layout plan | no |
 | v4 | file name of the key file | no |
 | v5 | plan generation (+1 per SYSTEM block) | yes |
-| v6 | SHA-256 (hex) of the active schema snapshot | yes |
+| v6 | schema digest (keyed HMAC-SHA256, hex) of the active schema snapshot | yes |
 | v7 | `created_ns` | no |
 | v8 | `"AES-256-GCM + HMAC-SHA256"` | no |
 | v9 | `{"lane_NL":0,"lane_NR":1,"realm_span":10**100}` (only in the first SYSTEM block) | no |
@@ -1015,17 +1098,26 @@ not contain v9. `get_system_cell(9)` nevertheless returns v9 from the remembered
 * **Key file:** JSON
   `{"contract":"NHYDB027_KEY_V1","db_id","db_name","key_b64"}` with 32
   random bytes; created exclusively (`create_new`), Unix permissions `0600`,
-  file and directory sync.
+  file and directory sync. If the file is readable by group or others on
+  open (`mode & 0o077`), NHyDB issues a `RuntimeWarning` (also listed in
+  `db.open_warnings`). The key is zeroed in memory when it is released
+  (limits: section 15.6). Windows: the
+  key file inherits the ACL of its directory; NHyDB sets no ACL of its own.
+  Therefore put key files into a directory accessible only to the user (for
+  example below `%USERPROFILE%`) or into a protected location via
+  `[paths] key_path`.
 * **Plan file:** JSON `{"contract":"NHYDB027_EXTERNAL_LAYOUT_V1","db_id","entries":[1..2],"mac"}`
   with `mac = HMAC-SHA256(SHA256("NHYDB027-LAYOUT-MAC:" ‖ key), json(envelope without mac))`.
 * **Entry:** `{"generation","sha256","nonce","ciphertext"}`; AES-256-GCM
   with a 12-byte random nonce, AAD `"NHYDB027:{db_id}:{generation}:{sha256}"`,
-  Base64-encoded.
+  Base64-encoded. `sha256` (historical field name) is the schema digest
+  `HMAC-SHA256(SHA256("NHYDB027-SCHEMA-DIGEST:" ‖ key), plaintext)` – a
+  guessed schema cannot be confirmed without the key.
 * **Plaintext:** schema snapshot
   `{"contract":"NHYDB027_SCHEMA_V1","realms","shapes","extensions","layouts","indexes","math_layouts"}`
   (lists sorted by ID).
 * JSON everywhere with sorted keys, separators `,`/`:` and UTF-8 without
-  ASCII escaping; MAC and hash depend on this byte-exact serialization.
+  ASCII escaping; MAC and schema digest depend on this byte-exact serialization.
 
 ### 8.4 Opening (Fail Closed)
 
@@ -1037,24 +1129,65 @@ sequenceDiagram
     participant K as layout.key
     participant P as layout.enc
     A->>D: NHyDB(path) / Db::open_with
-    D->>D: resolve configuration, acquire lock <db>.lock
-    D->>F: read both superblocks, choose highest valid generation
-    D->>D: check last_valid_end ∈ [8192, file size]
+    D->>D: anchor paths absolutely, resolve configuration,<br/>acquire lock <db>.lock (not with readonly=True)
+    D->>F: read and assess both superblocks
+    D->>D: commit boundary unambiguous? (otherwise fail closed, see below)
     D->>F: ONE scan up to last_valid_end (header CRC of all blocks)
     Note over D: register data blocks,<br/>check SYSTEM chain,<br/>reject layout meta blocks
     D->>D: file name == R0,v2 ?
     D->>K: load key (contract, db_id, db_name, length 32)
     D->>P: read plan, check HMAC
-    D->>D: exactly one entry with (generation, hash) from R0
-    D->>P: decrypt (AES-GCM), check SHA-256 and contract
-    D->>F: only now: truncate uncommitted tail
-    D->>D: import schema, validate MATH states
+    D->>D: exactly one entry with (generation, schema digest) from R0
+    D->>P: decrypt (AES-GCM), check schema digest and contract
+    D->>D: import schema, validate MATH states,<br/>check DATA prefixes for plausibility
+    D->>F: only now: truncate uncommitted tail<br/>(not with readonly=True)
     D-->>A: opened database
 ```
 
 Any error before the tail is truncated leaves the file unchanged.
 The engine checks R0 and registers data blocks in **one** scan over the
 block headers.
+
+**Assessment of the superblocks.** The valid superblock with the highest
+generation whose commit boundary lies inside the file is chosen. Bytes behind
+the boundary are only known to be uncommitted if **both** superblocks are
+valid and consistent. Otherwise:
+
+| Situation | Behavior on open |
+|---|---|
+| both superblocks valid and consistent | the tail is truncated after all checks (`recovered_tail_bytes`) |
+| one superblock damaged or inconsistent, **no** bytes behind the boundary of the newest valid superblock | opens with a `RuntimeWarning` (also in `db.open_warnings`) |
+| one superblock damaged or inconsistent, bytes behind the usable boundary (could be committed data) | `CorruptionError`, file unchanged; `readonly=True` reads the state of the usable superblock, `repair_file` resolves the situation (section 15.4) |
+| newest valid superblock points behind the end of the file (file truncated) | `CorruptionError` with a hint to `repair_file`; `readonly=True` reads an older fitting superblock if there is one |
+| both superblocks damaged or foreign file | `CorruptionError` ("no usable superblock" or "not an NHyDB 0.16 database file") |
+| file shorter than 8192 bytes | `CorruptionError` ("file is shorter than the superblock area …") |
+| opening with `lock=False` and an uncommitted tail | `DatabaseLockedError` (the tail could belong to another writer; nothing is truncated) |
+
+**When does this happen?** A plain process abort (e.g. `SIGKILL`, a crash
+of the application) never produces a damaged superblock: superblocks are
+written with a single write call, and uncommitted blocks are simply
+discarded on the next open. A torn superblock with data behind it only
+arises from a power or system failure during the superblock write (or from
+media errors). Then fail closed applies: `readonly=True` reads the state of
+the other superblock; `repair_file(apply=True, keep_uncommitted=True)` takes
+over the intact blocks behind the boundary (usually the state that was just
+being committed), `allow_data_loss=True` discards them.
+
+**File name binding.** R0,v2 stores the file name under which the database
+was created. It is compared with the name actually stored in the directory
+(Unix: match via the inode, Windows: canonical path); on case-insensitive
+file systems the stored spelling therefore counts. A file that was renamed
+or copied under another name does not open ("must keep the name"); for a
+copy under a new name use `compact_file(path, output=new)`.
+
+**Read-only mode `readonly=True`.** The file is opened with `O_RDONLY`,
+without lock; nothing is truncated and nothing is committed on close. Write
+APIs and `commit()` raise `NHyDBError`. An uncommitted tail stays invisible
+(`recovered_tail_bytes` reports its length). The view is the committed state
+at the time of opening; later commits of a writer that has the database open
+at the same time are not loaded (no `refresh`). If opening meets a concurrent schema commit of a writer
+(plan and R0 briefly inconsistent), it is retried. Write-protected files
+(e.g. permissions `0444`) can be read this way.
 
 ### 8.5 Commit with Schema Change (Two-Generation Protocol)
 
@@ -1065,7 +1198,7 @@ sequenceDiagram
     participant F as X.nhydb
     D->>D: export snapshot, seal generation g+1
     D->>P: atomically replace plan with [active(g), new(g+1)]<br/>(temp file, sync, atomic replacement, directory sync)
-    D->>F: append SYSTEM block (g+1, new hash)
+    D->>F: append SYSTEM block (g+1, new schema digest)
     D->>F: write buffer, sync
     D->>F: superblock into the other slot, sync
     Note over D: error after plan replacement ⇒<br/>database "poisoned": further writes blocked
@@ -1082,7 +1215,12 @@ Crash analysis:
 The plan holds only **two** generations. If the superblock fell back to a
 state before g (both superblocks of a newer generation defective), the
 matching generation would no longer be in the plan; opening then fails
-closed.
+closed. A restored **older** plan is detected in the same way (no generation
+matches R0 ⇒ `CorruptionError`).
+
+If only **one** superblock is found damaged on the next open and there are
+bytes behind the usable commit boundary, NHyDB no longer discards these bytes
+silently but refuses to open (section 8.4).
 
 ---
 
@@ -1111,6 +1249,25 @@ After `commit()` returns (or an operation with `commit=True`), the state is
 durable according to the selected durability mode. Data written without a
 commit resides in the tail and is lost in a crash.
 
+* On macOS, the sync in step 1 in mode `fsync` is an
+  `fcntl(F_BARRIERFSYNC)`: all data written before is persisted before the
+  superblock (write ordering). If the file system does not support the
+  barrier, `fsync(2)` is used.
+* In mode `full`, the sync in step 1 on macOS is an `F_BARRIERFSYNC` as well
+  (ordering), the sync in step 2 an `F_FULLFSYNC`: it flushes the drive
+  cache for the data **and** the superblock before `commit()` returns. Same
+  guarantee as before (two `F_FULLFSYNC`), but ≈ 3.6 instead of 6.0 ms per
+  commit. Without barrier support, step 1 uses `F_FULLFSYNC`. Crash
+  analysis: a failure before the superblock leaves the old superblock (old
+  consistent state); if the new superblock is persisted, so is its data,
+  because of the barrier.
+* If a sync or the superblock write fails, the handle is "poisoned": further
+  commits are rejected and the database must be reopened (a repeated sync
+  could report success although data was lost). A failed write of the buffer
+  itself can be retried.
+* A commit without changes writes nothing once both superblocks hold the
+  current state; `close()` makes sure that both slots are current.
+
 ### 9.3 Write Paths at a Glance
 
 | Operation | Result in the container | Notes |
@@ -1119,10 +1276,12 @@ commit resides in the tail and is lost in a crash.
 | `put(realm, u, values, …)` | like `put_dense_batch` with one row | |
 | `put_points(realm, cells, …)` | one `SPARSE_CELLS` block per `u` window | all cells are encoded before the first append |
 | `put_extensions(…)`, `put_extension_list(…)`, `put_extension_range(…)` | sparse cells | `merge=False` deletes unnamed, live extensions via tombstone |
-| `delete_point(realm, u, v, …)` | sparse tombstone | |
-| `delete(realm, u, …)` | `DELETE` block | hides the dense record at `u` |
+| `delete_point(realm, u, v, …)`, `delete_cell(…)` | sparse tombstone | `delete_cell` writes nothing if the cell is empty or null |
+| `delete(realm, u, …)` | `DELETE` block | hides only the dense record at `u`; sparse cells and extensions stay visible (section 5.2) |
+| `delete_record(layout_id, object_id, …)` | `DELETE` block (CLASSIC) and sparse tombstones | deletes the logical record completely (section 5.2) |
 | `put_object(s_batch)` | cells according to the layout | |
 | `put_math_batch(…)` | sparse cells in exclusive MATH realms | complete rollback in case of error (section 13) |
+| `with db.batch(…) as b:` | one `put_points` per realm/lane when the block is left | calls checked immediately, last one wins, no read-your-writes, nothing written on an exception (section 16.4) |
 | `set_max_db_size(…)` | `DB_CONFIG` block | |
 | schema operations | no file bytes; `layout_dirty` | new plan generation on commit |
 
@@ -1143,8 +1302,9 @@ flowchart LR
 `put_points` across several `u` windows) is not atomic as a whole. If
 a later append fails (e.g. size limit), earlier blocks of the
 same operation remain uncommitted in the tail until a commit makes them
-durable or the database is closed without a commit. A complete
-rollback is implemented only for `put_math_batch`.
+durable, `rollback()` discards them (section 9.7) or the database is closed
+without a commit. Only `put_math_batch` and the write of a `batch()`
+roll back completely by themselves.
 
 ### 9.4 Read Paths
 
@@ -1159,9 +1319,24 @@ rollback is implemented only for `put_math_batch`.
   hit cell. Budget: 4,194,304 skip marks, 4,096 v indexes, up to 64
   jointly indexed sibling u groups of a block.
 * **Overlays:** `get_internal` combines the dense record and the newest
-  sparse states of the same u group.
-* **Block cache:** CRC-checked payloads up to 8 MiB per block, total budget
-  64 MiB (when exceeded, the cache is cleared).
+  sparse states of the same u group. If the realm/lane has no sparse
+  overlays, `get_value`/`get_cell` decode only the requested BASE field (the
+  preceding fields are skipped).
+* **Sparse writes and v index:** a new sparse block does not update the
+  cached v indexes immediately; a v index catches up with the new blocks in
+  block order on the next read of its `u`. Decoded sparse records (key block
+  ID and `u`, immutable) stay valid.
+* **Ranges:** `range`/`select` find the next stored `u` through the interval
+  index in O(log segments) and skip gaps.
+* **Block cache:** budget `[cache] block_cache_bytes` (default 64 MiB),
+  blocks up to max(8 MiB, budget/8), LRU eviction. Every block is read
+  completely and checked by its payload CRC before its first use and is
+  then marked as *verified*; verified blocks that are not (or no longer)
+  cached are read by range only (offset table entry + record, or the sparse
+  window between two skip marks). Large batches therefore stay fast for
+  single accesses. The mark is per handle and is dropped whenever the file
+  is cut back (rollback, discarded buffer) and on close; `verify` always
+  checks completely. Details and all cache budgets: section 9.8.
 
 ### 9.5 Iterators
 
@@ -1171,12 +1346,19 @@ rollback is implemented only for `put_math_batch`.
 block by block, errors occur only at the first `next()`, and the
 memory requirement is independent of the result size.
 
+* After `close()` every further `next()` raises `NHyDBError("database is closed")`, even if rows are still
+  buffered.
+* `find` determines the list of matching `u` from the index at the first
+  `next()` (freshness is checked then, `StaleIndexError`). Afterwards the
+  iterator works with this snapshot: later writes raise no `StaleIndexError`
+  and are not taken into account. Create a new iterator for a current state.
+
 ### 9.6 Durability Modes
 
 | Mode | macOS | Linux | Windows |
 |---|---|---|---|
 | `fsync` (default) | `fsync(2)` | `fsync(2)` | `FlushFileBuffers` |
-| `full` | `fcntl(F_FULLFSYNC)` | `fsync(2)` | `FlushFileBuffers` |
+| `full` | `fcntl(F_BARRIERFSYNC)` before, `fcntl(F_FULLFSYNC)` after the superblock | `fsync(2)` | `FlushFileBuffers` |
 
 * `fsync` is the ordinary file sync of the operating system and is called on Unix via
   `libc::fsync` – deliberately **not** via
@@ -1194,22 +1376,83 @@ memory requirement is independent of the result size.
   an error; there is **no silent fallback** to `fsync(2)`.
 * All file syncs (database, layout plan) follow the selected mode, and on
   Unix the directory syncs as well. On Windows the directory sync
-  (`sync_dir`) has no effect in either mode (directory metadata is protected by the
-  NTFS journal); the atomic replacement (`atomic_replace`) uses
-  `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` there,
-  and on Unix `rename` followed by a directory sync.
+  (`sync_dir`) has no effect in either mode: directory entries are journaled
+  NTFS metadata of the file they name, and syncing a newly created file
+  commits the journal up to its last change. The atomic replacement
+  (`atomic_replace`) uses `std::fs::rename` there (POSIX semantics: replaces
+  an existing target even while a read-only handle still has it open; long
+  paths are supported) and then syncs the replaced file in the selected
+  mode, which makes the rename durable. If another process (virus scanner,
+  indexing service) briefly holds the file, it retries up to eight times with
+  a short delay (errors 5/32). On Unix `rename` followed by a directory
+  sync.
+* Before the superblock write, mode `fsync` on macOS uses `F_BARRIERFSYNC`
+  (section 9.2). This protects the commit boundary against power loss also
+  in mode `fsync`: the superblock can never reach the medium before the data
+  it points to. Measured cost: about 0.3 ms per commit (0.063 → 0.365 ms);
+  `full` additionally flushes the drive cache – with a single `F_FULLFSYNC`
+  after the superblock (section 9.2; commit `full` with 100 records
+  ≈ 6.0 → 3.6 ms).
+* Spellings: besides `"fsync"`, `durability` accepts the aliases
+  `"default"` and `"normal"`, besides `"full"` the alias `"fullfsync"`;
+  `db.durability` always returns the canonical name.
 
 ### 9.7 Life Cycle
 
 | Method | Effect |
 |---|---|
 | `NHyDB.create(path, overwrite=False, …)` | creates the triad (key, plan with generation 0, DB with SYSTEM block), sets the size limit (`DB_CONFIG`) and commits |
-| `NHyDB(path, …)` / `nhydb.open` | opens fail closed (section 8.4) |
+| `NHyDB(path, …)` / `nhydb.open` | opens fail closed (section 8.4); `readonly=True` opens without lock and without changing the file |
 | `commit()` | commit protocol; return value: commit boundary |
+| `rollback()` | discards all writes and schema changes of the object since its last commit: cuts the file back to the commit boundary, clears the caches, rebuilds the state with the open scan and the schema from the active layout plan entry (data, R0,u1, MATH states, size limit). Session settings (plugins, `durability`, dyn output) are kept. No effect without changes. `readonly=True` or "poisoned" ⇒ `NHyDBError`; with `lock=False` a commit of another writer is checked first (`DatabaseLockedError`, nothing is cut). Return value: commit boundary |
 | `sync(hard=False)` | write buffer, optionally file sync – **no** superblock commit |
-| `close(commit=True)` | optional commit, then release file handle and lock (immediately, not only when the object is released); afterwards every operation that needs the file raises `NHyDBError` ("database is closed"); values already held in the in-memory cache may still be returned, so a closed object should not be used for reading; repeated calls have no effect; if the commit fails, the database stays open (retry or `close(commit=False)`); `close(commit=False)` releases handle and lock even if writing the buffer fails |
-| `with nhydb.create(...) as db:` | `__exit__` calls `close(commit=True)` – **even if an exception occurred in the block** |
+| `close(commit=True)` | optional commit, then release file handle and lock (immediately, not only when the object is released); afterwards all read, write, index and query APIs as well as open iterators raise `NHyDBError` ("database is closed"), independent of cache contents; repeated calls have no effect; if the commit fails, the database stays open (retry or `close(commit=False)`), unless the handle is "poisoned" (section 9.2) – then handle and lock are released and the error is raised; `close(commit=False)` releases handle and lock even if writing the buffer fails; with `readonly=True` nothing is ever committed |
+| `with nhydb.create(...) as db:` | `__exit__` calls `close(commit=True)` – **even if an exception occurred in the block** (semantics of the v0.14 reference). If this commit fails, the database is closed with `close(commit=False)` (handle and lock released) and the commit error is raised, chained to the original exception (`__cause__`); `with` on a closed object raises `NHyDBError` |
 | object release without `close` | buffer is written but not committed |
+
+### 9.8 Caches and Memory Budgets
+
+All caches belong to one open object (handle); they are cleared, or
+dropped from the cut position on, on close, on `rollback()` and whenever
+the file is cut back. No cache replaces a check: data are used only after
+the CRC check of their block succeeded.
+
+**Assumption "blocks are immutable":** the check applies per handle
+and per block. A block checked once is afterwards used from the cache or by
+partial reads without a new CRC check, because NHyDB never changes a block
+after appending it. If another process changes the file *in place*
+(manipulation, tools outside NHyDB, or `repair_file(allow_data_loss=True)`,
+which cuts the file back, followed by new writes), a handle that is already
+open – typically a `readonly=True` reader without lock – does not notice: it
+returns cached old values or reads new bytes from a previously checked offset
+without CRC. A newly opened handle checks again. After such a change, close
+open handles and open them again. Compaction and `restore_backup`, in
+contrast, replace the file atomically; open handles keep reading the old file
+unchanged.
+
+| Cache | Budget | Behavior |
+|---|---|---|
+| block cache (payloads) | `[cache] block_cache_bytes`, default 64 MiB; `0` = off | LRU; eviction in batches down to ¾ of the budget; largest item max(8 MiB, budget/8), at most the budget (64 MiB ⇒ 8 MiB, 256 MiB ⇒ 32 MiB) |
+| "verified" registry | ≈ 30 bytes per checked block | offset → payload length; allows partial reads (`pread` of offset table entry + record, or sparse window); after 8 partial reads a cacheable block is loaded completely again (new CRC check) and cached |
+| index postings | 2^23 (≈ 8.4 million) `u` entries | a posting list above the budget is not cached |
+| FULLTEXT postings | 2^23 entries | as index postings |
+| sparse group directories | 2^22 (≈ 4.2 million) groups | per sparse block |
+| decoded sparse records / merged sparse states | 2^20 (≈ 1 million) cells each and at most 4,096 entries | key (block ID, `u`) or (realm, lane, `u`) |
+| v index (COLUMN/PACKED, sparse point access) | 4,194,304 skip marks, 4,096 indexes (fixed) | `[cache] vindex_*` are checked but not used yet |
+| index directories (`sec_dirs`/`sec_sorted`) | bounded by the number of indexes | from CRC-checked SECONDARY blocks |
+
+When a budget is reached, the cache concerned (except the block cache) is
+cleared after its real use was recomputed. `stats()["block_cache"]` returns
+`budget_bytes`, `max_item_bytes`, `cached_bytes`, `cached_blocks`,
+`verified_blocks` and the counters `hits`, `loads`, `partial_reads`,
+`evictions` (since opening).
+
+**Effect (measurement section 18.5):** single access into a block with 1M
+records after the first check: `get` 4.2 ms → 3 µs; 4,000 random accesses
+across 400 blocks (≈ 100 MB) warm 21 µs → 3.6 µs (budget 32 MiB), 2.2 µs
+(64 MiB), 0.26 µs (256 MiB). The first access to a block still costs the
+one-time read and check of the whole block (1M KQ records ≈ 25 MB, a few
+ms).
 
 ---
 
@@ -1279,6 +1522,10 @@ provides a bridge for Python objects.
   `delete_record` …) are not supported and are rejected with a PyO3 borrow error
   (`RuntimeError`). Read callbacks outside of
   write operations work.
+* `occupied_addresses(db, layout, object_id, lane)` is also called during
+  `delete_record`; `db` is locked there (`RuntimeError: Already mutably
+  borrowed`). Plugins should therefore compute the addresses from `layout`,
+  `object_id` and `lane` only and not use `db` in this method.
 
 ### 10.5 Example COLUMN and PACKED
 
@@ -1370,9 +1617,53 @@ The QueryEngine planner uses only fresh indexes and otherwise falls back to
 a scan; BM25 search (`search`) requires a fresh
 FULLTEXT index. `verify` reports stale indexes.
 
+**Memory during the build:** all indexes of one pass are built from one
+scan; their posting lists stay in memory until they are written (4 bytes
+per reference, 8 bytes from u ≥ 2^32, exact BigInt values from u ≥ 2^64;
+measured with KQ-10M about 8.6 bytes per reference including growth
+reserve and write buffers, three indexes over 10 M records ≈ 275 MiB). The
+DATA blocks are checked but read past the block cache. Before the scan
+`build_indexes` estimates the need (records × 10 bytes per index): if all
+selected indexes together exceed half of the physical memory, they are
+built automatically in several scans (field `passes` in the result; same
+result, longer run time). If a single index needs more than the physical
+memory, the operation raises `MemoryError` before anything is read or
+written. For TOKEN, TRIGRAM and FULLTEXT indexes the estimate is a lower
+bound; a memory growth that still fails raises `MemoryError` instead of
+aborting the process, as far as the operating system refuses the request
+(on Linux the OOM killer may act first). The database always stays
+unchanged in its last committed state.
+
 The index of a realm that contains only sparse data is written and
 is considered fresh; sparse states of BASE fields (incl. tombstones and
 purely sparse records) are taken into account during index construction.
+
+**Semantics: the index returns exactly what the scan returns.** The general
+evaluator (scan) is the reference; index paths may only be used where they
+give identical results:
+
+* **Only CLASSIC records** are indexed. Cells of `u` routed to a COLUMN,
+  PACKED or CUSTOM layout go into no index. The planner uses an index only if
+  all layouts of the realm are CLASSIC and the field appears there under the
+  queried name; otherwise it scans.
+* **`delete(realm, u)`** hides only the dense values of the record.
+  Sparse cells on BASE fields and extensions that still exist afterwards stay
+  visible (as in `get_value`/`get_cell` and in the scan) and indexed
+  (section 5.2); `delete_record` removes them as well.
+* **Equality** follows Python (`1 == 1.0 == True`); `== NaN` never matches
+  (also not inside lists or dicts).
+* **Ranges** (`between`, `<`, `>` …) exclude `None` and NaN; values that
+  are not comparable with the bounds (e.g. text against a number) do not
+  match – an empty result instead of `TypeError`, as in the scan.
+* `u` above 2^32 or 2^64 are stored exactly in postings.
+* A SECONDARY block is read completely and CRC-checked on first access; a
+  damaged block results in `CorruptionError`.
+
+> **Note on updating:** indexes built with NHyDB 0.27.1 or older could
+> contain incomplete or surplus postings because of the fixed defects
+> (large `u`, non-CLASSIC layouts, extensions after `delete`). Since
+> databases of 0.27.1 do not open with 0.28.0 (section 7), the indexes are
+> rebuilt with `build_indexes()` after the re-import.
 
 ### 12.3 Candidate API in the Core
 
@@ -1441,7 +1732,27 @@ with the sign of the divisor, `**` with a negative exponent ⇒
 **Resource limit:** No intermediate result
 may have more than `math_max_intermediate_bits` bits (default
 2^20 = 1,048,576). `*`, `**` and `lcm` are estimated via the bit lengths
-**before** the computation; exceeding the limit ⇒ `MathDomainError`.
+**before** the computation; exceeding the limit ⇒ `MathDomainError`. The
+limit applies only to results of arithmetic operations in formulas;
+passed-through inputs (`u = "x"`), constants, the realm split and the realm
+assignment are not limited. Constant folding at compile time also respects
+the limit. There are **two settings** that do not influence each other:
+
+| Setting | applies to |
+|---|---|
+| `[math] math_max_intermediate_bits` in `nhydb_config.toml` | MATH layouts of a database: the value is frozen in the layout state when a MATH layout is **created** (`MathLayoutState.max_intermediate_bits`) and then applies to writing and reading this layout, independent of later sessions and configurations; `replace_math_spec` (before the first write) takes over the current configuration value |
+| `nhydb.math.set_math_max_intermediate_bits(bits)` | process-wide for **standalone** objects (`MathExpression`, `MathMap`, `dry_run`); has no effect on database operations; `bits ≥ 1`, otherwise `ValueError` |
+
+**Nesting limits:** brackets and recursion levels (bracket, unary operators,
+`not`, `**`) are limited to 200 as in CPython
+(`MathSyntaxError("too many nested parentheses …")` or "expression too
+deeply nested …"),
+the syntax tree to depth 1000. Long chains of the same precedence
+(`x + 1 + 1 + …`) are evaluated n-ary and iteratively and are not limited.
+Identifiers and parameter names must be NFC/NFKC-normalized; number literals
+follow the rules of CPython (e.g. `0x_ff`, no keyword directly after a
+number). Input values are converted like Python `int()` (large floats
+exactly, underscores, NaN/inf ⇒ `ValueError`).
 
 ```python
 from nhydb.math import MathExpression
@@ -1471,7 +1782,16 @@ spec = MathMapLayoutSpec("grid", m, 4096)      # realm_auto_limit = 4096
   entirely (starting at realm 1; every non-MATH realm counts as
   occupied).
 * Budget: `existing + new ≤ realm_auto_limit` (default 4096), otherwise
-  `RealmBudgetExceeded`.
+  `RealmBudgetExceeded`. `realm_auto_limit` limits the **number** of logical
+  realms of a MATH layout, not their size or number – a single huge logical
+  realm number (e.g. ≈ 10^5000) counts as 1.
+* Origin of `realm_auto_limit`: `MathMapLayoutSpec(name, mapping,
+  realm_auto_limit)` carries the value itself; `create_math_map_layout(...)`
+  takes the value from `[math] realm_auto_limit` of the configuration if none
+  is given; standalone objects (`MathMapLayoutSpec`, `MathRealmMap`,
+  `dry_run`) use the library default 4096
+  (`nhydb.math.DEFAULT_REALM_AUTO_LIMIT`) if none is given. The value is
+  stored with the layout and never overridden by the configuration on open.
 * Plans are validated against a snapshot (revision = `next_block_id`)
   (`StalePlanError`, `AllocationConflictError`).
 * The RealmMap is append-only and bijective.
@@ -1514,8 +1834,8 @@ flowchart TB
 Physical realms of a MATH layout are blocked for shapes, layouts, extensions,
 indexes and direct `put_points`
 (`SchemaError("Realm … belongs exclusively to MATH layout …")`).
-`create_realm` on such a realm ID is not
-blocked and changes only the name/description.
+`create_realm` on such a realm ID (as on any occupied one) raises
+`SchemaError("realm … already exists")`.
 
 ### 13.8 Example
 
@@ -1604,6 +1924,19 @@ Costs are rounded like Python `round(cost, 3)`.
 * `POSTING_COUNT`: `count` over exactly one field predicate with an exact estimate.
 * `CLASSIC_U`: record domain in a realm with exactly one CLASSIC layout,
   only indexed field leaves in `AND`; evaluation in u space.
+* Universe from segment metadata (no marker in the output): realm with
+  exactly one CLASSIC layout, `(realm, lane)` without overlays (no sparse
+  cells, `DELETE` blocks or overlaps), shapes with fields. Then `COUNT(*)`
+  comes from the segments (1M records 0.76 s → 1.9 ms on the first call per
+  handle with the checksum check of the DATA blocks, repeated 0.03 ms;
+  sections 15.1 and 18.5), `NOT`/`ALL` need no
+  decoding, `ORDER BY … LIMIT` builds only the window and `GROUP BY`
+  streams the rows in chunks of 4,096. Results and error messages are
+  identical to the general path (tested).
+* Planner: FIELD, AND-of-FIELD and ALL expressions are planned only when
+  needed (`explain`); nested AND/OR reuse the plan of `execute`. Unions of
+  several postings are sorted as `u64` (exact `Nat` path as soon as a
+  `u > 2^64` occurs).
 
 **Providers:** built-in `formula` (expressions over `k`), `n_sequence`
 (arithmetic N sequence, GZ/N0 skipped), `math_layout_inputs`
@@ -1612,15 +1945,33 @@ Python callables that receive the engine and may access `engine.db`
 **read-only**.
 
 **Semantics:** comparisons, equality and group keys follow Python
-(`1 == 1.0 == True`; incompatible ordering comparisons yield `False`);
-groups in insertion order; `sum` exact for integers; `avg` as a correctly
-rounded division; `ORDER BY` stable with fixed `None` handling,
-incompatible types ⇒ `QueryPlanError`.
+(`1 == 1.0 == True`; incompatible ordering comparisons yield `False` – in the
+scan **and** via indexes, section 12.2); `== NaN` never matches, ranges
+exclude `None` and NaN; rows with NaN as group value each form a group of
+their own; groups in insertion order; `sum` exact for integers; `avg` as a
+correctly rounded division; `ORDER BY` stable with fixed `None` handling,
+incompatible types ⇒ `QueryPlanError`. The `CLASSIC_U` fastpath returns the
+same row shapes as the general path (`record` envelopes, structural
+columns); unknown columns in `select` yield `None`. `IS NULL` matches only if
+the field is **missing** in the record (e.g. an extension that was never
+set); an explicitly stored null value counts as present (`IS NOT NULL`).
+
+**Limits:** expression trees (Python `Q`, JSON specification) are limited
+to 256 levels (`QueryPlanError`); chains of the same `&`/`|` operator are
+collected n-ary and are not limited. BM25: `k1` must be finite and > 0
+(`IndexConfigError`); `@record_n` requires integral values (`3.0` yes,
+`3.7` ⇒ `ValueError`); `search(limit=)` accepts arbitrarily large integers.
 
 **Performance optimizations without semantic change:** Rows without `ORDER BY`
 are produced only within the LIMIT/OFFSET window; materialization scans do not hold
-a set of all records; `STRUCT_RANGE` over ranges > 4096 visits only
-materialized `u`.
+a set of all records; `STRUCT_RANGE` over ranges > 4096 visits only the
+stored `u` **of the range** (candidates from the dense/sparse interval
+index, presence per `u` as in the direct path; 1M records, `u 1..4097`:
+284 → 11 ms).
+
+**Thread model:** `query`, `explain_query`, `sql`, `sql_numpy` and the
+`QueryEngine` methods run without the GIL; runtime providers in Python take
+the GIL back for their call (section 16.7).
 
 ### 14.4 NHySQL-0.24 (Read-Only SELECT)
 
@@ -1639,7 +1990,7 @@ FROM [realm.]layout [[AS] alias]
 | Element | Support |
 |---|---|
 | SELECT list | `*`, `q.*`, field `[AS] alias`, `relevance`, `COUNT/SUM/MIN/MAX/AVG(*\|field)` (default alias `<op>_<field\|all>`) |
-| Source | **CLASSIC** layouts only; realm as `realm_N`, `realmN`, `rN`, `N` or unique name; layout as number, `layout_N`, `layoutN` or unique name |
+| Source | **CLASSIC** layouts only; realm as `realm_N`, `realmN`, `rN`, `N` or unique name; layout as number, `layout_N`, `layoutN` or unique name. `FROM <layout>` covers only the records routed to this layout (routing winner, section 10.2), not the whole realm |
 | WHERE | `NOT` > `AND` > `OR`, parentheses; `IS [NOT] NULL`, `BETWEEN … AND …`, comparisons with a literal (`= NULL` forbidden), infix `CONTAINS`, `ICONTAINS`, `TOKEN`, `FULLTEXT`, `PHRASE`; functions `TOKEN`, `TOKENS_ALL`, `TOKENS_ANY`, `CONTAINS`, `ICONTAINS`, `FULLTEXT`, `FULLTEXT_ANY`, `PHRASE`, `EXISTS` |
 | Structural references | `@u`, `STRUCT.u` (`realm`, `u`, `v`, `lane`, `n`, `record_n`, `layout_id`, `layout_kind`, `layout_name`, `object`) |
 | Parameters | `?` (numbered by position) and `:name`; substituted during parsing |
@@ -1650,7 +2001,9 @@ Rules: field and alias resolution is case-insensitive (casefold); non-aggregated
 fields must be grouped; `GROUP BY` without an aggregate is an
 error; `relevance` only without an aggregate and only with `ORDER BY relevance DESC`
 (→ BM25 search, default `LIMIT 20`); `COUNT(*)` alone uses the count path.
-Error texts contain line, column and `near`.
+Error texts contain line, column and `near`. Brackets and `NOT` are limited
+to 256 levels (`SQLSyntaxError`); `AND`/`OR` chains are n-ary and not
+limited. `IS NULL` has the semantics from section 14.3 (field missing).
 
 Result: `{query_version, language: "NHySQL-0.24", statement, source,
 columns, rows, returned, matched, optimizer, …}`; `EXPLAIN` returns only the
@@ -1675,79 +2028,157 @@ db.sql_numpy("SELECT id, temp FROM records WHERE id BETWEEN ? AND ?", [3, 7])
 |---|---|
 | superblock CRC32, magic, version | every open |
 | header CRC of all blocks in the committed range | every open (one scan) |
-| payload CRC of SYSTEM, DB_CONFIG, DELETE, CHECKPOINT | on open |
-| payload CRC of data and index blocks | on first load into the block cache and in `verify` |
+| payload CRC of SYSTEM, DB_CONFIG, DELETE, CHECKPOINT, SPARSE | on open |
+| payload CRC of data blocks | before the first use per handle (whole block, then partial reads) and in `verify` |
+| payload CRC of SECONDARY blocks (index) | on first access to the index (whole block), afterwards directory and postings from the checked payload |
+| DATA prefix: end of the offset table = end of payload, shape exists and belongs to the realm | on open (from the read-ahead window of the open scan; for large blocks one additional small read) |
 | prefixes, offset tables, sparse streams, group count | `verify`, with `deep=True` complete decoding of all records |
-| plan: HMAC, AES-GCM tag, SHA-256 of the plaintext, contracts, generation | every open |
+| plan: HMAC, AES-GCM tag, schema digest (HMAC) of the plaintext, contracts, generation | every open |
 | R0 chain: immutable cells, generation +1, v9 | every open |
 | MATH states (no foreign definitions in MATH realms, no double occupancy) | open and `health` |
 
-All length and offset computations from file contents are overflow-checked;
-manipulated headers result in `CorruptionError` instead of a crash.
+All length and offset computations from file contents are overflow-checked
+(`checked_add`, `try_from`); counters from the file (groups, postings) are
+checked for plausibility against the payload length, allocations are
+requested with `try_reserve`, zlib streams are inflated with a size limit,
+JSON metadata is read up to depth 256. Damaged or manipulated files result in
+`CorruptionError` (or `MemoryError` on real memory shortage), never in
+`IndexError`, `PanicException` or a process abort.
+
+**Routing prefixes:** SPARSE blocks are CRC-checked on open (realm,
+`u_start`, `u_end` and counters lie in the protected payload); small blocks
+come from the scan window that is read anyway, large ones are read in 1 MiB
+chunks (measured about 0.1 ms per MiB of sparse data). A displaced overlay
+can therefore no longer silently return an older BASE value. For DATA
+prefixes the shape must exist and belong to the realm of the segment; a
+flipped realm value raises `CorruptionError` on open.
+
+**Remaining gap:** the other routing prefixes of DATA blocks are read on open
+without payload CRC. A flipped `u_start` value of the same encoded length
+shifts the segment; a read (`get`, `get_value`, `get_cell`, `get_record`,
+`select_us`) of a `u` that no segment covers, and a range read (`range`,
+`select`, `read_numpy`) that skips such a gap, therefore CRC-checks the next
+higher DATA block once per handle and raises `CorruptionError` instead of
+"not found". Answers taken from the segment metadata alone (`Q.all()` as
+count or N list, `COUNT(*)`) CRC-check all DATA blocks of the realm once per
+handle first. If another segment starts between the read `u` and the
+shifted `u_start` (only with overlapping segments, i.e. after overwrites),
+that segment is checked instead of the shifted block; the affected `u` then
+appear empty until the block is loaded or `verify(deep=True)` is run.
+Closing this completely would need a prefix checksum of its own (format
+change).
 
 ### 15.2 Tail Recovery
 
 Bytes behind the commit boundary are truncated on open – only after successful
-verification of R0, key and plan; their number is available in
-`db.recovered_tail_bytes`.
+verification of R0, key, plan and schema; their number is available in
+`db.recovered_tail_bytes`. They are truncated only if the commit boundary is
+unambiguous (both superblocks valid and consistent) and the lock is held;
+otherwise opening fails without changing the file (section 8.4). Committed,
+CRC-valid data is never truncated silently.
 
 ### 15.3 Maintenance Functions
 
 | Function | Description |
 |---|---|
-| `verify(deep=False)` | block structure up to end of file; result `{ok, scanned_blocks, physical_records, error_count, errors, …}`; reports stale indexes |
-| `health(deep=False)` | checks `container`, `layouts`, `spacemap`, `layout_routing`, `math_layouts`, `definitions`, `indexes`, `checkpoint`; overall status `healthy`/`warning`/`unhealthy` |
+| `verify(deep=False)` | block structure up to end of file; continues after damage and reports **every** damaged block; result `{ok, scanned_blocks, physical_records, error_count, errors, warnings, …}`; stale indexes are listed in `warnings` (not an error) |
+| `health(deep=False)` | checks `container`, `layouts`, `spacemap`, `layout_routing`, `math_layouts`, `definitions`, `indexes`, `checkpoint`; overall status `healthy`/`warning`/`unhealthy`; a stale index results in `warning` |
 | `stats()` | file, format, realms, shapes, layouts, extensions, indexes (incl. `kind`, `options`, `distinct_values`), `max_db_size_bytes`, MATH layouts |
 | `checkpoint()` | CHECKPOINT block + commit |
-| `NHyDB.inspect_tail(path)` | checks the physical file tail without opening (header, payload CRC) |
-| `NHyDB.repair_file(path, *, apply=False, make_backup=True, rebuild_indexes=True, …)` | truncates a defective tail and resets both superblocks |
+| `NHyDB.inspect_tail(path)` | checks the file without opening (header, payload CRC); additionally reports both superblocks (`superblocks`), the commit boundary (`committed_end`), `superblock_problem`, `uncommitted_bytes`, `damaged_blocks` and intact blocks behind a damaged spot (`later_valid_blocks`) |
+| `NHyDB.repair_file(path, *, apply=False, make_backup=True, rebuild_indexes=True, allow_data_loss=False, keep_uncommitted=False, …)` | establishes an unambiguous, consistent state (section 15.4) |
+| `NHyDB.restore_backup(backup, path, …)` | restores a backup of `repair_file`/`compact_file` (DB + plan) after checking it (section 15.5) |
 | `NHyDB.compact_file(path, *, output=None, make_backup=True, rebuild_indexes=True, batch_records=10000, …)` | rewrites the logical state |
 
 ### 15.4 Repair
 
-`repair_file` determines the last CRC-valid block end via `inspect_tail`
-and derives a **safe** end from it: only blocks are taken over
-whose R0 generation is in the layout plan and whose data blocks refer to
-published realms, shapes and indexes. If the safe end lies
-before the previous commit boundary, `repair` aborts with `CorruptionError`
-(no automatic repair of committed inconsistencies). Side file paths and
-configuration are passed through. With `make_backup=True`, a copy
-`<db>.bak_<timestamp>` is created beforehand.
+`repair_file` first takes the write lock (with `apply=True`), examines the file
+(`inspect_tail`, both superblocks) and determines a **safe** end: only
+CRC-valid blocks are taken over whose R0 generation is in the layout plan and
+whose data blocks refer to published realms, shapes and indexes. Principles:
 
-> **Note:** Because the new commit boundary is set to the safe end,
-> intact, previously **uncommitted** blocks can become durable through `repair`.
-> `apply=False` (default) only reports.
+* **Committed data is never sacrificed silently.** If intact committed blocks
+  lie behind a damaged spot and would be cut off, `repair_file` aborts with
+  `CorruptionError` and changes nothing. Only with `allow_data_loss=True` are
+  they discarded; they are then listed in `lost_blocks`.
+* **Uncommitted blocks** behind the commit boundary are discarded by default
+  (`discarded_uncommitted_blocks`); with `keep_uncommitted=True` intact
+  uncommitted blocks are taken over (`kept_uncommitted_blocks`).
+* If the commit boundary is ambiguous (one superblock damaged or
+  inconsistent) and complete blocks follow, `repair_file` requires an
+  explicit decision: `keep_uncommitted=True` (keep) or `allow_data_loss=True`
+  (discard); otherwise `CorruptionError`.
+* If the file is shorter than the commit boundary, the result reports
+  `missing_committed_bytes`; the new boundary is the last valid block end.
+* Both superblocks are written with new generations (the inactive slot
+  first, each with a sync), then the file is truncated.
+* `apply=False` (default) changes nothing and reports the planned action
+  (`action`, `cut_reason`, `plan_error`, `damaged_blocks`, `lost_blocks` …).
+* With `make_backup=True` (under unique names, also for several backups
+  per second), the DB file is first saved durably as
+  `<db>.bak_<timestamp>` and the layout plan as
+  `<db>.bak_<timestamp>.layout.enc` (`backup`, `backup_layout_plan`).
+
+Side file paths and configuration are passed through.
 
 ### 15.5 Compaction
 
 * **In-place** (`output=None`): new file with identical R0 identity (ID,
   generation) and the same side files; only the `.nhydb` is replaced atomically;
-  backup `<db>.before_compact_<timestamp>` of the DB file with
-  `make_backup=True`.
+  with `make_backup=True` durable backup of the DB file as
+  `<db>.before_compact_<timestamp>` and of the layout plan as
+  `<db>.before_compact_<timestamp>.layout.enc`.
 * **Export** (`output=…`): new UUID, own side files next to the target file.
-* Flow: dense records with stored raw BASE values, sparse states
+* Flow: dense records with stored raw BASE values (records hidden by
+  `delete` are not copied), newest sparse states
   (tombstones only where they hide dense values), MATH states 1:1,
   index rebuild, checkpoint, deep verify of the target file, reopening with
   deep verify, atomic replacement.
+* **Bounded memory:** BASE records are copied as raw bytes (same shape; the
+  depth check of the target decodes every record again), tombstones are
+  checked against the record's shape/extensions only when needed, extension
+  and sparse cells are written in chunks of 50,000. Memory depends on
+  `batch_records`, not on the database size (1M KQ records with overlays:
+  peak RSS 1,880 → 67 MiB, 3.5 → 1.2 s; 2M: 91 MiB).
 * In-place compaction also works with MATH data; realm defaults
   (`default_shape_id`/`base_reserve_to`) and tombstones on BASE fields
   are preserved.
 * The lock is held across source, staging file and replacement.
+* If compaction fails, only the files it created itself are removed; the
+  source stays unchanged.
+
+**Restoring backups.** Backups of `repair_file` and `compact_file` consist
+of `<backup>` and `<backup>.layout.enc`; the key stays unchanged.
+`NHyDB.restore_backup(backup, path)` (CLI `nhydb restore`) takes the lock of
+`path`, checks that the backup opens with the plan of the backup and the key
+of `path` and belongs to this database, copies both files durably next to
+the targets and swaps them in (first the plan, then the DB). By hand: copy
+`<backup>` to the DB path and `<backup>.layout.enc` to the plan path while
+the database is closed.
 
 ### 15.6 Safety Mechanisms and Their Limits
 
 | Mechanism | Protects against | Does **not** protect against |
 |---|---|---|
 | AES-256-GCM + HMAC of the layout plan | unnoticed manipulation or swapping of schema/plan; reading the schema without the key | reading the **payload data** in `X.nhydb` – it is **not encrypted** |
-| binding R0 ↔ plan (generation, SHA-256) | combining files that do not belong together | loss of the key file (the DB can then no longer be opened) |
+| binding R0 ↔ plan (generation, keyed schema digest) | combining files that do not belong together; confirming a guessed schema without the key | loss of the key file (the DB can then no longer be opened) |
 | file name binding (R0,v2) | accidental opening of renamed files | – |
-| write lock `<db>.lock` | concurrent writing processes of the same engine | processes that bypass the lock (`lock=False`) or ignore it |
+| write lock `<db>.lock` | concurrent writing processes of the same engine; the lock file never follows a symbolic link | processes that bypass the lock (`lock=False`) or ignore it |
 | size limit `DB_CONFIG` | uncontrolled file growth | – |
 | MATH bit limit | resource exhaustion through expressions | – |
 | CRC32 | random bit errors, partial writes | deliberate manipulation of the data blocks (CRC is not a cryptographic protection) |
 
-Key file: Unix permissions `0600`; on Windows the default ACL of the
-user profile applies. Secret keys never belong in the configuration file.
+Key file: Unix permissions `0600` (warning on open if group or others may
+read it); on Windows it inherits the ACL of its directory (section 8.3).
+Secret keys never belong in the configuration file.
+
+**Key material in memory:** the key object is overwritten with zeros when it
+is released, the keys derived from it for the plan MAC and the schema digest
+right after use. Not guaranteed to be erased are the internal states of the
+HMAC and AES-GCM implementations used and temporary buffers while the key
+file is loaded or created (file content, JSON object, Base64 text). NHyDB is
+not a security product: only the layout plan is encrypted, the data file
+`.nhydb` is not.
 
 ---
 
@@ -1765,7 +2196,7 @@ user profile applies. Secret keys never belong in the configuration file.
 | `nhydb.query` | `Q`, expression classes, native `QueryEngine`, `expr_from_spec`, `parse_sql`, SQL dataclasses, CLI |
 
 Module constants of `nhydb`: `REALM_SPAN` (`10**100`), `ENGINE_VERSION`
-(`"0.27.1"`, the product version), `FILE_FORMAT_VERSION` (`"0.16"`, internal
+(`"0.28.0"`, the product version), `FILE_FORMAT_VERSION` (`"0.16"`, internal
 identifier of the file format), `TYPE_CODES`. `nhydb.query` additionally provides
 `QUERY_VERSION` (`"0.27"`) and `SQL_LANGUAGE_VERSION` (`"NHySQL-0.24"`)
 (section 18.3).
@@ -1775,19 +2206,36 @@ identifier of the file format), `TYPE_CODES`. `nhydb.query` additionally provide
 ```python
 db = nhydb.NHyDB.create("x.nhydb", *, overwrite=False, layout_path=None, key_path=None,
                         config=None, durability=None, lock=None, lock_timeout_ms=None)
-db = nhydb.NHyDB("x.nhydb", *, strict=True, layout_path=None, key_path=None,
+db = nhydb.NHyDB("x.nhydb", *, readonly=False, layout_path=None, key_path=None,
                  config=None, durability=None, lock=None, lock_timeout_ms=None)
 ```
 
 All options are keyword arguments. `nhydb.create(...)` and
 `nhydb.open(...)` are short forms of `NHyDB.create(...)` and `NHyDB(...)`, respectively.
+The former parameter `strict` has been removed (it had no effect); a call
+with `strict=` raises `TypeError`. `readonly=True` opens without lock and
+without changing the file (section 8.4); `create` rejects `readonly=True`.
+
+* All paths (DB, plan, key, lock, configuration) are anchored absolutely on
+  open or create; a later `os.chdir` has no effect. Empty, identical or
+  directory paths for DB, plan, key and lock are rejected (`ValueError` or
+  `IsADirectoryError`).
+* `create(overwrite=True)` first creates the new database under temporary
+  names and replaces the old one only afterwards; plan or key files of
+  **another** database (different `db_id`) are never deleted but lead to
+  `FileExistsError`. For several equally named databases sharing one key
+  directory there is the placeholder `{db_path_hash}` (section 17.2). `db_max_size_bytes` must be at least 64 KiB.
+* `lock=` and `lock_timeout_ms=` override the entries of `[lock]`
+  individually (a value not given comes from the configuration).
 
 Attributes: `path`, `closed`, `durability` (readable and writable),
 `layout_path`, `key_path`, `max_db_size_bytes`, `next_block_id`,
 `last_valid_end`, `committed_end`, `checkpoint_offset`,
 `recovered_tail_bytes`, `config_source`, `realms` (`{id: dict}`),
 `index_defs` (`{id: IndexDef}`), `math_layouts`, `f` (read-only file view with
-`seek`/`tell`).
+`seek`/`tell`), `readonly`, `open_warnings` (list of warnings on open, e.g.
+superblock fallback or a key file that is too open; they are also issued as
+`RuntimeWarning`). `path` is absolute.
 
 ### 16.3 Python API (Selection by Area)
 
@@ -1795,14 +2243,14 @@ Attributes: `path`, `closed`, `durability` (readable and writable),
 |---|---|
 | Schema | `create_realm`, `create_shape`, `set_realm_default_shape`, `define_extension`, `define_extensions`, `resolve_v`, `extension_catalog` |
 | Layouts | `create_layout`, `create_classic_layout`, `create_column_layout`, `create_packed_layout`, `create_custom_layout`, `register_layout_plugin`, `layout_at`, `layout_candidates`, `route_address`, `layout_diagnostics`, `get_layout`, `plan_layout_evolution`, `evolve_layout`, `logical_address`, `record_anchor` |
-| Writing | `put_dense_batch`, `put`, `put_extensions`, `put_extension_list`, `put_extension_range`, `put_points`, `delete_point`, `delete`, `put_object`, `put_objects_batch` |
+| Writing | `put_dense_batch`, `put`, `put_extensions`, `put_extension_list`, `put_extension_range`, `put_points`, `delete_point`, `delete`, `put_object`, `put_objects_batch`, `batch` (`WriteBatch.put_cell`/`delete_cell`/`flush`/`discard`) |
 | Reading | `get`, `get_internal`, `get_cell`, `get_cell_n`, `get_object`, `get_record_view`, `get_n`, `get_n_cell`, `get_n_record`, `get_address`, `describe_n`, `occupied_n`, `occupied_from_n`, `range`, `select`, `select_us`, `iter_materialized_sparse_points`, `iter_materialized_cells`, `iter_materialized_record_ns`, `record_n_for_address`, `record_n_from_n` |
 | Addresses | `realm_bounds`, `dyn_address`, `cell_address`, `resolve_n`, `set_dyn_address_output` |
 | Indexes | `create_index`, `create_token_index`, `create_trigram_index`, `create_fulltext_index`, `build_indexes`, `find_u`, `find`, `posting_count`, `index_candidate_estimate`, `index_candidates`, `fulltext_term_posting`, `fulltext_corpus`, `fulltext_payloads` |
 | MATH | `create_math_layout`, `create_math_map_layout`, `replace_math_spec`, `put_math_batch`, `put_math_numpy`, `put_math`, `get_math_cell`, `get_math`, `describe_math` |
 | Queries | `query`, `explain_query`, `sql`, `sql_numpy`, `compile_sql` |
 | System | `get_system_metadata`, `get_system_cell`, `set_max_db_size` |
-| Maintenance | `commit`, `sync`, `close`, `checkpoint`, `verify`, `health`, `stats`, `compact_file`, `inspect_tail`, `repair_file` (static) |
+| Maintenance | `commit`, `rollback`, `sync`, `close`, `checkpoint`, `verify`, `health`, `stats`, `compact_file`, `inspect_tail`, `repair_file`, `restore_backup` (static) |
 
 Return values: `create_realm/shape/index` and `define_extension` return
 dicts (same fields as `to_dict()`), `db.realms` returns `{id: dict}`;
@@ -1817,35 +2265,97 @@ dicts (same fields as `to_dict()`), `db.realms` returns `{id: dict}`;
 | `put_record(layout_id, object_id, values, *, lane=None, commit=False)` | write a record via a layout |
 | `put_cell(realm_id, u, v, value, *, type=None, lane=None, commit=False)` | single cell `(R,u,v[,lane])` |
 | `get_record(layout_id, object_id, *, lane=None)` | dict or `None` |
-| `get_value(realm_id, u, v, *, lane=None)` | value or `None` |
-| `delete_cell(realm_id, u, v, *, lane=None, commit=False)` | tombstone |
-| `delete_record(layout_id, object_id, *, lane=None, commit=False)` | logically delete a record |
+| `get_value(realm_id, u, v, *, lane=None)` | value or `None`; `v` also as a column name (field, extension, COLUMN field name, `"v<n>"`) as with `get_cell` |
+| `delete_cell(realm_id, u, v, *, lane=None, commit=False)` | tombstone; returns `True` if the cell had a value, otherwise `False` (then nothing is written) |
+| `delete_record(layout_id, object_id, *, lane=None, commit=False)` | delete a record completely (CLASSIC: dense record and all live sparse cells of the u group including extensions; otherwise all occupied cells); returns the number of deleted elements (0 = nothing) |
 
-`commit=True` executes the same commit sequence as `db.commit()`.
+`commit=True` executes the same commit sequence as `db.commit()` (also if
+`delete_cell` had nothing to delete). `delete(realm, u)` also returns
+`True`/`False`, but hides only the dense record; single cells and
+extensions stay visible (section 5.2).
+
+**Collecting single cells (`batch`).** `with db.batch(commit=False,
+u_window=10_000) as b:` returns a `WriteBatch`; `b.put_cell(...)` and
+`b.delete_cell(...)` take the same arguments as the database methods and
+are **checked immediately** (`put_cell` with all rules of `put_points`
+without writing, `delete_cell` realm, `u`, `v`). Every cell ends in the
+same state as with the single calls in the same order (the last `put`
+wins, `put` → `delete` deletes; a `delete` after a `put` of `None` leaves
+the null cell, as `delete_cell` does). When the block is left without an exception, one `put_points` per
+realm and lane is written (a collected delete produces a tombstone only if
+the cell then has a value), `commit=True` commits afterwards. Inside the
+block there is **no read-your-writes**; if the block ends with an
+exception, nothing is written. If writing fails (size limit, I/O error,
+realm removed by `rollback()` inside the block), the whole batch is taken
+back – across all realm/lane groups and `u` windows: the file is cut back
+to its length before the batch and the state of the handle is rebuilt
+(one rescan of the file, like an open); earlier uncommitted writes of the
+handle stay. `flush()` writes early (`{"cells",
+"tombstones", "blocks", "bytes"}`), `discard()` drops, `len(b)` counts.
+Effect: 20,000 single cells ≈ 1.8× faster, file ≈ 5× smaller.
+
+**Coordinates, realm, lane, IDs:** `int`, objects with `__index__` (e.g.
+NumPy integers) and decimal strings are taken over exactly; floats,
+`Decimal` and `Fraction` only with an integral value (`3.0`). `2.7` raises
+`TypeError` (no silent truncation as with `int()` in the reference).
+Administrative IDs (`shape_id`, `layout_id`, `index_id`) are limited to
+2^63 − 1 (`ValueError`; for parameters with a 64-bit type the conversion may
+already report `OverflowError`). Nested values (lists/dicts) are limited to
+256 levels (`ValueError`, also for cyclic structures).
+
+**Type checks on writing:** integers that do not fit a finite `f32`/`f64`
+⇒ `ValueError`; `bytes` for a `utf8` field ⇒ `TypeError`; unknown keys in
+dict rows ⇒ `SchemaError`; keys from the output of `get` (metadata starting
+with `_`, extension names and `v<n>`) are ignored by `put`, so
+`put(realm, u, db.get(realm, u))` works; `bytes(n)` from an integer at most 1 GiB.
+
+**Schema IDs:** `create_realm`, `create_shape`, `create_index` (and layout
+creation) with an ID that is already occupied raise `SchemaError` instead of
+replacing the definition; the default shape of a realm is changed with
+`set_realm_default_shape`.
 
 ### 16.5 NumPy Batch API
 
 Arrays are taken over via the buffer protocol (controlled copy,
 arbitrary endianness and strides; no `numpy` crate). Encoding, validation
-and write loops run in Rust without the GIL.
+and write loops run in Rust without the GIL. `read_numpy` and `sql_numpy`
+hand their result vectors to NumPy without a copy (writable arrays over
+the buffer `ColumnBuffer`, which lives as long as the array); `read_numpy`
+decodes numeric BASE values of records without sparse overlay and without
+extensions straight into the typed column (1M × 11 fields: 3.9 → 6.5 M
+records/s, peak RSS 309 → 240 MiB).
 
 | Method | Description |
 |---|---|
 | `put_numpy_batch(realm_id, u_start, columns, *, shape_id=None, lane=None, commit=False)` | CLASSIC/BASE batch from `u_start` |
 | `put_objects_numpy(layout_id, object_ids, columns, *, lane=None, commit=False, u_window=10000)` | any layout |
 | `put_cells_numpy(realm_id, u, v, values, *, type=None, lane=None, commit=False, u_window=10000)` | sparse cells |
-| `read_numpy(realm_id, u_start, count, fields=None, *, lane=None)` | columns as arrays + `_present` |
+| `read_numpy(realm_id, u_start, count, fields=None, *, lane=None, object_fallback=False)` | columns as arrays + `_present` |
 
-| Field type | Accepted columns |
-|---|---|
-| `u8 … i64`, `varuint`, `varint` | integer arrays of any width (range is checked), lists, BigInt objects |
-| `f32`, `f64` | float and integer arrays |
-| `bool` | bool and integer arrays |
-| `utf8`, `bytes`, enums | object arrays or lists (`str`, `bytes`, enum labels) |
+Columns are one-dimensional arrays, buffer objects (`memoryview`,
+`array.array`) or Python sequences. `ndim != 1` ⇒ `ValueError`; `str`,
+`bytes`, `bytearray`, `dict` as a column ⇒ `TypeError`; all columns must
+have the same length (`ValueError`, also with an empty first column).
+Supported dtypes: bool, int8 … int64, uint8 … uint64, float32, float64,
+object, str/bytes; float16, longdouble, complex, datetime/timedelta and
+structured dtypes ⇒ `TypeError`. Scalars (Python `int`, NumPy scalar, 0-d
+array) for `u`/`v`/`object_ids` are broadcast to all rows.
 
-`read_numpy` returns `uint64` for `varuint`, `int64` for integer types,
-`float32/64`, `bool`, otherwise object arrays; missing records have
-`_present=False` (values 0 / NaN / None). **Large coordinates:** scalars such as
+| Field type | Accepted columns | Rejected (`TypeError`) |
+|---|---|---|
+| `u8 … i64`, `varuint`, `varint` | integer arrays of any width (range is checked), lists, BigInt objects | bool, float arrays |
+| `f32`, `f64` | float and integer arrays; NaN/±Inf are valid values (as in the single-item API); finite values outside `f32` ⇒ `ValueError` | bool arrays |
+| `bool` | bool and integer arrays | float arrays |
+| `utf8`, `bytes` | object, str, bytes arrays or lists | integer, float, bool arrays |
+| enums | object arrays or lists (labels), integer arrays (codes) | bool, float arrays |
+
+`read_numpy` returns exactly `count` rows; the dtype depends only on the field
+type: `varuint` `uint64`, integer types `int64`, `float32/64`, `bool`,
+otherwise object arrays. If a stored value does not fit (e.g. a `varuint`
+above 2^64 − 1), `ValueError` is raised; with `object_fallback=True` this column
+becomes an object array. Missing records have `_present=False` (values 0 /
+NaN / None). A `count` whose result does not fit into physical memory raises
+`MemoryError` (no process abort); a negative `count` ⇒ `ValueError`. **Large coordinates:** scalars such as
 `u_start`/`realm_id` may be arbitrarily large; arrays for `u`/`v`/`object_id`
 are limited to `uint64` – for larger values use object arrays or lists of
 Python `int`.
@@ -1873,30 +2383,73 @@ Exception
 │   ├── AddressError
 │   ├── DatabaseLockedError
 │   ├── DatabaseSizeLimitError
-│   └── MathLayoutError
-│       ├── MathLayoutNotFound
-│       ├── MappingFrozenError
-│       └── MathCellConflictError
-├── MathError
-│   ├── MathSyntaxError
-│   └── MathDomainError
-├── LayoutError                  (errors of the MATH realm planner)
-│   ├── LayoutStateError
-│   ├── RealmBudgetExceeded
-│   ├── StalePlanError
-│   └── AllocationConflictError
-├── QueryError
-│   ├── QueryPlanError
-│   ├── QueryDomainError
-│   └── SQLSyntaxError
+│   ├── MathLayoutError
+│   │   ├── MathLayoutNotFound
+│   │   ├── MappingFrozenError
+│   │   └── MathCellConflictError
+│   ├── MathError
+│   │   ├── MathSyntaxError
+│   │   └── MathDomainError
+│   ├── LayoutError              (errors of the MATH realm planner)
+│   │   ├── LayoutStateError
+│   │   ├── RealmBudgetExceeded
+│   │   ├── StalePlanError
+│   │   └── AllocationConflictError
+│   └── QueryError
+│       ├── QueryPlanError
+│       ├── QueryDomainError
+│       └── SQLSyntaxError
 └── ValueError
     └── IndexConfigError
 ```
 
-In addition, the engine uses the builtins `ValueError`, `KeyError`,
-`TypeError`, `FileNotFoundError` and `FileExistsError`. `MathError`,
-`LayoutError` and `QueryError` are **not** subclasses of `NHyDBError`.
+Since 0.28.0, `MathError`, `LayoutError` and `QueryError` are
+subclasses of `NHyDBError`; `except nhydb.NHyDBError` therefore catches all
+library-specific errors except `IndexConfigError` (a `ValueError`).
 The hierarchy is defined in `crates/nhydb-py/src/exceptions.rs`.
+
+In addition, the engine uses builtins:
+
+| Exception | Cause |
+|---|---|
+| `ValueError`, `TypeError`, `KeyError` | invalid arguments, values and names (e.g. non-integral coordinates ⇒ `TypeError`, IDs > 2^63 − 1 ⇒ `ValueError`, values nested too deeply ⇒ `ValueError`) |
+| `OverflowError` | a Python integer does not fit a parameter with a fixed 64-bit type (e.g. `layout_id=2**64`) |
+| `UnicodeEncodeError` | text with lone surrogates (cannot be encoded as UTF-8) |
+| `MemoryError` | real memory shortage or a result larger than physical memory (e.g. `read_numpy(count=…)`) |
+| `OSError` and subclasses (`FileNotFoundError`, `FileExistsError`, `PermissionError`, `IsADirectoryError` …) | file system errors, with `errno` and – where known – `filename` |
+| `RuntimeError` | a write call on an object that another thread is using (or vice versa), a plugin callback into the database that is currently writing (PyO3: "Already borrowed"), use of a finished `WriteBatch` |
+| `RuntimeWarning` (warning) | notes on open (`db.open_warnings`) |
+
+Damaged files result in `CorruptionError`. An `IndexError` or a
+`PanicException` caused by file or user input is a defect of the engine.
+
+**Threads.** Without the GIL run: `query`, `explain_query`, `sql`,
+`sql_numpy`, the `QueryEngine` methods, `stats`, `health`, `verify`,
+`read_numpy`, the batch writers (`put_dense_batch`, `put_points`,
+`put_numpy_batch`, `put_cells_numpy`, `put_objects_batch`,
+`put_objects_numpy`, `put_math_batch`, `put_math_numpy`,
+`WriteBatch.flush`), `build_indexes`, `commit`, `rollback`, `close`,
+open/create and `compact_file`, `repair_file` and `restore_backup`. Python
+runtime providers and layout plugins take the GIL back for their callback.
+`get`, `find_u` and other calls in the µs range keep the GIL **on
+purpose**: handing it over per call cost 3–8 % single-threaded and halved
+(`get`) or cut to a fifth (`find_u`) the throughput of four threads.
+
+An object is shared by reading calls and held exclusively by writing calls.
+Several threads may run read-only queries on the **same** object at the
+same time (tested with `sql`, `query`, `stats`, `health`). A write call,
+`commit` or `rollback` while another thread uses the object (or vice versa)
+is rejected immediately with `RuntimeError` ("Already borrowed" / "Already
+mutably borrowed") – it does not wait and does not change any data (tested:
+after such conflicts all successful writes are visible and
+`verify(deep=True)` is clean). For parallel work use one object per thread
+(reading threads with `readonly=True`, because the write lock allows only
+one writing object per file; four threads with own objects: SQL scan over
+1M records ≈ 2.9× faster than one, point query ≈ 1.65×) or serialize
+writes and reads with a `threading.Lock`. This also applies to iterators
+and `QueryEngine` objects that use a database. Several reader processes
+with `readonly=True` scale almost linearly (`get_value`, 1/2/4/6
+processes: 3.3/5.8/10.5/13.0 M calls/s in total).
 
 ### 16.8 CLI
 
@@ -1908,7 +2461,7 @@ The package installs the command `nhydb` (equivalent: `python -m nhydb`);
 | `to-n`, `from-n` | address conversion without a database |
 | `layout`/`get-layout`, `layout-check`, `layout-plan`, `evolve-layout`, `route`, `logical-address` | layouts |
 | `describe`, `occupied`, `get`/`get-n`, `address`, `cell`, `cell-n`, `find` | reading |
-| `stats`/`info`, `health`, `verify`, `rebuild-indexes`, `repair`, `compact` | operation |
+| `stats`/`info`, `health`, `verify`, `rebuild-indexes`, `repair`, `restore`, `compact` | operation |
 
 `get` accepts `N123`, `R1,u2,v3[,NL|NR]` or `u2,v3[,NL|NR]` with `--realm`.
 
@@ -1927,9 +2480,24 @@ python -m nhydb.query daten.nhydb --sql "SELECT COUNT(*) FROM records"
 The CLI has no options for deviating `layout_path`/`key_path`; it
 uses the default side files or the configuration.
 
+* Read commands open the database with `readonly=True` (the file is never
+  changed); `verify` also works on damaged files (fallback to
+  `inspect_tail`).
+* Exit codes: `0` success, `1` a check found problems (`verify`, `health`
+  with `unhealthy`, `repair` dry run with findings), `2` usage error or
+  refused operation, `3` error. Errors appear as a message on stderr,
+  without traceback.
+* `repair` is a dry run without `--apply`; `--allow-data-loss` and
+  `--keep-uncommitted` correspond to the switches of `repair_file`.
+  `restore BACKUP DB` restores a backup.
+* In JSON output, `bytes` appear as `{"$bytes_b64": "…"}`.
+* By default Python cannot print numbers with more than 4,300 decimal digits
+  as text (section 3.6); set the environment variable
+  `PYTHONINTMAXSTRDIGITS=0` for that.
+
 ### 16.9 Complete Example
 
-The following example was executed with NHyDB 0.27.0; the
+The following example was executed with NHyDB 0.28.0; the
 comments show the actual outputs.
 
 ```python
@@ -2013,12 +2581,12 @@ Search order (the first source found applies):
 
 ```toml
 [database]
-db_max_size_bytes = 53687091200   # 50 GiB; initial value for NEW databases
+db_max_size_bytes = 53687091200   # 50 GiB; initial value for NEW databases (min. 65536)
 durability = "fsync"              # "fsync" | "full"
 
 [math]
 realm_auto_limit = 4096           # initial value for NEW MATH layouts
-math_max_intermediate_bits = 1048576
+math_max_intermediate_bits = 1048576   # frozen per MATH layout at creation
 
 [lock]
 enabled = true                    # lock file <db>.lock
@@ -2026,11 +2594,11 @@ timeout_ms = 0                    # 0 = fail immediately, otherwise wait time in
 
 [paths]
 # layout_path = "{db}.layout.enc"           # {db} = file name of the database
-# key_path    = "/secure/location/{db}.layout.key"
+# key_path    = "/secure/location/{db}.{db_path_hash}.layout.key"
 
 [cache]
-block_cache_bytes = 67108864
-vindex_max_marks = 4000000
+block_cache_bytes = 67108864      # block cache (64 MiB); vindex_*: still fixed
+vindex_max_marks = 4194304
 vindex_max_indexes = 4096
 ```
 
@@ -2043,10 +2611,23 @@ Rules:
 * Unknown keys are errors; `realm_span`, `nl`, `nr` are forbidden
   keys (fixed system settings).
 * Relative path templates refer to the directory of the database.
-* **Note on the `[cache]` section:** The keys are parsed and
-  validated, but in NHyDB 0.27.1 the engine uses fixed
-  compiled-in values (block cache 64 MiB, v index 4,194,304 skip marks
-  and 4,096 indexes). See section 19.1.
+  Placeholders: `{db}` = file name of the database, `{db_path_hash}` = the
+  first 16 hex digits of the SHA-256 of the absolute DB path (unique per
+  location; for several equally named databases sharing one key directory).
+* `durability` also accepts the aliases `default`/`normal` (= `fsync`) and
+  `fullfsync` (= `full`).
+* `[lock] enabled`/`timeout_ms` and the API parameters `lock`/
+  `lock_timeout_ms` are combined field by field.
+* `db_max_size_bytes` must be at least 65,536 (64 KiB).
+* `math_max_intermediate_bits` is frozen per MATH layout at creation
+  (section 13.2); later changes of the file affect only new MATH layouts.
+* **Note on the `[cache]` section:** `block_cache_bytes` sets the budget of
+  the block cache (0 = no cache, verified blocks are only read by range).
+  `vindex_max_marks`/`vindex_max_indexes` are parsed and validated, but the
+  engine still uses fixed compiled-in values (4,194,304 skip marks and
+  4,096 indexes). The example
+  value of `vindex_max_marks` equals this compiled-in value. See
+  section 19.1.
 
 ### 17.3 Installation and Build from Source
 
@@ -2065,7 +2646,7 @@ python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install maturin
 maturin build --release --out dist   # wheel in dist/
-pip install dist/nhydb-0.27.1-*.whl
+pip install dist/nhydb-0.28.0-*.whl
 # alternatively, build and install in one step:
 pip install .
 ```
@@ -2092,7 +2673,9 @@ see `RELEASING.md`).
 
 Operating-system-specific code resides exclusively in `platform.rs`
 (Unix: `libc`, Windows: `windows-sys`). The file format (little-endian,
-UTF-8 JSON) and the layout plan are platform-neutral.
+UTF-8 JSON) and the layout plan are platform-neutral. CI builds and tests on
+Linux, macOS and Windows (`.github/workflows/ci.yml`); details on durability,
+lock and key files per platform are in `docs/PLATFORM.md`.
 
 ### 17.5 Operational Notes
 
@@ -2100,13 +2683,34 @@ UTF-8 JSON) and the layout plan are platform-neutral.
   `.layout.key`); keep the key file separate and access-protected.
 * **Renaming:** A renamed DB file does not open (R0,v2). For a
   copy under a new name use `compact_file(path, output=new)`.
-* **Multiple processes:** exactly one opening process per database (the
-  lock is taken exclusively on every open); `lock_timeout_ms` waits.
-* **Durability:** `fsync` is the default; for protection against loss of the drive cache
-  on macOS choose `durability="full"` (in the core benchmark about 30–60 %
-  lower write throughput, section 18.5).
+* **Multiple processes and threads:** exactly one writing object per
+  database (the lock is taken exclusively on every writing open);
+  `lock_timeout_ms` waits. Further readers open with `readonly=True`
+  (without lock, state at the time of opening; reopen for a newer state,
+  ≈ 1 ms for 1M records). Do not write and read on one object at the same
+  time; parallel threads with own objects (section 16.7).
+* **Caches:** adapt `[cache] block_cache_bytes` to the working set
+  (section 9.8); `stats()["block_cache"]` shows hits, loads, partial reads
+  and evictions.
+* **Key file on Windows:** inherits the ACL of its directory; put it into a
+  directory accessible only to the user (section 8.3).
+* **Durability:** `fsync` is the default (on macOS with a write barrier before
+  the superblock, section 9.6); for protection against loss of the drive cache
+  on macOS choose `durability="full"` (commit ≈ 3.6 ms; in the core
+  benchmark before the optimization about 30–60 % lower write throughput,
+  sections 9.6 and 18.5).
+* **Many single cells:** use `db.batch()` (section 16.4) instead of many
+  single `put_cell` calls; discard unwanted uncommitted changes with
+  `rollback()`.
 * **Maintenance:** run `verify()`/`health()` regularly; before `repair_file(apply=True)`
-  and compaction, back up copies (backups are active by default).
+  and compaction, back up copies (backups of DB and plan are active by
+  default; restore with `NHyDB.restore_backup`). Compaction needs memory
+  only for one batch (`batch_records`), but disk space for the new file and
+  the backup.
+* **Updating from 0.27.1:** databases of NHyDB 0.27.1 or earlier do not
+  open with 0.28.0; export the data with 0.27.1, import it with 0.28.0 into a
+  newly created database and build the indexes with `build_indexes()`
+  (sections 7 and 12.2).
 
 ---
 
@@ -2165,15 +2769,38 @@ block after a write error) is checked on all platforms by the Rust test
 `test_kernel.py` skips the AES-GCM comparison if the package `cryptography`
 is missing; `test_sql.py` skips the NumPy output test without `numpy`.
 
+The figures above describe the release state 0.27.1. With the stabilization
+in 0.28.0 (`CHANGELOG.md`) the regression tests
+`tests/python/test_stab_*.py` were added: persistence, opening, repair and
+restore (`test_stab_persistence.py`), schema digest and rejection of 0.27.1
+databases (`test_stab_schema_digest.py`), CLI (`test_stab_cli.py`), large
+numbers (`test_stab_bigint.py`), codec and input conversion
+(`test_stab_codec.py`), ID limits (`test_stab_ids.py`), MATH limits
+(`test_stab_math.py`), index versus scan as a matrix of scenarios,
+predicates and return modes (`test_stab_index_vs_scan.py`), query API and
+closed database (`test_stab_query_api.py`), recursion limits in a subprocess
+(`test_stab_recursion_limits.py`) and the Python and NumPy API including
+threads (`test_stab_api.py`); in addition further Rust unit tests (among
+others fault injection for fsync and compaction).
+
+The performance revision of 0.28.0 adds result-equality and invariant tests: read
+path and block cache with budgets from 0 to 256 MiB including corruption
+(`test_perf_lesen.py`), query fast paths against the general path
+(`test_perf_query_paths.py`), compaction, `put_math`, GIL release, NumPy
+output, `batch()` and `rollback()` (`test_perf_schreiben.py`) and cache
+coherence after `rollback`, `batch` and compaction
+(`test_perf_integration.py`); Rust tests among others in
+`db/blockcache.rs`.
+
 ### 18.3 Version Identifiers
 
 | Identifier | Value | Meaning |
 |---|---|---|
-| Product version | `0.27.1` | identical in the Cargo workspace (`nhydb-core`, `nhydb-py`), the Python package `nhydb` (version via maturin from Cargo) and `nhydb.ENGINE_VERSION` |
-| File identifier | `NHYDB016` (`FILE_FORMAT_VERSION = "0.16"`, block version 16) | internal identifier of the file format; changes only when the on-disk format changes, independent of the product version |
+| Product version | `0.28.0` | identical in the Cargo workspace (`nhydb-core`, `nhydb-py`), the Python package `nhydb` (version via maturin from Cargo) and `nhydb.ENGINE_VERSION` |
+| File identifier | `NHYDB016` (`FILE_FORMAT_VERSION = "0.16"`, block version 16) | internal identifier of the file format; changes only when the on-disk format changes, independent of the product version. The identifier is unchanged from 0.27.1, yet databases of 0.27.1 do not open because of the keyed schema digest (section 7) |
 | `QUERY_VERSION` | `"0.27"` | identifier of the query layer; appears as `query_version` in query results; not a product version |
 | `SQL_LANGUAGE_VERSION` | `"NHySQL-0.24"` | identifier of the NHySQL language scope; appears as `language` in SQL results; not a product version |
-| Contract identifiers | `NHYDB027_R0U1_V1`, `NHYDB027_KEY_V1`, `NHYDB027_EXTERNAL_LAYOUT_V1`, `NHYDB027_SCHEMA_V1`, `NHYDB_DB_CONFIG_V015`, MAC domain `NHYDB027-LAYOUT-MAC:` | fixed identifiers of the JSON structures and of the key derivation in the file format (sections 7.5 and 8.3); the digits they contain are part of the identifier, not a product version |
+| Contract identifiers | `NHYDB027_R0U1_V1`, `NHYDB027_KEY_V1`, `NHYDB027_EXTERNAL_LAYOUT_V1`, `NHYDB027_SCHEMA_V1`, `NHYDB_DB_CONFIG_V015`, MAC domain `NHYDB027-LAYOUT-MAC:`, schema digest domain `NHYDB027-SCHEMA-DIGEST:` | fixed identifiers of the JSON structures and of the key derivation in the file format (sections 7.5 and 8.3); the digits they contain are part of the identifier, not a product version |
 
 ### 18.4 License
 
@@ -2242,6 +2869,38 @@ tenth row.
 | `put_math_batch` | 852,000 rows/s |
 | `get_math` | 645,000 queries/s |
 
+#### Performance Revision (0.28.0)
+
+The scripts `benchmarks/bench_028_lesen.py`, `bench_028_query.py` and
+`bench_028_schreiben.py` (description, `--scale` and load run for larger
+machines: `benchmarks/README.md`) compare two builds alternately. Measured
+on 2026-10-20 on the same MacBook Air (M2, 16 GB), release builds, serially
+without other load, median of five alternating runs (read path: three runs
+of five repetitions each) against the state before the revision. All
+results were identical in both states.
+
+| Case (scale 1) | before | after |
+|---|---:|---:|
+| `get` in a block with 1M records (after the first check) | 4,035 µs | 3.0 µs |
+| `get_value` 4,000 random records across ≈ 100 MB, warm, 64 MiB cache | 20.5 µs | 2.1 µs |
+| open, 1M records in 20,000 blocks | 24.5 ms | 4.8 ms |
+| `get_value` (dense, no overlay) | 1.36 M/s | 4.10 M/s |
+| alternating `put_cell`/`get_value` | 8,210 pairs/s | 304,800 pairs/s |
+| `range` over 80,000 single segments | 3,786 ms | 172 ms |
+| `Q.u.between(1, 4097)` over 1M records | 271 ms | 10.2 ms |
+| SQL `COUNT(*)` (1M), first call / repeated | 764 / 750 ms | 1.9 / 0.03 ms |
+| SQL `ORDER BY id DESC LIMIT 5` / `GROUP BY` (1M) | 2,479 / 2,048 ms | 578 / 541 ms |
+| compaction 1M records + overlays (time / peak RSS) | 3.38 s / 1,880 MiB | 1.13 s / 67 MiB |
+| compaction with 100,000 tombstones (time / peak RSS) | 6.50 s / 1,970 MiB | 3.72 s / 145 MiB |
+| `put_math`, 2,000 realms | 882/s | 62,060/s |
+| commit `fsync` / `full` (macOS, 100 records) | 0.19 / 4.99 ms | 0.19 / 3.95 ms |
+| `read_numpy` 1M × 11 fields | 3.99 M rec/s | 6.61 M rec/s |
+| single `put_cell`, commit every 1,000 (after: also with `batch()`) | 397,000/s | 402,000/s (`batch()`: 578,000/s) |
+| SQL scan, 4 threads with own `readonly` handles (speedup) | 0.99× | 3.35× |
+
+On its first call per handle, `COUNT(*)` checks the checksums of all
+DATA blocks involved; repetitions use the result of that check.
+
 ## 19. Known Limitations
 
 ### 19.1 Limitations
@@ -2250,20 +2909,32 @@ tenth row.
 |---|---|
 | Payload encryption | only the layout plan is encrypted; data in `X.nhydb` is stored in plaintext |
 | Key file | without the matching `*.layout.key` the database cannot be opened (fail closed); a lost key cannot be recovered |
-| Concurrency | one opening process per database (exclusive lock `<db>.lock`, and within a process only one open object per file); no shared read mode, no multi-process transactions |
-| Transactions | no explicit transaction API; atomicity via the commit boundary; multi-block operations not atomic as a whole (exception: `put_math_batch` with rollback) |
-| Context manager | `__exit__` commits even after an exception in the `with` block |
-| Plugins | callbacks into the same DB during a write operation not supported (`RuntimeError`); CUSTOM logic must be registered at runtime |
-| `[cache]` configuration | keys are parsed and validated but not yet used by the engine (fixed: 64 MiB block cache, 4,194,304 skip marks, 4,096 v indexes); the value `vindex_max_marks = 4000000` in the configuration example deviates from the compiled-in value |
-| Parameter `strict` | is stored but does not affect the open path in NHyDB 0.27.1; opening is always fail closed |
+| Key material in memory | key object and derived keys are zeroed; internal states of the HMAC/AES-GCM implementations and temporary buffers while loading the key file are not guaranteed to be erased (section 15.6); NHyDB is not a security product |
+| Concurrency | one writing object per database (exclusive lock `<db>.lock`, also within a process); further readers with `readonly=True` (without lock, state at the time of opening, no reload); no multi-process transactions |
+| Threads | reading calls may share an object; a write call next to another call on the same object ⇒ immediate `RuntimeError`, no data change; `get`/`find_u` keep the GIL (section 16.7) |
+| Transactions | atomicity via the commit boundary; `rollback()` discards all changes of the object since its last commit; no nested transactions/savepoints; multi-block operations not atomic as a whole (exceptions with automatic rollback: `put_math_batch`, writing a `batch()`) |
+| `batch()` | no read-your-writes inside the block; covers only `put_cell`/`delete_cell` |
+| Deleting | `delete(realm, u)` hides only the dense record; single cells and extensions stay visible; `delete_record` deletes completely; only `compact_file()` removes data physically (section 5.2) |
+| Context manager | `__exit__` commits even after an exception in the `with` block (semantics of the reference); a commit error is chained to the original exception, handle and lock are released |
+| Plugins | callbacks into the same DB during a write operation not supported (`RuntimeError`), also not in `occupied_addresses` during `delete_record`; CUSTOM logic must be registered at runtime |
+| `[cache]` configuration | `vindex_max_marks`/`vindex_max_indexes` are parsed and validated but not yet used (fixed: 4,194,304 skip marks, 4,096 v indexes); `block_cache_bytes` is effective |
+| Large blocks | every block is read and checked completely once per object on the first access (1M KQ records ≈ 25 MB); blocks above the largest cacheable item (default 8 MiB) are afterwards read by range only |
+| `readonly` readers | see the state at the time of opening; no `refresh()`, reopen for a newer state |
+| Index build | keeps all references of an index in memory (≈ 8 bytes per reference while `u ≤ 2^64`); no spilling to disk; several scans when memory is short, an index above the physical memory ⇒ `MemoryError` (section 12.2) |
+| Prefix check | a flipped `u_start` of the same length in a DATA prefix is detected on a read of an uncovered `u`, with overlapping segments not always – then only when the block is loaded or by `verify(deep=True)` (section 15.1); realm values in DATA prefixes and SPARSE prefixes are checked on open |
+| Open handles | a handle checks every block once and then uses it without a new CRC check; an in-place change of the file by another process (including `repair_file(allow_data_loss=True)` followed by writes) is not noticed by a handle that is already open – open it again (section 9.8) |
+| Negative coordinates | single reads (`get`, `get_value`, `get_cell`) return `None` for a negative `realm`/`u`/`v`, as v0.14 does; writes and N computation reject it, the NumPy paths raise `ValueError` |
+| Open option `strict` | removed (it had no effect); use `readonly=True` instead; opening is always fail closed |
 | Older format revisions | files with a file identifier other than `NHYDB016` cannot be read; no converter |
-| ID ranges | `shape_id`, `layout_id`, `index_id`, `block_id` ≤ 2^64−1; enum codes `i64`; mathematical coordinates unbounded |
+| Databases of 0.27.1 | same file identifier, but unkeyed schema digest: opening ⇒ `CorruptionError` naming 0.27.1 (also with `readonly=True`); no migration – export with 0.27.1, re-import with 0.28.0 (section 7) |
+| ID ranges | `shape_id`, `layout_id` (also MATH), `index_id`, `default_shape_id` ≤ 2^63−1 (`ValueError`); `block_id` ≤ 2^64−1; enum codes `i64`; mathematical coordinates and `varuint`/`varint` values unbounded (section 3.6) |
 | NumPy coordinates | `u`/`v`/`object_id` arrays limited to `uint64` |
 | Dense batch | record area ≤ 4 GiB per block |
 | Plan generations | only two generations in the plan; superblock fallback across more than one schema generation ⇒ fail closed |
-| Repair | can make intact, uncommitted blocks durable |
-| Durability `full` | macOS: `F_FULLFSYNC`, an error if the file system lacks support (no silent fallback); Linux: `fsync(2)`; Windows: `FlushFileBuffers` (section 9.6) |
-| Platforms | developed and tested primarily on macOS (Apple Silicon); wheels for Linux and Windows are built and tested via CI |
+| Repair | sacrifices committed data only with `allow_data_loss=True`; uncommitted blocks are discarded by default and taken over with `keep_uncommitted=True` (section 15.4) |
+| Durability `full` | macOS: `F_BARRIERFSYNC` before and `F_FULLFSYNC` after the superblock, an error if the file system lacks `F_FULLFSYNC` support (no silent fallback); Linux: `fsync(2)`; Windows: `FlushFileBuffers` (section 9.6) |
+| Platforms | developed primarily on macOS (Apple Silicon); CI builds and tests on Linux, macOS and Windows |
+| Indexes | only CLASSIC records are indexed; indexes are not maintained automatically (`build_indexes()`); rebuild them after a re-import |
 | NHySQL | read-only, CLASSIC sources only; `DISTINCT`, `HAVING` not implemented |
 | Full-text search | `search` requires a fresh FULLTEXT index (no scan fallback) |
 
@@ -2274,7 +2945,10 @@ NHyDB error class and their own text, e.g.
 `CorruptionError("layout plan: decryption/authentication failed (invalid AES-GCM tag)")` for a
 layout plan that cannot be decrypted, or
 `MathSyntaxError("invalid syntax (<unknown>, line 1)")` for syntax errors in
-MATH expressions. All error texts of the engine are in English.
+MATH expressions. All error texts of the engine are in English. Error texts
+are not part of the stable interface and may change (spelling, additions
+such as paths or hints); programs should evaluate error classes and – for
+`OSError` – `errno`, not the text.
 
 ---
 

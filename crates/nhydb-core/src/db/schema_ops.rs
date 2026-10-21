@@ -5,7 +5,7 @@ use crate::codec::{FieldDef, TypeCode};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::nat::Nat;
-use crate::schema::{ExtensionDef, IndexDef, RealmDef, ShapeDef};
+use crate::schema::{check_id, ExtensionDef, IndexDef, RealmDef, ShapeDef};
 use crate::textindex::{normalize_kind, normalize_options, IndexKind};
 use crate::val::Val;
 use crate::vmap;
@@ -13,6 +13,9 @@ use crate::vmap;
 use super::{Db, DynMode};
 
 impl Db {
+    /// Creates a new realm. An occupied realm ID is rejected with
+    /// `SchemaError` (F008, deliberate deviation from the v0.27 reference,
+    /// which silently replaced the definition).
     pub fn create_realm(
         &mut self,
         realm_id: &Nat,
@@ -22,6 +25,25 @@ impl Db {
         base_reserve_to: &Nat,
     ) -> Result<RealmDef> {
         address::require_positive("realm_id", realm_id)?;
+        if self.realms.contains_key(realm_id) {
+            return Err(Error::Schema(format!("realm {realm_id} already exists")));
+        }
+        self.store_realm_def(realm_id, name, description, default_shape_id, base_reserve_to)
+    }
+
+    /// Writes a realm definition (new or updated, e.g. a new default shape).
+    pub(crate) fn store_realm_def(
+        &mut self,
+        realm_id: &Nat,
+        name: &str,
+        description: &str,
+        default_shape_id: Option<u64>,
+        base_reserve_to: &Nat,
+    ) -> Result<RealmDef> {
+        address::require_positive("realm_id", realm_id)?;
+        if let Some(sid) = default_shape_id {
+            check_id("default_shape_id", sid)?;
+        }
         if !base_reserve_to.is_zero() {
             validate_local_v(base_reserve_to, Some(realm_id))?;
         }
@@ -51,6 +73,10 @@ impl Db {
         self.require_realm(realm_id)?;
         self.deny_math_realm(realm_id)?;
         let s = ShapeDef::new(shape_id, realm_id.clone(), name.to_string(), fields, description.to_string())?;
+        if self.shapes.contains_key(&shape_id) {
+            // F008: replacing an existing shape would make its records unreadable.
+            return Err(Error::Schema(format!("shape ID {shape_id} already exists")));
+        }
         self.append_block(BT_SHAPE, s.to_val().to_json()?.as_bytes(), 0)?;
         self.shapes.insert(s.shape_id, s.clone());
         self.clear_decode_caches();
@@ -110,7 +136,7 @@ impl Db {
         };
         self.validate_base_shape(realm_id, &shape)?;
         let old = self.realms[realm_id].clone();
-        self.create_realm(realm_id, &old.name, &old.description, Some(shape_id), &old.base_reserve_to)
+        self.store_realm_def(realm_id, &old.name, &old.description, Some(shape_id), &old.base_reserve_to)
     }
 
     pub fn extension_boundary(&self, realm_id: &Nat) -> Nat {
@@ -212,10 +238,15 @@ impl Db {
         ngram: Option<&Val>,
         description: &str,
     ) -> Result<IndexDef> {
+        check_id("index_id", index_id)?;
         self.require_realm(realm_id)?;
         self.deny_math_realm(realm_id)?;
         if self.index_name_map.contains_key(&(realm_id.clone(), name.to_string())) {
             return Err(Error::Schema("Index name exists".into()));
+        }
+        if self.index_defs.contains_key(&index_id) {
+            // F008: an occupied ID would silently replace the definition.
+            return Err(Error::Schema(format!("index ID {index_id} already exists")));
         }
         let source_v = self.resolve_v(realm_id, v)?;
         let kind = normalize_kind(kind)?;

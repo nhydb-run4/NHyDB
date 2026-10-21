@@ -25,25 +25,99 @@ pub struct Storage {
     /// File offset of `pending[0]` == length of the written file.
     pending_start: u64,
     pub sync_mode: SyncMode,
+    /// Opened read-only (`O_RDONLY`): every write fails, fsync is a no-op.
+    readonly: bool,
     /// Test-only fault injection: writes beyond this file offset fail after
     /// writing the part below it (emulates a file size limit / full disk).
     #[cfg(test)]
     pub(crate) fail_writes_beyond: Option<u64>,
+    /// Test-only fault injection: every fsync/barrier fails with EIO.
+    #[cfg(test)]
+    pub(crate) fail_fsync: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: `fail_writes_beyond` for every `Storage` opened afterwards on
+    /// this thread (fault injection into internally opened files, e.g. the
+    /// compaction target).
+    pub(crate) static FAIL_NEW_WRITES_BEYOND: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only (T017): positional file reads and bytes read on this thread
+    /// (complexity tests count I/O instead of measuring wall-clock time).
+    pub(crate) static FILE_READS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn count_read(len: usize) {
+    FILE_READS.with(|c| {
+        let (n, b) = c.get();
+        c.set((n + 1, b + len as u64));
+    });
+}
+
+fn read_only_error() -> Error {
+    Error::NHyDB("database is opened read-only (readonly=True); writing is not possible".into())
 }
 
 impl Storage {
     pub fn open(path: &Path, sync_mode: SyncMode) -> Result<Storage> {
+        Self::open_mode(path, sync_mode, false)
+    }
+
+    /// Opens read-write or (`readonly`) with `O_RDONLY`; a read-only
+    /// storage never changes the file.
+    pub fn open_mode(path: &Path, sync_mode: SyncMode, readonly: bool) -> Result<Storage> {
         sync_mode.check_supported()?;
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file = OpenOptions::new().read(true).write(!readonly).open(path)?;
         let len = file.metadata()?.len();
         Ok(Storage {
             file: Some(file),
             pending: Vec::new(),
             pending_start: len,
             sync_mode,
+            readonly,
             #[cfg(test)]
-            fail_writes_beyond: None,
+            fail_writes_beyond: FAIL_NEW_WRITES_BEYOND.with(|c| c.get()),
+            #[cfg(test)]
+            fail_fsync: false,
         })
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// Read-only view: limits the logical file length to `len` (bytes behind
+    /// the commit boundary stay invisible without truncating the file).
+    pub fn limit_view(&mut self, len: u64) {
+        debug_assert!(self.readonly && self.pending.is_empty());
+        if len < self.pending_start {
+            self.pending_start = len;
+        }
+    }
+
+    /// Physical length of the underlying file (ignores the read-only view).
+    pub fn file_len(&self) -> Result<u64> {
+        Ok(self.file()?.metadata()?.len())
+    }
+
+    /// Read-only view: moves the logical end forward to `len` (bytes a
+    /// concurrent writer has committed since the open, N1). `len` must lie
+    /// inside the file.
+    pub fn extend_view(&mut self, len: u64) -> Result<()> {
+        if !self.readonly || !self.pending.is_empty() {
+            return Err(Error::NHyDB("extend_view requires a read-only storage".into()));
+        }
+        let physical = self.file_len()?;
+        if len > physical {
+            return Err(Error::Corruption(format!("commit boundary {len} lies outside the file ({physical} bytes)")));
+        }
+        self.pending_start = self.pending_start.max(len);
+        Ok(())
     }
 
     fn file(&self) -> Result<&File> {
@@ -52,6 +126,9 @@ impl Storage {
 
     /// Positional write of the underlying file (single point for all writes).
     fn write_file_at(&self, data: &[u8], off: u64) -> Result<()> {
+        if self.readonly {
+            return Err(read_only_error());
+        }
         #[cfg(test)]
         if let Some(limit) = self.fail_writes_beyond {
             if off + data.len() as u64 > limit {
@@ -94,6 +171,9 @@ impl Storage {
     /// Appends bytes to the end of the file.
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         self.file()?;
+        if self.readonly {
+            return Err(read_only_error());
+        }
         if self.pending.len() + data.len() > FLUSH_THRESHOLD {
             self.flush()?;
             if data.len() >= FLUSH_THRESHOLD {
@@ -124,7 +204,29 @@ impl Storage {
     }
 
     pub fn fsync(&self) -> Result<()> {
-        platform::sync_file(self.file()?, self.sync_mode)
+        let f = self.file()?;
+        if self.readonly {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_fsync {
+            return Err(Error::Io(std::io::Error::other("injected fsync error (EIO)")));
+        }
+        platform::sync_file(f, self.sync_mode)
+    }
+
+    /// Synchronization before the superblock write of a commit (ordering
+    /// barrier, see [`platform::barrier_sync`]).
+    pub fn fsync_barrier(&self) -> Result<bool> {
+        let f = self.file()?;
+        if self.readonly {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if self.fail_fsync {
+            return Err(Error::Io(std::io::Error::other("injected fsync error (EIO)")));
+        }
+        platform::barrier_sync(f, self.sync_mode)
     }
 
     /// Positional write outside the append region (superblocks). The range
@@ -146,9 +248,13 @@ impl Storage {
             buf.copy_from_slice(&self.pending[s..s + buf.len()]);
         } else if end <= self.pending_start {
             read_exact_at(self.file()?, buf, off)?;
+            #[cfg(test)]
+            count_read(buf.len());
         } else {
             let split = (self.pending_start - off) as usize;
             read_exact_at(self.file()?, &mut buf[..split], off)?;
+            #[cfg(test)]
+            count_read(split);
             let rest = buf.len() - split;
             buf[split..].copy_from_slice(&self.pending[..rest]);
         }
@@ -171,9 +277,19 @@ impl Storage {
         self.read_vec(off, avail)
     }
 
+    /// Drops the unwritten append buffer without touching the file (G2-1:
+    /// blocks of a `lock=False` handle that may never reach a file another
+    /// writer has extended meanwhile).
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
     /// Discards all bytes from `len` on (rollback of a failed append).
     pub fn rollback_to(&mut self, len: u64) -> Result<()> {
         self.file()?;
+        if self.readonly {
+            return Err(read_only_error());
+        }
         if len >= self.pending_start {
             self.pending.truncate((len - self.pending_start) as usize);
             Ok(())
@@ -186,6 +302,10 @@ impl Storage {
     }
 
     pub fn truncate(&mut self, len: u64) -> Result<()> {
+        self.file()?;
+        if self.readonly {
+            return Err(read_only_error());
+        }
         self.flush()?;
         self.file()?.set_len(len)?;
         self.pending_start = len;

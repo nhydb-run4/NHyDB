@@ -49,19 +49,56 @@ pub enum OutCol {
 }
 
 impl OutCol {
-    fn for_type(t: TypeCode, enum_: bool, n: usize) -> OutCol {
+    /// Empty column for a field type (the dtype depends only on the type,
+    /// never on the stored values).
+    fn for_type(t: TypeCode, enum_: bool) -> OutCol {
         if enum_ {
-            return OutCol::Vals(Vec::with_capacity(n));
+            return OutCol::Vals(Vec::new());
         }
         match t {
-            TypeCode::U64 | TypeCode::VarUInt => OutCol::U64(Vec::with_capacity(n)),
+            TypeCode::U64 | TypeCode::VarUInt => OutCol::U64(Vec::new()),
             TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 | TypeCode::VarInt => {
-                OutCol::I64(Vec::with_capacity(n))
+                OutCol::I64(Vec::new())
             }
-            TypeCode::F32 => OutCol::F32(Vec::with_capacity(n)),
-            TypeCode::F64 => OutCol::F64(Vec::with_capacity(n)),
-            TypeCode::Bool => OutCol::Bool(Vec::with_capacity(n)),
-            _ => OutCol::Vals(Vec::with_capacity(n)),
+            TypeCode::F32 => OutCol::F32(Vec::new()),
+            TypeCode::F64 => OutCol::F64(Vec::new()),
+            TypeCode::Bool => OutCol::Bool(Vec::new()),
+            _ => OutCol::Vals(Vec::new()),
+        }
+    }
+
+    /// Bytes per row of this column (for the memory estimate).
+    fn row_bytes(&self) -> usize {
+        match self {
+            OutCol::I64(_) | OutCol::U64(_) | OutCol::F64(_) => 8,
+            OutCol::F32(_) => 4,
+            OutCol::Bool(_) => 1,
+            OutCol::Vals(_) => std::mem::size_of::<Val>(),
+        }
+    }
+
+    /// Fallible reservation of `n` rows (F018: no abort on huge counts).
+    fn try_reserve(&mut self, n: usize) -> Result<()> {
+        let r = match self {
+            OutCol::I64(v) => v.try_reserve_exact(n),
+            OutCol::U64(v) => v.try_reserve_exact(n),
+            OutCol::F32(v) => v.try_reserve_exact(n),
+            OutCol::F64(v) => v.try_reserve_exact(n),
+            OutCol::Bool(v) => v.try_reserve_exact(n),
+            OutCol::Vals(v) => v.try_reserve_exact(n),
+        };
+        r.map_err(|e| Error::Memory(format!("cannot allocate {n} result rows: {e}")))
+    }
+
+    /// NumPy dtype name (for error messages).
+    pub fn dtype_name(&self) -> &'static str {
+        match self {
+            OutCol::I64(_) => "int64",
+            OutCol::U64(_) => "uint64",
+            OutCol::F32(_) => "float32",
+            OutCol::F64(_) => "float64",
+            OutCol::Bool(_) => "bool",
+            OutCol::Vals(_) => "object",
         }
     }
 
@@ -77,8 +114,10 @@ impl OutCol {
     }
 
     /// Appends a value; `None`/missing → null value (0 / NaN / None).
-    /// If the value does not fit the column type, the column switches to `Vals`.
-    fn push(&mut self, v: Option<&Val>) {
+    /// If the value does not fit the column type, the column switches to
+    /// `Vals` when `allow_object` is set; otherwise nothing is appended and
+    /// `false` is returned (deterministic dtype, F033).
+    fn push(&mut self, v: Option<&Val>, allow_object: bool) -> bool {
         let ok = match (&mut *self, v) {
             (OutCol::I64(c), None | Some(Val::None)) => {
                 c.push(0);
@@ -127,10 +166,99 @@ impl OutCol {
             _ => false,
         };
         if !ok {
+            if !allow_object {
+                return false;
+            }
             let mut vals = self.to_vals();
             vals.push(v.cloned().unwrap_or(Val::None));
             *self = OutCol::Vals(vals);
         }
+        true
+    }
+}
+
+impl OutCol {
+    /// Removes the last row (undo of a direct decode, P018).
+    fn pop(&mut self) {
+        match self {
+            OutCol::I64(v) => drop(v.pop()),
+            OutCol::U64(v) => drop(v.pop()),
+            OutCol::F32(v) => drop(v.pop()),
+            OutCol::F64(v) => drop(v.pop()),
+            OutCol::Bool(v) => drop(v.pop()),
+            OutCol::Vals(v) => drop(v.pop()),
+        }
+    }
+}
+
+/// P018: decodes a stored BASE value straight into a typed column (no
+/// `Val`). Returns `Ok(false)` with `pos` unchanged when the combination of
+/// field type and column needs the generic path (enums, text, numbers
+/// beyond 64 bit, a field type differing from the column type, object
+/// columns); the values pushed are exactly those of `decode_value` + `push`.
+fn decode_into(c: &mut OutCol, f: &crate::codec::FieldDef, raw: &[u8], pos: &mut usize) -> Result<bool> {
+    if f.enum_map.is_some() {
+        return Ok(false);
+    }
+    fn fixed<'a>(raw: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
+        let end = pos.checked_add(n).filter(|e| *e <= raw.len()).ok_or_else(|| Error::Corruption("fixed-width value incomplete".into()))?;
+        let b = &raw[*pos..end];
+        *pos = end;
+        Ok(b)
+    }
+    match (c, f.typ) {
+        (OutCol::I64(c), TypeCode::U8) => c.push(fixed(raw, pos, 1)?[0] as i64),
+        (OutCol::I64(c), TypeCode::I8) => c.push(fixed(raw, pos, 1)?[0] as i8 as i64),
+        (OutCol::I64(c), TypeCode::U16) => c.push(u16::from_le_bytes(fixed(raw, pos, 2)?.try_into().unwrap()) as i64),
+        (OutCol::I64(c), TypeCode::I16) => c.push(i16::from_le_bytes(fixed(raw, pos, 2)?.try_into().unwrap()) as i64),
+        (OutCol::I64(c), TypeCode::U32) => c.push(u32::from_le_bytes(fixed(raw, pos, 4)?.try_into().unwrap()) as i64),
+        (OutCol::I64(c), TypeCode::I32) => c.push(i32::from_le_bytes(fixed(raw, pos, 4)?.try_into().unwrap()) as i64),
+        (OutCol::I64(c), TypeCode::I64) => c.push(i64::from_le_bytes(fixed(raw, pos, 8)?.try_into().unwrap())),
+        (OutCol::U64(c), TypeCode::U64) => c.push(u64::from_le_bytes(fixed(raw, pos, 8)?.try_into().unwrap())),
+        (OutCol::F32(c), TypeCode::F32) => c.push(f32::from_le_bytes(fixed(raw, pos, 4)?.try_into().unwrap())),
+        (OutCol::F64(c), TypeCode::F64) => c.push(f64::from_le_bytes(fixed(raw, pos, 8)?.try_into().unwrap())),
+        (OutCol::Bool(c), TypeCode::Bool) => c.push((fixed(raw, pos, 1)?[0] != 0) as u8),
+        (OutCol::U64(c), TypeCode::VarUInt) => match crate::nat::get_vu64(raw, pos)? {
+            Some(v) => c.push(v),
+            None => return Ok(false),
+        },
+        (OutCol::I64(c), TypeCode::VarInt) => match crate::nat::get_vu64(raw, pos)? {
+            // zigzag: every u64 code maps into i64
+            Some(z) => c.push(if z % 2 == 0 { (z / 2) as i64 } else { -((z / 2) as i64) - 1 }),
+            None => return Ok(false),
+        },
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Physical memory of the machine in bytes (None if unknown).
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+        if pages > 0 && size > 0 {
+            return (pages as u64).checked_mul(size as u64);
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain C struct, dwLength set as required by the API.
+        unsafe {
+            let mut st: MEMORYSTATUSEX = std::mem::zeroed();
+            st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut st) != 0 {
+                return Some(st.ullTotalPhys);
+            }
+        }
+        None
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
     }
 }
 
@@ -300,7 +428,22 @@ impl Db {
 
     /// Reads `count` CLASSIC records starting at `u_start` column-wise
     /// (including sparse overlays, tombstones, deletes).
-    pub fn read_columns(&self, realm: &Nat, u_start: &Nat, count: usize, fields: Option<&[Val]>, lane: Lane) -> Result<ColumnsOut> {
+    ///
+    /// The result always has exactly `count` rows. The dtype of every column
+    /// depends only on the field type; a stored value that does not fit it
+    /// (e.g. varuint > 2^64-1) raises `ValueError` unless `allow_object` is
+    /// set, in which case that column becomes an object column.
+    /// Memory is reserved fallibly up front; a `count` whose result would
+    /// not fit into the physical memory raises `MemoryError` (F018).
+    pub fn read_columns(
+        &self,
+        realm: &Nat,
+        u_start: &Nat,
+        count: usize,
+        fields: Option<&[Val]>,
+        lane: Lane,
+        allow_object: bool,
+    ) -> Result<ColumnsOut> {
         self.require_realm(realm)?;
         address::require_positive("u_start", u_start)?;
         let base = self.current_base_shape(realm);
@@ -329,24 +472,49 @@ impl Db {
             .map(|(_, v)| {
                 let fd = base.and_then(|b| b.by_v(v)).cloned().or_else(|| self.extension_defs.get(&(realm.clone(), v.clone())).map(|e| e.as_field()));
                 match fd {
-                    Some(f) => OutCol::for_type(f.typ, f.enum_map.is_some(), count),
-                    None => OutCol::Vals(Vec::with_capacity(count)),
+                    Some(f) => OutCol::for_type(f.typ, f.enum_map.is_some()),
+                    None => OutCol::Vals(Vec::new()),
                 }
             })
             .collect();
-        let mut present = Vec::with_capacity(count);
+        // F018: plausibility check against the physical memory, then fallible reservation.
+        let row_bytes: usize = 1 + cols.iter().map(|c| c.row_bytes()).sum::<usize>();
+        let too_big = || Error::Memory(format!("read_numpy: count={count} needs more memory than available"));
+        let need = (count as u64).checked_mul(row_bytes as u64).ok_or_else(too_big)?;
+        if let Some(phys) = physical_memory_bytes() {
+            if need > phys {
+                return Err(Error::Memory(format!(
+                    "read_numpy: count={count} would need about {} MiB, more than the physical memory ({} MiB)",
+                    need >> 20,
+                    phys >> 20
+                )));
+            }
+        }
+        for c in cols.iter_mut() {
+            c.try_reserve(count)?;
+        }
+        let mut present: Vec<u8> = Vec::new();
+        present.try_reserve_exact(count).map_err(|e| Error::Memory(format!("cannot allocate {count} result rows: {e}")))?;
         let key = (realm.clone(), lane);
         let sparse_idx = self.sparse.get(&key);
         let overlay = self.dense_overlap_keys.contains(&key);
         let check_deletes = !self.deletes.is_empty();
         let ncols = wanted.len();
         let mut row: Vec<Option<Val>> = vec![None; ncols];
+        let mut direct: Vec<bool> = vec![false; ncols];
         let mut hits = Vec::new();
         let mut u = u_start.clone();
         let mut done = 0usize;
+        // F021 rest (G3-03): start of the uncovered/deleted run the read is in
+        let mut gap_start: Option<Nat> = None;
         while done < count {
             // determine the run within one segment
             let seg = self.resolve_segment(realm, &u, lane);
+            match seg {
+                None if gap_start.is_none() => gap_start = Some(u.clone()),
+                None => {}
+                Some(_) => gap_start = None,
+            }
             let run = match seg {
                 Some(s) if !overlay => {
                     let left = s.u_end.checked_sub(&u).and_then(|d| d.as_u64()).unwrap_or(0) as usize + 1;
@@ -359,15 +527,32 @@ impl Db {
                     let shape = self.shape_of(seg.shape_id)?;
                     let plan: Vec<Option<usize>> =
                         shape.fields.iter().map(|f| wanted.iter().position(|(_, v)| *v == f.v)).collect();
-                    let payload = self.block_payload(seg.block_offset)?;
-                    let toff = (seg.offsets_offset - seg.payload_offset) as usize;
-                    let rbase = (seg.records_offset - seg.payload_offset) as usize;
-                    let first = u.checked_sub(&seg.u_start).and_then(|d| d.as_u64()).unwrap() as usize;
+                    // Only the offset table window and the records of the
+                    // run are read (whole payload from the cache, or direct
+                    // range reads of a block verified earlier, P001/P003).
+                    let acc = self.block_access(seg.block_offset)?;
+                    let plen = acc.payload_len() as usize;
+                    let bad = || Error::Corruption("DATA segment offsets invalid".into());
+                    let toff = seg.offsets_offset.checked_sub(seg.payload_offset).ok_or_else(bad)? as usize;
+                    let rbase = seg.records_offset.checked_sub(seg.payload_offset).ok_or_else(bad)? as usize;
+                    let first = u
+                        .checked_sub(&seg.u_start)
+                        .and_then(|d| d.as_u64())
+                        .ok_or_else(|| Error::Corruption("DATA segment does not contain u".into()))? as usize;
+                    // corrupted offset tables must not panic (D006: no PanicException)
+                    if ((first + run) as u64) > seg.count || toff + (first + run) * 4 + 4 > plen {
+                        return Err(Error::Corruption("DATA offset table incomplete".into()));
+                    }
+                    let tab = self.access_range(&acc, seg.block_offset, toff + first * 4, run * 4 + 4)?;
+                    let at = |k: usize| u32::from_le_bytes(tab[k * 4..k * 4 + 4].try_into().unwrap()) as usize;
+                    let (st0, en_last) = (at(0), at(run));
+                    if en_last < st0 || rbase + en_last > plen {
+                        return Err(Error::Corruption("DATA record offset invalid".into()));
+                    }
+                    let recs = self.access_range(&acc, seg.block_offset, rbase + st0, en_last - st0)?;
                     for k in 0..run {
-                        let i = first + k;
-                        let st = u32::from_le_bytes(payload[toff + i * 4..toff + i * 4 + 4].try_into().unwrap()) as usize;
-                        let en = u32::from_le_bytes(payload[toff + i * 4 + 4..toff + i * 4 + 8].try_into().unwrap()) as usize;
-                        if en < st || rbase + en > payload.len() {
+                        let (st, en) = (at(k), at(k + 1));
+                        if en < st || st < st0 || en > en_last {
                             return Err(Error::Corruption("DATA record offset invalid".into()));
                         }
                         let uu = if k == 0 { u.clone() } else { u.add_u64(k as u64) };
@@ -376,14 +561,63 @@ impl Db {
                                 if *d > seg.block_id {
                                     present.push(0);
                                     for c in cols.iter_mut() {
-                                        c.push(None);
+                                        c.push(None, true);
                                     }
                                     continue;
                                 }
                             }
                         }
-                        let raw = &payload[rbase + st..rbase + en];
+                        let raw = &recs[st - st0..en - st0];
                         row.iter_mut().for_each(|x| *x = None);
+                        let has_sparse = match sparse_idx {
+                            Some(si) => {
+                                hits.clear();
+                                si.iv.stab(&uu, &mut hits);
+                                !hits.is_empty()
+                            }
+                            None => false,
+                        };
+                        // P018: records without sparse overlay and without
+                        // extensions are decoded straight into the columns.
+                        if !has_sparse {
+                            direct.iter_mut().for_each(|x| *x = false);
+                            let mut p = 0usize;
+                            for (f, ci) in shape.fields.iter().zip(plan.iter()) {
+                                match ci {
+                                    Some(ci) => {
+                                        if decode_into(&mut cols[*ci], f, raw, &mut p)? {
+                                            direct[*ci] = true;
+                                        } else {
+                                            row[*ci] = Some(decode_value(f, raw, &mut p)?);
+                                        }
+                                    }
+                                    None => skip_value(f, raw, &mut p)?,
+                                }
+                            }
+                            if p == raw.len() {
+                                present.push(1);
+                                for (ci, c) in cols.iter_mut().enumerate() {
+                                    if !direct[ci] && !c.push(row[ci].as_ref(), allow_object) {
+                                        return Err(Error::Value(format!(
+                                            "read_numpy: value {} of field '{}' at u={} does not fit dtype {}; \
+                                             use object_fallback=True (object column) or get()/range()",
+                                            row[ci].as_ref().map(|x| x.py_repr()).unwrap_or_default(),
+                                            wanted[ci].0,
+                                            uu,
+                                            c.dtype_name()
+                                        )));
+                                    }
+                                }
+                                continue;
+                            }
+                            // extensions follow: undo and take the generic path
+                            for (ci, c) in cols.iter_mut().enumerate() {
+                                if direct[ci] {
+                                    c.pop();
+                                }
+                            }
+                            row.iter_mut().for_each(|x| *x = None);
+                        }
                         let mut p = 0usize;
                         for (f, ci) in shape.fields.iter().zip(plan.iter()) {
                             match ci {
@@ -399,10 +633,8 @@ impl Db {
                                 }
                             }
                         }
-                        if let Some(si) = sparse_idx {
-                            hits.clear();
-                            si.iv.stab(&uu, &mut hits);
-                            if !hits.is_empty() {
+                        if let (Some(si), true) = (sparse_idx, has_sparse) {
+                            {
                                 hits.sort_unstable();
                                 let upd = self.sparse_states_direct(realm, &uu, si, &hits)?;
                                 for (ci, (_, v)) in wanted.iter().enumerate() {
@@ -416,19 +648,35 @@ impl Db {
                         }
                         present.push(1);
                         for (ci, c) in cols.iter_mut().enumerate() {
-                            c.push(row[ci].as_ref());
+                            if !c.push(row[ci].as_ref(), allow_object) {
+                                return Err(Error::Value(format!(
+                                    "read_numpy: value {} of field '{}' at u={} does not fit dtype {}; \
+                                     use object_fallback=True (object column) or get()/range()",
+                                    row[ci].as_ref().map(|x| x.py_repr()).unwrap_or_default(),
+                                    wanted[ci].0,
+                                    uu,
+                                    c.dtype_name()
+                                )));
+                            }
                         }
                     }
                 }
                 None => {
                     present.push(0);
                     for c in cols.iter_mut() {
-                        c.push(None);
+                        c.push(None, true);
                     }
                 }
             }
             u = u.add_u64(run as u64);
             done += run;
+        }
+        // A gap followed by a read segment needs no check (that block, the
+        // nearest one above the gap, was CRC-checked before use); a read
+        // that ends in a gap checks the nearest segment above it like a
+        // point access.
+        if let Some(g) = gap_start {
+            self.check_uncovered_u(realm, &g, lane)?;
         }
         Ok(ColumnsOut { names: wanted.into_iter().map(|(n, _)| n).collect(), cols, present })
     }
@@ -444,8 +692,8 @@ impl Db {
         let mut out = super::SparseMap::new();
         for &i in hits {
             let seg = &idx.segs[i];
-            if let Some((payload, rel, len)) = self.read_sparse_record_bytes(seg, u)? {
-                for (v, m) in self.decode_sparse_record(realm, u, &payload[rel..rel + len])? {
+            if let Some((raw, _)) = self.read_sparse_record_bytes(seg, u)? {
+                for (v, m) in self.decode_sparse_record(realm, u, &raw)? {
                     out.insert(v, m.value);
                 }
             }
@@ -485,5 +733,52 @@ impl Db {
             self.commit()?;
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NL;
+    use crate::codec::FieldDef;
+    use crate::db::OpenOptions;
+
+    fn db_with(name: &str) -> (Db, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("nhydb_cols_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("c.nhydb");
+        let r = Nat::S(1);
+        let mut db = Db::create(&p, true, OpenOptions::default()).unwrap();
+        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
+        db.create_shape(1, &r, "s", vec![FieldDef::new(Nat::S(1), "n", TypeCode::VarUInt)], "").unwrap();
+        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
+        let rows = vec![vec![Val::Int(5)], vec![Val::from_bigint(num_bigint::BigInt::from(1u8) << 70)]];
+        db.put_dense_batch(&r, &Nat::S(1), &DenseRows::Tuples(&rows), Some(1), &[], NL, false).unwrap();
+        (db, d)
+    }
+
+    /// F018: a huge `count` is an error, never an abort/panic.
+    #[test]
+    fn read_columns_huge_count_is_memory_error() {
+        let (db, d) = db_with("huge");
+        for count in [usize::MAX, usize::MAX / 2, 1usize << 40] {
+            let e = db.read_columns(&Nat::S(1), &Nat::S(1), count, None, NL, false).unwrap_err();
+            assert!(matches!(e, Error::Memory(_)), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// F033: dtype depends on the field type; misfits raise unless allowed.
+    #[test]
+    fn read_columns_deterministic_dtype() {
+        let (db, d) = db_with("dtype");
+        let ok = db.read_columns(&Nat::S(1), &Nat::S(1), 1, None, NL, false).unwrap();
+        assert!(matches!(ok.cols[0], OutCol::U64(_)));
+        assert!(matches!(db.read_columns(&Nat::S(1), &Nat::S(1), 2, None, NL, false), Err(Error::Value(_))));
+        let obj = db.read_columns(&Nat::S(1), &Nat::S(1), 3, None, NL, true).unwrap();
+        assert!(matches!(&obj.cols[0], OutCol::Vals(v) if v.len() == 3));
+        assert_eq!(obj.present, vec![1, 1, 0]);
+        let _ = std::fs::remove_dir_all(d);
     }
 }

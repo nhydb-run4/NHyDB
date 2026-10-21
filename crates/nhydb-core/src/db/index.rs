@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use crate::codec::{decode_value, skip_value};
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::nat::{get_vu, get_vu_u64, put_vu64, Nat};
-use crate::schema::IndexDef;
+use crate::schema::{IndexDef, LayoutKind};
 use crate::textindex::{self, FtCorpus, FtPosting, IndexKind, FULLTEXT_DOCLEN_KEY, PAYLOAD_FULLTEXT_DOCLENS, PAYLOAD_FULLTEXT_POSITIONS};
 use crate::val::{Val, ValKey};
 use crate::vmap;
@@ -29,11 +30,99 @@ pub enum Cond {
     Range(Val, Val),
 }
 
+/// Document u of one key during the build (P014/P020, I001): plain `u32`
+/// as long as every u fits (4 bytes per reference, the width of an ordinary
+/// posting on disk), then `u64` from the first u >= 2^32, then exact `Nat`
+/// values from the first u >= 2^64, so BigInt u keep their width-0
+/// postings. Growth is fallible: an allocation failure becomes
+/// `Error::Memory` instead of aborting the process.
+#[derive(Clone, Debug)]
+pub(crate) enum UList {
+    Tiny(Vec<u32>),
+    Small(Vec<u64>),
+    Big(Vec<Nat>),
+}
+
+impl Default for UList {
+    fn default() -> Self {
+        UList::Tiny(Vec::new())
+    }
+}
+
+fn grow<T>(v: &mut Vec<T>) -> Result<()> {
+    v.try_reserve(1).map_err(|e| Error::Memory(format!("index build: cannot grow a posting list: {e}")))
+}
+
+impl UList {
+    fn push(&mut self, u: &Nat) -> Result<()> {
+        match (&mut *self, u) {
+            (UList::Tiny(v), Nat::S(x)) if *x <= u32::MAX as u64 => {
+                grow(v)?;
+                v.push(*x as u32);
+            }
+            (UList::Small(v), Nat::S(x)) => {
+                grow(v)?;
+                v.push(*x);
+            }
+            (UList::Big(v), _) => {
+                grow(v)?;
+                v.push(u.clone());
+            }
+            (UList::Tiny(v), Nat::S(x)) => {
+                let mut wide: Vec<u64> = Vec::new();
+                wide.try_reserve_exact(v.len() + 1).map_err(|e| Error::Memory(format!("index build: cannot widen a posting list: {e}")))?;
+                wide.extend(v.iter().map(|&y| y as u64));
+                wide.push(*x);
+                *self = UList::Small(wide);
+            }
+            (UList::Tiny(_), Nat::B(_)) | (UList::Small(_), Nat::B(_)) => {
+                let mut big = self.to_nats();
+                grow(&mut big)?;
+                big.push(u.clone());
+                *self = UList::Big(big);
+            }
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            UList::Tiny(v) => v.len(),
+            UList::Small(v) => v.len(),
+            UList::Big(v) => v.len(),
+        }
+    }
+
+    fn last(&self) -> Option<Nat> {
+        match self {
+            UList::Tiny(v) => v.last().map(|x| Nat::S(*x as u64)),
+            UList::Small(v) => v.last().map(|x| Nat::S(*x)),
+            UList::Big(v) => v.last().cloned(),
+        }
+    }
+
+    fn sort_check(&mut self) {
+        match self {
+            UList::Tiny(v) => sort_dedup_check(v),
+            UList::Small(v) => sort_dedup_check(v),
+            UList::Big(v) => sort_dedup_check(v),
+        }
+    }
+
+    fn to_nats(&self) -> Vec<Nat> {
+        match self {
+            UList::Tiny(v) => v.iter().map(|x| Nat::S(*x as u64)).collect(),
+            UList::Small(v) => v.iter().map(|x| Nat::S(*x)).collect(),
+            UList::Big(v) => v.clone(),
+        }
+    }
+}
+
 /// Posting content of a key during the build.
 #[derive(Clone, Debug)]
 pub(crate) enum Bucket {
     /// Document u (VALUE/TOKEN/TRIGRAM).
-    Us(Vec<Nat>),
+    Us(UList),
     /// FULLTEXT: (u, positions).
     Ft(Vec<(Nat, Vec<u64>)>),
     /// FULLTEXT: (u, document length) under `FULLTEXT_DOCLEN_KEY`.
@@ -101,6 +190,11 @@ pub struct SecondaryMeta {
     pub postings_base: u64,
     pub payload_end: u64,
     pub block_id: u64,
+    /// Offset of the block header (for the one-time payload CRC check).
+    pub block_offset: u64,
+    /// Payload CRC already verified in this session (F011). Shared between
+    /// clones; a later per-block "verified" registry can replace it.
+    pub verified: Arc<AtomicBool>,
 }
 
 /// Python-style comparison of two scalars (`lo <= value`).
@@ -156,7 +250,9 @@ pub fn encode_big_posting(us: &[Nat]) -> Result<Vec<u8>> {
 pub fn decode_big_posting(raw: &[u8], count: u64) -> Result<Vec<Nat>> {
     let mut p = 0;
     let mut prev = Nat::ZERO;
-    let mut out = Vec::with_capacity(count as usize);
+    // Every delta takes at least one byte: the capacity never exceeds the
+    // payload, whatever `count` claims (F022).
+    let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(usize::MAX).min(raw.len()));
     for _ in 0..count {
         let d = get_vu(raw, &mut p)?;
         if d.is_zero() {
@@ -197,6 +293,62 @@ fn width_for(max_u: &Nat) -> u8 {
     }
 }
 
+/// Class of a value for range lookups: 0 numbers (without NaN), 1 `str`,
+/// 2 `bytes`, 3 everything else (never ordered against the bounds).
+fn range_class(v: &Val) -> u8 {
+    match v {
+        Val::Float(f) if f.is_nan() => 3,
+        Val::Bool(_) | Val::Int(_) | Val::Big(_) | Val::Float(_) => 0,
+        Val::Str(_) => 1,
+        Val::Bytes(_) => 2,
+        _ => 3,
+    }
+}
+
+/// Python `x == x` is false for NaN; containers holding NaN never compare
+/// equal to a freshly decoded value either.
+fn contains_nan(v: &Val) -> bool {
+    match v {
+        Val::Float(f) => f.is_nan(),
+        Val::List(l) => l.iter().any(contains_nan),
+        Val::Map(m) => m.iter().any(|(_, x)| contains_nan(x)),
+        _ => false,
+    }
+}
+
+/// Sorted, duplicate-free union of several postings (P014): when every u
+/// fits into 64 bits (width 4/8 postings) the union is sorted as plain
+/// `u64` (no enum comparisons); postings with u > 2^64 (width 0, BigInt)
+/// take the general `Nat` path, so arbitrarily large u stay exact.
+pub(crate) fn union_postings(postings: &[Arc<Vec<Nat>>]) -> Vec<Nat> {
+    let total: usize = postings.iter().map(|p| p.len()).sum();
+    let mut small: Vec<u64> = Vec::with_capacity(total);
+    let mut all_small = true;
+    'outer: for p in postings {
+        for u in p.iter() {
+            match u {
+                Nat::S(x) => small.push(*x),
+                Nat::B(_) => {
+                    all_small = false;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    if all_small {
+        small.sort_unstable();
+        small.dedup();
+        return small.into_iter().map(Nat::S).collect();
+    }
+    let mut merged: Vec<Nat> = Vec::with_capacity(total);
+    for p in postings {
+        merged.extend(p.iter().cloned());
+    }
+    merged.sort();
+    merged.dedup();
+    merged
+}
+
 fn sort_dedup_check<T: Ord + Clone>(v: &mut [T]) {
     if v.windows(2).any(|w| w[0] > w[1]) {
         v.sort();
@@ -206,6 +358,18 @@ fn sort_dedup_check<T: Ord + Clone>(v: &mut [T]) {
 
 /// Value lists per `(index_id, lane)` during the build.
 type IndexMaps = HashMap<(u64, Lane), ValueMap>;
+
+/// I001: bytes per posting reference assumed when planning a build: the
+/// list element for the largest u of the lane, the worst-case growth
+/// reserve of a doubling `Vec` and the write buffers (measured with KQ-10M:
+/// about 8.6 bytes per reference for `u32` lists).
+fn ref_bytes_estimate(max_u: &Nat) -> u64 {
+    match max_u {
+        Nat::S(x) if *x <= u32::MAX as u64 => 10,
+        Nat::S(_) => 20,
+        Nat::B(_) => 80,
+    }
+}
 /// Positional postings per query term (shared, without copying).
 pub type TermPostingsOwned = Vec<(String, Arc<Vec<FtPosting>>)>;
 
@@ -243,6 +407,8 @@ impl Db {
             postings_base,
             payload_end,
             block_id: info.block_id,
+            block_offset: info.offset,
+            verified: Arc::new(AtomicBool::new(false)),
         };
         self.secondary_blocks.insert((index_id, lane), meta);
         self.secondary_source_block.insert((index_id, lane), source_bid);
@@ -263,19 +429,27 @@ impl Db {
         let Some(meta) = self.secondary_blocks.get(&(index_id, lane)) else {
             return Ok(Arc::new(SecondaryDir::default()));
         };
-        let dbytes = self.store.read_vec(meta.dir_offset, meta.dir_len as usize)?;
+        // F011: the whole SECONDARY payload is CRC-checked once before its
+        // first use (directory and postings); the directory comes from the
+        // verified payload.
+        let payload = self.verified_secondary_payload(meta)?;
+        let payload_off = meta.block_offset + BLOCK_HEADER_SIZE as u64;
+        let rel = (meta.dir_offset - payload_off) as usize;
+        let dbytes = payload
+            .get(rel..rel.saturating_add(meta.dir_len as usize))
+            .ok_or_else(|| Error::Corruption("SECONDARY directory outside the block".into()))?;
         let mut q = 0usize;
         let mut dir = SecondaryDir::default();
         for _ in 0..meta.entry_count {
-            let klen = get_vu_u64(&dbytes, &mut q, "SECONDARY key")? as usize;
-            if q + klen > dbytes.len() {
+            let klen = get_vu_u64(dbytes, &mut q, "SECONDARY key")? as usize;
+            if q.checked_add(klen).is_none_or(|e| e > dbytes.len()) {
                 return Err(Error::Corruption("Length value ends beyond payload".into()));
             }
             let value = json_key_decode(&dbytes[q..q + klen])?;
             q += klen;
-            let rel = get_vu_u64(&dbytes, &mut q, "SECONDARY rel")?;
-            let clen = get_vu_u64(&dbytes, &mut q, "SECONDARY clen")?;
-            let cnt = get_vu_u64(&dbytes, &mut q, "SECONDARY cnt")?;
+            let rel = get_vu_u64(dbytes, &mut q, "SECONDARY rel")?;
+            let clen = get_vu_u64(dbytes, &mut q, "SECONDARY clen")?;
+            let cnt = get_vu_u64(dbytes, &mut q, "SECONDARY cnt")?;
             let Some(&width) = dbytes.get(q) else {
                 return Err(Error::Corruption("SECONDARY width missing".into()));
             };
@@ -303,26 +477,31 @@ impl Db {
         Ok(arc)
     }
 
-    /// `_secondary_keys_sorted`: natural ordering of the keys.
+    /// Reads the payload of a SECONDARY block with CRC check and marks the
+    /// block as verified (F011).
+    fn verified_secondary_payload(&self, meta: &SecondaryMeta) -> Result<Vec<u8>> {
+        let (info, payload) = self.read_block(meta.block_offset)?;
+        if info.block_type != BT_SECONDARY || info.block_id != meta.block_id {
+            return Err(Error::Corruption(format!("SECONDARY block {}: header changed", meta.block_id)));
+        }
+        meta.verified.store(true, AtomicOrdering::Release);
+        Ok(payload)
+    }
+
+    /// Directory keys ordered for range lookups (F025): numbers (without
+    /// NaN), then `str`, then `bytes`, each in natural order; all other keys
+    /// (None, NaN, lists, dicts) follow unordered. Range bounds of one of the
+    /// three ordered classes only ever match keys of the same class.
     fn secondary_keys_sorted(&self, index_id: u64, lane: Lane) -> Result<Arc<Vec<Val>>> {
         if let Some(k) = self.cache().sec_sorted.get(&(index_id, lane)) {
             return Ok(k.clone());
         }
         let dir = self.secondary_dir(index_id, lane)?;
         let mut keys: Vec<Val> = dir.entries.iter().map(|e| e.value.clone()).collect();
-        let mut ok = true;
-        for w in keys.windows(2) {
-            if crate::val::py_cmp(&w[0], &w[1]).is_none() {
-                ok = false;
-                break;
-            }
-        }
-        if !ok || keys.len() > 1 && keys.windows(2).any(|w| crate::val::py_cmp(&w[0], &w[1]) == Some(Ordering::Greater)) {
-            if !ok {
-                return Err(Error::Type("Range filter does not match mixed index types".into()));
-            }
-            keys.sort_by(|a, b| crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal));
-        }
+        keys.sort_by(|a, b| {
+            let (ca, cb) = (range_class(a), range_class(b));
+            ca.cmp(&cb).then_with(|| if ca < 3 { crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal) } else { Ordering::Equal })
+        });
         let arc = Arc::new(keys);
         self.cache().sec_sorted.insert((index_id, lane), arc.clone());
         Ok(arc)
@@ -330,6 +509,7 @@ impl Db {
 
     /// Public view of the (lazily loaded) directory.
     pub fn secondary_directory(&self, index_id: u64, lane: Lane) -> Result<Arc<SecondaryDir>> {
+        self.check_open()?;
         self.secondary_dir(index_id, lane)
     }
 
@@ -353,8 +533,8 @@ impl Db {
     fn append_index_document(map: &mut ValueMap, idef: &IndexDef, kg: &KeyGen, u: &Nat, value: &Val) -> Result<()> {
         match idef.kind {
             IndexKind::Value => {
-                if let Bucket::Us(v) = map.bucket(value.clone(), || Bucket::Us(Vec::new())) {
-                    v.push(u.clone());
+                if let Bucket::Us(v) = map.bucket(value.clone(), || Bucket::Us(UList::default())) {
+                    v.push(u)?;
                 }
             }
             IndexKind::Fulltext => {
@@ -391,8 +571,8 @@ impl Db {
                 let mut seen: HashSet<&str> = HashSet::with_capacity(keys.len());
                 for k in &keys {
                     if seen.insert(k.as_str()) {
-                        if let Bucket::Us(v) = map.bucket_str(k, || Bucket::Us(Vec::new())) {
-                            v.push(u.clone());
+                        if let Bucket::Us(v) = map.bucket_str(k, || Bucket::Us(UList::default())) {
+                            v.push(u)?;
                         }
                     }
                 }
@@ -425,6 +605,11 @@ impl Db {
                 self.current_base_shape(&realm).map(|b| b.fields.iter().map(|f| f.v.clone()).collect()).unwrap_or_default();
             let base_idxs: Vec<&IndexDef> = idxs.iter().copied().filter(|i| base_vs.contains(i.field_v())).collect();
             let ext_idxs: Vec<&IndexDef> = idxs.iter().copied().filter(|i| !base_vs.contains(i.field_v())).collect();
+            // F010: cells of COLUMN/PACKED/CUSTOM layouts give v another
+            // meaning; only u routed to a CLASSIC layout (or to no layout)
+            // are indexed. Pure CLASSIC realms skip the per-u check.
+            let mixed = self.realm_layouts(&realm).iter().any(|l| l.kind != LayoutKind::Classic);
+            let foreign = |u: &Nat| mixed && self.layout_at(&realm, u).is_some_and(|l| l.kind != LayoutKind::Classic);
             for lane in [0u8, 1] {
                 let key = (realm.clone(), lane);
                 // Sparse states of indexed BASE fields overlay the
@@ -437,7 +622,7 @@ impl Db {
                     if let Some(sidx) = self.sparse.get(&key) {
                         for seg in &sidx.segs {
                             let bi = self.sparse_block_index(seg)?;
-                            let payload = self.block_payload(seg.block_offset)?;
+                            let payload = self.block_payload_once(seg.block_offset)?;
                             for (u, abs, len) in bi.iter() {
                                 let rel = (abs - seg.payload_offset) as usize;
                                 for (v, meta) in self.decode_sparse_record(&realm, u, &payload[rel..rel + *len as usize])? {
@@ -485,7 +670,7 @@ impl Db {
                             if wanted_here.is_empty() {
                                 continue;
                             }
-                            let payload = self.block_payload(seg.block_offset)?;
+                            let payload = self.block_payload_once(seg.block_offset)?;
                             let toff = (seg.offsets_offset - seg.payload_offset) as usize;
                             let rbase = (seg.records_offset - seg.payload_offset) as usize;
                             let max_fi = wanted_here.last().unwrap().0;
@@ -500,6 +685,9 @@ impl Db {
                                     }
                                 }
                                 dense_scanned += 1;
+                                if foreign(&u) {
+                                    continue;
+                                }
                                 let s = u32::from_le_bytes(payload[toff + i * 4..toff + i * 4 + 4].try_into().unwrap()) as usize;
                                 let e = u32::from_le_bytes(payload[toff + i * 4 + 4..toff + i * 4 + 8].try_into().unwrap()) as usize;
                                 if e < s || rbase + e > payload.len() {
@@ -538,7 +726,7 @@ impl Db {
                     let mut extra: Vec<(&(Nat, Nat), &Val)> = overlay
                         .iter()
                         .filter_map(|(k, st)| st.val().map(|v| (k, v)))
-                        .filter(|((u, _), _)| self.resolve_segment(&realm, u, lane).is_none())
+                        .filter(|((u, _), _)| self.resolve_segment(&realm, u, lane).is_none() && !foreign(u))
                         .collect();
                     extra.sort_by(|a, b| a.0.cmp(b.0));
                     for ((u, v), val) in extra {
@@ -556,20 +744,22 @@ impl Db {
                         let mut seen_cells: HashSet<(Nat, Nat)> = HashSet::new();
                         for seg in segs {
                             let bi = self.sparse_block_index(seg)?;
-                            let payload = self.block_payload(seg.block_offset)?;
+                            let payload = self.block_payload_once(seg.block_offset)?;
                             for (u, abs, len) in bi.iter() {
                                 sparse_groups += 1;
                                 let rel = (abs - seg.payload_offset) as usize;
+                                if foreign(u) {
+                                    continue;
+                                }
                                 let vals = self.decode_sparse_selected(&realm, u, &payload[rel..rel + *len as usize], &max_wanted)?;
-                                let delete_bid = self.deletes.get(&(realm.clone(), lane, u.clone())).copied().unwrap_or(0);
+                                // F026: `delete(realm, u)` hides only the dense
+                                // record; extension cells stay visible to the
+                                // read path and therefore stay indexed.
                                 for (v, meta) in vals {
                                     if !wanted.contains(&v) {
                                         continue;
                                     }
                                     if !seen_cells.insert((u.clone(), v.clone())) {
-                                        continue;
-                                    }
-                                    if delete_bid > seg.block_id {
                                         continue;
                                     }
                                     let SVal::V(val) = meta.value else { continue };
@@ -587,7 +777,7 @@ impl Db {
         for vm in maps.values_mut() {
             for (_, b) in vm.items.iter_mut() {
                 match b {
-                    Bucket::Us(v) => sort_dedup_check(v),
+                    Bucket::Us(v) => v.sort_check(),
                     Bucket::Ft(v) => {
                         if v.windows(2).any(|w| w[0].0 > w[1].0) {
                             v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -604,8 +794,22 @@ impl Db {
         Ok((maps, dense_scanned, sparse_groups))
     }
 
-    fn persist_secondary(&mut self, idx: &IndexDef, value_map: &ValueMap, source_bid: u64, lane: Lane, max_u: &Nat) -> Result<(u64, u64, usize)> {
-        let width = width_for(max_u);
+    fn persist_secondary(&mut self, idx: &IndexDef, value_map: &ValueMap, source_bid: u64, lane: Lane, lane_max_u: &Nat) -> Result<(u64, u64, usize)> {
+        // F009: the posting width covers the largest document u actually
+        // indexed (sparse u may exceed the dense maximum of the lane); the
+        // lane maximum keeps the width of the reference for ordinary data.
+        let mut max_u = lane_max_u.clone();
+        for (_, b) in &value_map.items {
+            if let Bucket::Us(us) = b {
+                if let Some(last) = us.last() {
+                    if last > max_u {
+                        max_u = last;
+                    }
+                }
+            }
+        }
+        let width = width_for(&max_u);
+        let too_wide = || Error::Value("posting u exceeds the posting width".into());
         let mut items: Vec<&(Val, Bucket)> = value_map.items.iter().collect();
         crate::val::py_sort_keys(&mut items, |kv| &kv.0);
         let mut postings: Vec<u8> = Vec::new();
@@ -614,10 +818,45 @@ impl Db {
             let (w, raw): (u8, Vec<u8>) = match bucket {
                 Bucket::Ft(e) => (PAYLOAD_FULLTEXT_POSITIONS, textindex::encode_fulltext_posting(e)?),
                 Bucket::Doc(e) => (PAYLOAD_FULLTEXT_DOCLENS, textindex::encode_fulltext_doc_lengths(e)?),
-                Bucket::Us(us) => match width {
-                    4 => (4, us.iter().flat_map(|u| (u.as_u64().unwrap() as u32).to_le_bytes()).collect()),
-                    8 => (8, us.iter().flat_map(|u| u.as_u64().unwrap().to_le_bytes()).collect()),
-                    _ => (0, encode_big_posting(us)?),
+                Bucket::Us(UList::Tiny(us)) if width == 4 || width == 8 => {
+                    let mut raw = Vec::with_capacity(us.len() * width as usize);
+                    for &x in us {
+                        if width == 4 {
+                            raw.extend_from_slice(&x.to_le_bytes());
+                        } else {
+                            raw.extend_from_slice(&(x as u64).to_le_bytes());
+                        }
+                    }
+                    (width, raw)
+                }
+                Bucket::Us(UList::Small(us)) if width == 4 || width == 8 => {
+                    let mut raw = Vec::with_capacity(us.len() * width as usize);
+                    for &x in us {
+                        if width == 4 {
+                            raw.extend_from_slice(&u32::try_from(x).map_err(|_| too_wide())?.to_le_bytes());
+                        } else {
+                            raw.extend_from_slice(&x.to_le_bytes());
+                        }
+                    }
+                    (width, raw)
+                }
+                Bucket::Us(us) => match (width, us) {
+                    (4, UList::Big(us)) => {
+                        let mut raw = Vec::with_capacity(us.len() * 4);
+                        for u in us {
+                            let x = u.as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(too_wide)?;
+                            raw.extend_from_slice(&x.to_le_bytes());
+                        }
+                        (4, raw)
+                    }
+                    (8, UList::Big(us)) => {
+                        let mut raw = Vec::with_capacity(us.len() * 8);
+                        for u in us {
+                            raw.extend_from_slice(&u.as_u64().ok_or_else(too_wide)?.to_le_bytes());
+                        }
+                        (8, raw)
+                    }
+                    (_, us) => (0, encode_big_posting(&us.to_nats())?),
                 },
             };
             let comp = crate::zlib::compress(&raw, 1);
@@ -649,7 +888,67 @@ impl Db {
     /// A lane with any data blocks (even only sparse or
     /// deletes) always receives a SECONDARY block, so that indexes of
     /// pure sparse realms also become fresh.
+    /// I001: estimated memory of the posting lists of one index during the
+    /// build – one reference per dense record and per sparse u group of its
+    /// realm (exact for VALUE indexes; a lower bound for TOKEN, TRIGRAM and
+    /// FULLTEXT, which can produce several references per record).
+    pub(crate) fn index_build_estimate(&self, idx: &IndexDef) -> u64 {
+        let mut refs = 0u64;
+        let mut per_ref = 10u64;
+        for lane in [0u8, 1] {
+            let key = (idx.realm_id.clone(), lane);
+            if let Some(d) = self.dense.get(&key) {
+                refs = refs.saturating_add(d.segs.iter().map(|s| s.count).sum::<u64>());
+            }
+            if let Some(sp) = self.sparse.get(&key) {
+                refs = refs.saturating_add(sp.segs.iter().map(|s| s.group_count).sum::<u64>());
+            }
+            if let Some(m) = self.max_u.get(&key) {
+                per_ref = per_ref.max(ref_bytes_estimate(m));
+            }
+        }
+        refs.saturating_mul(per_ref)
+    }
+
+    /// I001: splits the selected indexes into scan passes. All indexes of a
+    /// pass are built from one scan and held in memory together, so a pass
+    /// may use at most half of the physical memory; consecutive indexes are
+    /// grouped (order kept). Normally that is a single pass, as before; only
+    /// for very large databases the build falls back to fewer indexes per
+    /// scan. An index that alone would need more than the physical memory
+    /// is refused with `Error::Memory` before anything is read or written.
+    fn plan_index_passes(&self, selected: &[IndexDef]) -> Result<Vec<Vec<IndexDef>>> {
+        let Some(phys) = self.index_build_memory_override.or_else(super::columns::physical_memory_bytes) else {
+            return Ok(vec![selected.to_vec()]);
+        };
+        let limit = phys / 2;
+        let mut passes: Vec<Vec<IndexDef>> = Vec::new();
+        let (mut cur, mut cur_bytes): (Vec<IndexDef>, u64) = (Vec::new(), 0);
+        for idx in selected {
+            let need = self.index_build_estimate(idx);
+            if need > phys {
+                return Err(Error::Memory(format!(
+                    "build_indexes: index '{}' would need about {} MiB of memory during the build, more than the physical memory ({} MiB)",
+                    idx.name,
+                    need >> 20,
+                    phys >> 20
+                )));
+            }
+            if !cur.is_empty() && cur_bytes.saturating_add(need) > limit {
+                passes.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur.push(idx.clone());
+            cur_bytes = cur_bytes.saturating_add(need);
+        }
+        if !cur.is_empty() {
+            passes.push(cur);
+        }
+        Ok(passes)
+    }
+
     pub fn build_indexes(&mut self, index_ids: Option<&[u64]>, commit: bool) -> Result<Val> {
+        self.check_open()?;
         let selected: Vec<IndexDef> = match index_ids {
             None => self.index_defs.values().cloned().collect(),
             Some(ids) => ids
@@ -663,50 +962,63 @@ impl Db {
             }
             return Ok(vmap! {"scan_s" => 0.0, "persist_s" => 0.0, "total_s" => 0.0, "records_scanned" => 0i64, "indexes" => Val::List(vec![])});
         }
-        let t0 = Instant::now();
-        let (maps, dense_scanned, sparse_groups) = self.build_maps(&selected)?;
-        let scan_s = t0.elapsed().as_secs_f64();
-        let t1 = Instant::now();
+        let passes = self.plan_index_passes(&selected)?;
+        let (mut scan_s, mut persist_s) = (0.0f64, 0.0f64);
+        let (mut dense_scanned, mut sparse_groups) = (0u64, 0u64);
+        let mut scanned_realms: HashSet<Nat> = HashSet::new();
         let mut stats = Vec::new();
-        for idx in &selected {
-            for lane in [0u8, 1] {
-                let rk = (idx.realm_id.clone(), lane);
-                let sk = (idx.index_id, lane);
-                let has_data = self.data_max_block_id_by_lane.get(&rk).copied().unwrap_or(0) > 0;
-                if !has_data && !self.secondary_blocks.contains_key(&sk) {
-                    continue;
-                }
-                let source = self.data_max_block_id_by_lane.get(&rk).copied().unwrap_or(0);
-                let max_u = self.max_u.get(&rk).cloned().unwrap_or_default();
-                let vm = &maps[&sk];
-                let (off, bid, nbytes) = self.persist_secondary(idx, vm, source, lane, &max_u)?;
-                let mut row = vmap! {
-                    "index_id" => idx.index_id as i64, "name" => idx.name.as_str(), "kind" => idx.kind.name(),
-                    "lane" => lane as i64, "lane_name" => lane_name(lane),
-                };
-                if idx.kind == IndexKind::Fulltext {
-                    let docs = vm.get(FULLTEXT_DOCLEN_KEY).map(|b| b.len()).unwrap_or(0);
-                    let has_doc = vm.get(FULLTEXT_DOCLEN_KEY).is_some();
-                    let refs: usize = vm.items.iter().filter(|(k, _)| k.as_str() != Some(FULLTEXT_DOCLEN_KEY)).map(|(_, b)| b.len()).sum();
-                    row.set("distinct_values", Val::Int(vm.items.len() as i64 - has_doc as i64));
-                    row.set("u_references", Val::Int(refs as i64));
-                    row.set("block_offset", Val::Int(off as i64));
-                    row.set("block_id", Val::Int(bid as i64));
-                    row.set("payload_bytes", Val::Int(nbytes as i64));
-                    row.set("documents", Val::Int(docs as i64));
-                } else {
-                    let refs: usize = vm.items.iter().map(|(_, b)| b.len()).sum();
-                    row.set("distinct_values", Val::Int(vm.items.len() as i64));
-                    row.set("u_references", Val::Int(refs as i64));
-                    row.set("block_offset", Val::Int(off as i64));
-                    row.set("block_id", Val::Int(bid as i64));
-                    row.set("payload_bytes", Val::Int(nbytes as i64));
-                }
-                stats.push(row);
+        for pass in &passes {
+            let t0 = Instant::now();
+            let (maps, pass_dense, pass_sparse) = self.build_maps(pass)?;
+            scan_s += t0.elapsed().as_secs_f64();
+            // a realm scanned again in a later pass is not counted twice
+            let new_realm = pass.iter().fold(false, |acc, i| scanned_realms.insert(i.realm_id.clone()) | acc);
+            if new_realm {
+                dense_scanned += pass_dense;
+                sparse_groups += pass_sparse;
             }
+            let t1 = Instant::now();
+            for idx in pass {
+                for lane in [0u8, 1] {
+                    let rk = (idx.realm_id.clone(), lane);
+                    let sk = (idx.index_id, lane);
+                    let has_data = self.data_max_block_id_by_lane.get(&rk).copied().unwrap_or(0) > 0;
+                    if !has_data && !self.secondary_blocks.contains_key(&sk) {
+                        continue;
+                    }
+                    let source = self.data_max_block_id_by_lane.get(&rk).copied().unwrap_or(0);
+                    let max_u = self.max_u.get(&rk).cloned().unwrap_or_default();
+                    let vm = &maps[&sk];
+                    let (off, bid, nbytes) = self.persist_secondary(idx, vm, source, lane, &max_u)?;
+                    let mut row = vmap! {
+                        "index_id" => idx.index_id as i64, "name" => idx.name.as_str(), "kind" => idx.kind.name(),
+                        "lane" => lane as i64, "lane_name" => lane_name(lane),
+                    };
+                    if idx.kind == IndexKind::Fulltext {
+                        let docs = vm.get(FULLTEXT_DOCLEN_KEY).map(|b| b.len()).unwrap_or(0);
+                        let has_doc = vm.get(FULLTEXT_DOCLEN_KEY).is_some();
+                        let refs: usize = vm.items.iter().filter(|(k, _)| k.as_str() != Some(FULLTEXT_DOCLEN_KEY)).map(|(_, b)| b.len()).sum();
+                        row.set("distinct_values", Val::Int(vm.items.len() as i64 - has_doc as i64));
+                        row.set("u_references", Val::Int(refs as i64));
+                        row.set("block_offset", Val::Int(off as i64));
+                        row.set("block_id", Val::Int(bid as i64));
+                        row.set("payload_bytes", Val::Int(nbytes as i64));
+                        row.set("documents", Val::Int(docs as i64));
+                    } else {
+                        let refs: usize = vm.items.iter().map(|(_, b)| b.len()).sum();
+                        row.set("distinct_values", Val::Int(vm.items.len() as i64));
+                        row.set("u_references", Val::Int(refs as i64));
+                        row.set("block_offset", Val::Int(off as i64));
+                        row.set("block_id", Val::Int(bid as i64));
+                        row.set("payload_bytes", Val::Int(nbytes as i64));
+                    }
+                    stats.push(row);
+                }
+            }
+            drop(maps);
+            persist_s += t1.elapsed().as_secs_f64();
         }
         self.store.flush()?;
-        let persist_s = t1.elapsed().as_secs_f64();
         {
             let c = self.caches.get_mut().unwrap_or_else(|e| e.into_inner());
             c.postings.clear();
@@ -720,6 +1032,7 @@ impl Db {
             "scan_s" => scan_s, "persist_s" => persist_s, "total_s" => scan_s + persist_s,
             "records_scanned" => (dense_scanned + sparse_groups) as i64,
             "scan_detail" => vmap! {"dense_records_scanned" => dense_scanned as i64, "sparse_groups_scanned" => sparse_groups as i64},
+            "passes" => passes.len() as i64,
             "indexes" => Val::List(stats),
         })
     }
@@ -741,6 +1054,7 @@ impl Db {
 
     fn read_payload(&self, r: &PostingRef) -> Result<Vec<u8>> {
         let comp = self.store.read_vec(r.abs_offset, r.compressed_len as usize)?;
+        // R010: `decompress` is bounded by deflate's maximum ratio
         crate::zlib::decompress(&comp).map_err(|e| Error::Corruption(format!("Index payload zlib-corrupt: {e}")))
     }
 
@@ -767,7 +1081,9 @@ impl Db {
             return Err(Error::Corruption("Posting count mismatch".into()));
         }
         let arc = Arc::new(list);
-        self.cache().postings.insert(ck, arc.clone());
+        let mut c = self.cache();
+        let c = &mut *c;
+        super::blockcache::bounded_insert(&mut c.postings, &mut c.used.postings, ck, arc.clone(), |v| v.len(), super::blockcache::POSTINGS_BUDGET, usize::MAX);
         Ok(arc)
     }
 
@@ -780,6 +1096,7 @@ impl Db {
 
     /// `fulltext_term_posting(index_id, term, lane=…)`
     pub fn fulltext_term_posting(&self, index_id: u64, term: &str, lane: Lane) -> Result<Arc<Vec<FtPosting>>> {
+        self.check_open()?;
         self.require_fulltext(index_id)?;
         let ck = (index_id, lane, term.to_string());
         if let Some(c) = self.cache().ft_postings.get(&ck) {
@@ -799,12 +1116,15 @@ impl Db {
             }
         };
         let arc = Arc::new(out);
-        self.cache().ft_postings.insert(ck, arc.clone());
+        let mut c = self.cache();
+        let c = &mut *c;
+        super::blockcache::bounded_insert(&mut c.ft_postings, &mut c.used.ft_postings, ck, arc.clone(), |v| v.len(), super::blockcache::FT_POSTINGS_BUDGET, usize::MAX);
         Ok(arc)
     }
 
     /// `fulltext_corpus(index_id, lane=…)`
     pub fn fulltext_corpus(&self, index_id: u64, lane: Lane) -> Result<Arc<FtCorpus>> {
+        self.check_open()?;
         self.require_fulltext(index_id)?;
         if let Some(c) = self.cache().ft_corpus.get(&(index_id, lane)) {
             return Ok(c.clone());
@@ -839,27 +1159,46 @@ impl Db {
         Ok((out, self.fulltext_corpus(index_id, lane)?))
     }
 
+    /// Keys `k` with `lo <= k <= hi` under the scan semantics
+    /// (`match_raw(k, "between", lo, hi)`): incomparable values (None, NaN,
+    /// other types) never match and never raise (F025).
     fn range_keys(&self, index_id: u64, lane: Lane, lo: &Val, hi: &Val) -> Result<Vec<Val>> {
         let keys = self.secondary_keys_sorted(index_id, lane)?;
-        let cmp = |a: &Val, b: &Val| crate::val::py_cmp(a, b).ok_or_else(|| Error::Type("Range filter does not match the index type".into()));
-        // bisect_left(keys, lo), bisect_right(keys, hi)
-        let mut a = 0usize;
-        let mut b = keys.len();
-        while a < b {
-            let m = (a + b) / 2;
-            if cmp(&keys[m], lo)? == Ordering::Less { a = m + 1 } else { b = m }
+        let c = range_class(lo);
+        if c >= 3 || range_class(hi) != c {
+            // Unusual bounds (None, NaN, lists, mixed classes): evaluate the
+            // scan predicate on every key.
+            let mut out = Vec::new();
+            for k in keys.iter() {
+                if crate::query::match_raw(k, "between", lo, hi)? {
+                    out.push(k.clone());
+                }
+            }
+            return Ok(out);
         }
-        let start = a;
-        let (mut a, mut b) = (0usize, keys.len());
-        while a < b {
-            let m = (a + b) / 2;
-            if cmp(hi, &keys[m])? == Ordering::Less { b = m } else { a = m + 1 }
+        let first = keys.partition_point(|k| range_class(k) < c);
+        let last = keys.partition_point(|k| range_class(k) <= c);
+        let seg = &keys[first..last];
+        let cmp = |a: &Val, b: &Val| crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal);
+        let start = seg.partition_point(|k| cmp(k, lo) == Ordering::Less);
+        let end = seg.partition_point(|k| cmp(hi, k) != Ordering::Less);
+        Ok(if end > start { seg[start..end].to_vec() } else { Vec::new() })
+    }
+
+    /// Keys equal to `value` under Python equality (F045: NaN never matches).
+    fn eq_keys(&self, dir: &SecondaryDir, value: &Val) -> Vec<Val> {
+        if contains_nan(value) {
+            return Vec::new();
         }
-        Ok(if a > start { keys[start..a].to_vec() } else { Vec::new() })
+        match value {
+            Val::List(_) | Val::Map(_) => dir.entries.iter().filter(|e| &e.value == value).map(|e| e.value.clone()).collect(),
+            _ => dir.by_key.get(&ValKey(value.clone())).map(|&i| vec![dir.entries[i].value.clone()]).unwrap_or_default(),
+        }
     }
 
     /// `posting_count`: exact cardinality from directory metadata.
     pub fn posting_count(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<u64> {
+        self.check_open()?;
         let dir = self.secondary_dir(index_id, lane)?;
         Ok(match cond {
             Cond::Range(lo, hi) => self
@@ -867,27 +1206,28 @@ impl Db {
                 .iter()
                 .map(|k| dir.by_key.get(&ValKey(k.clone())).map(|&i| dir.entries[i].raw_count).unwrap_or(0))
                 .sum(),
-            Cond::Eq(v) => dir.by_key.get(&ValKey(v.clone())).map(|&i| dir.entries[i].raw_count).unwrap_or(0),
+            Cond::Eq(v) => self
+                .eq_keys(&dir, v)
+                .iter()
+                .map(|k| dir.by_key.get(&ValKey(k.clone())).map(|&i| dir.entries[i].raw_count).unwrap_or(0))
+                .sum(),
         })
     }
 
     pub(crate) fn posting_for_condition(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<Arc<Vec<Nat>>> {
-        match cond {
-            Cond::Eq(v) => self.load_posting(index_id, v, lane),
-            Cond::Range(lo, hi) => {
-                let matched = self.range_keys(index_id, lane, lo, hi)?;
-                match matched.len() {
-                    0 => Ok(Arc::new(Vec::new())),
-                    1 => self.load_posting(index_id, &matched[0], lane),
-                    _ => {
-                        let mut merged: Vec<Nat> = Vec::new();
-                        for v in &matched {
-                            merged.extend(self.load_posting(index_id, v, lane)?.iter().cloned());
-                        }
-                        merged.sort();
-                        Ok(Arc::new(merged))
-                    }
-                }
+        let matched = match cond {
+            Cond::Eq(v) => {
+                let dir = self.secondary_dir(index_id, lane)?;
+                self.eq_keys(&dir, v)
+            }
+            Cond::Range(lo, hi) => self.range_keys(index_id, lane, lo, hi)?,
+        };
+        match matched.len() {
+            0 => Ok(Arc::new(Vec::new())),
+            1 => self.load_posting(index_id, &matched[0], lane),
+            _ => {
+                let postings: Vec<Arc<Vec<Nat>>> = matched.iter().map(|v| self.load_posting(index_id, v, lane)).collect::<Result<_>>()?;
+                Ok(Arc::new(union_postings(&postings)))
             }
         }
     }
@@ -910,6 +1250,7 @@ impl Db {
 
     /// `index_candidate_estimate`
     pub fn index_candidate_estimate(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Val> {
+        self.check_open()?;
         let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
         let dir = self.secondary_dir(index_id, lane)?;
         let op = crate::unicode::lower(op);
@@ -974,6 +1315,7 @@ impl Db {
 
     /// `index_candidates`: sorted record u for an index predicate.
     pub fn index_candidates(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Vec<Nat>> {
+        self.check_open()?;
         let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
         if !self.index_is_fresh(index_id, lane) {
             return Err(Error::StaleIndex(format!("Index {}/{} is not fresh", Val::str(idx.name.as_str()).py_repr(), lane_name(lane))));
@@ -992,7 +1334,7 @@ impl Db {
         };
         match idx.kind {
             IndexKind::Value => match op.as_str() {
-                "eq" => Ok(self.load_posting(index_id, value, lane)?.to_vec()),
+                "eq" => Ok(self.posting_for_condition(index_id, &Cond::Eq(value.clone()), lane)?.to_vec()),
                 "between" => Ok(self.posting_for_condition(index_id, &Cond::Range(value.clone(), value2.clone()), lane)?.to_vec()),
                 _ => Err(Error::Schema(format!("VALUE index does not support operator {}", Val::str(op.as_str()).py_repr()))),
             },
@@ -1057,6 +1399,7 @@ impl Db {
 
     /// u values satisfying all filters (`find_u`, VALUE indexes only).
     pub fn find_u(&self, realm: &Nat, filters: &[(String, Cond)], lane: Lane, u_from: Option<&Nat>, u_to: Option<&Nat>) -> Result<Vec<Nat>> {
+        self.check_open()?;
         let key = (realm.clone(), lane);
         let mut postings: Vec<Arc<Vec<Nat>>> = Vec::new();
         for (name, cond) in filters {
@@ -1144,6 +1487,7 @@ impl Db {
         dyn_mode: Option<&str>,
         dyn_v: Option<&Nat>,
     ) -> Result<Vec<Val>> {
+        self.check_open()?;
         let mut out = Vec::new();
         for u in self.find_u(realm, filters, lane, u_from, u_to)? {
             if let Some(r) = self.get(realm, &u, lane, dyn_mode, dyn_v, true)? {
@@ -1151,5 +1495,114 @@ impl Db {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    /// I001: under memory pressure the build splits into scan passes with
+    /// identical postings; an index that cannot fit is refused before
+    /// anything is written.
+    #[test]
+    fn build_passes_follow_the_memory_budget_i001() {
+        use crate::address::NL;
+        use crate::codec::{FieldDef, TypeCode};
+        use crate::db::dense::DenseRows;
+        use crate::db::OpenOptions;
+        let d = std::env::temp_dir().join(format!("nhydb_i001_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let r = Nat::S(1);
+        let mut db = Db::create(d.join("i.nhydb"), true, OpenOptions::default()).unwrap();
+        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
+        let fields = ["a", "b", "c"].iter().enumerate().map(|(i, n)| FieldDef::new(Nat::S(i as u64 + 1), *n, TypeCode::VarUInt)).collect();
+        db.create_shape(1, &r, "s", fields, "").unwrap();
+        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
+        for (id, v) in [(1u64, 1i64), (2, 2), (3, 3)] {
+            db.create_index(id, &r, ["a", "b", "c"][id as usize - 1], &Val::Int(v), "").unwrap();
+        }
+        let rows: Vec<Vec<Val>> = (1..=2000u64).map(|u| vec![Val::Int((u % 7) as i64), Val::Int((u % 13) as i64), Val::Int((u % 101) as i64)]).collect();
+        db.put_dense_batch(&r, &Nat::S(1), &DenseRows::Tuples(&rows), Some(1), &[], NL, true).unwrap();
+        // every index: 2000 references x 10 bytes
+        assert_eq!(db.index_build_estimate(&db.index_defs[&1].clone()), 20_000);
+        let finds = |db: &Db| -> Vec<Vec<Nat>> {
+            [("a", 3i64), ("b", 5), ("c", 42)]
+                .iter()
+                .map(|(f, v)| db.find_u(&r, &[(f.to_string(), Cond::Eq(Val::Int(*v)))], NL, None, None).unwrap())
+                .collect()
+        };
+        let one = db.build_indexes(None, true).unwrap();
+        assert_eq!(one.get("passes"), Some(&Val::Int(1)));
+        let want = finds(&db);
+        assert_eq!(want[0].len(), 286);
+        // half of 50 000 bytes holds one index per pass
+        db.index_build_memory_override = Some(50_000);
+        let three = db.build_indexes(None, true).unwrap();
+        assert_eq!(three.get("passes"), Some(&Val::Int(3)));
+        assert_eq!(three.get("records_scanned"), one.get("records_scanned"));
+        assert_eq!(finds(&db), want);
+        // one index alone needs more than the assumed memory: refused, nothing written
+        db.index_build_memory_override = Some(15_000);
+        let len = db.store.len();
+        assert!(matches!(db.build_indexes(None, true), Err(Error::Memory(_))));
+        assert_eq!(db.store.len(), len);
+        assert_eq!(finds(&db), want);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn big(shift: u32, add: u64) -> Nat {
+        Nat::from_bigint(&((num_bigint::BigInt::from(1u8) << shift) + add)).unwrap()
+    }
+
+    /// P014: the u64 union equals the general `Nat` union; a single u > 2^64
+    /// switches to the exact path.
+    #[test]
+    fn union_postings_small_and_big() {
+        let a = Arc::new(vec![Nat::S(1), Nat::S(5), Nat::S(9), Nat::S(u64::MAX)]);
+        let b = Arc::new(vec![Nat::S(2), Nat::S(5), Nat::S(u32::MAX as u64 + 3)]);
+        let c = Arc::new(Vec::new());
+        let got = union_postings(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(got, vec![Nat::S(1), Nat::S(2), Nat::S(5), Nat::S(9), Nat::S(u32::MAX as u64 + 3), Nat::S(u64::MAX)]);
+        let d = Arc::new(vec![Nat::S(3), big(64, 0), big(70, 1)]);
+        let got = union_postings(&[d, a, b, c]);
+        assert_eq!(got.len(), 9);
+        assert!(got.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(got[6], Nat::S(u64::MAX));
+        assert_eq!(got[7], big(64, 0));
+        assert_eq!(got[8], big(70, 1));
+    }
+
+    /// P020: build lists stay `u64` until the first u > 2^64, keep order and
+    /// produce the same values as `Nat` lists.
+    #[test]
+    fn ulist_upgrades_exactly() {
+        let mut l = UList::default();
+        for u in [Nat::S(7), Nat::S(3), Nat::S(u32::MAX as u64)] {
+            l.push(&u).unwrap();
+        }
+        assert!(matches!(l, UList::Tiny(_)));
+        l.push(&Nat::S(u64::MAX)).unwrap();
+        assert!(matches!(l, UList::Small(_)));
+        assert_eq!(l.last(), Some(Nat::S(u64::MAX)));
+        l.push(&big(64, 5)).unwrap();
+        l.push(&Nat::S(1)).unwrap();
+        assert!(matches!(l, UList::Big(_)));
+        assert_eq!(l.len(), 6);
+        l.sort_check();
+        assert_eq!(l.to_nats(), vec![Nat::S(1), Nat::S(3), Nat::S(7), Nat::S(u32::MAX as u64), Nat::S(u64::MAX), big(64, 5)]);
+        // straight from u32 to BigInt
+        let mut t = UList::default();
+        t.push(&Nat::S(9)).unwrap();
+        t.push(&big(70, 1)).unwrap();
+        assert!(matches!(t, UList::Big(_)));
+        assert_eq!(t.to_nats(), vec![Nat::S(9), big(70, 1)]);
+        let mut w = UList::Tiny(vec![9, 2, 4]);
+        w.sort_check();
+        assert_eq!(w.to_nats(), vec![Nat::S(2), Nat::S(4), Nat::S(9)]);
+        let mut s = UList::Small(vec![9, 2, 4]);
+        s.sort_check();
+        assert_eq!(s.to_nats(), vec![Nat::S(2), Nat::S(4), Nat::S(9)]);
     }
 }

@@ -165,12 +165,39 @@ pub fn int_like(v: &Val) -> Option<BigInt> {
             use num_traits::FromPrimitive;
             BigInt::from_f64(f.trunc())
         }
-        Val::Str(s) => {
-            let t = s.trim().replace('_', "");
-            BigInt::parse_bytes(t.as_bytes(), 10)
-        }
+        Val::Str(s) => parse_py_int(s),
         _ => None,
     }
+}
+
+/// Python `int(str)` (base 10): surrounding Unicode whitespace, optional
+/// sign, Unicode decimal digits, single underscores only between digits
+/// (F031: `'1__0'`, `'_5'`, `'5_'` are rejected like in Python).
+pub fn parse_py_int(s: &str) -> Option<BigInt> {
+    let t = crate::unicode::strip(s);
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'+') => (false, &t[1..]),
+        Some(b'-') => (true, &t[1..]),
+        _ => (false, t),
+    };
+    let mut digits = String::with_capacity(body.len());
+    let mut after_digit = false;
+    for c in body.chars() {
+        if c == '_' {
+            if !after_digit {
+                return None;
+            }
+            after_digit = false;
+            continue;
+        }
+        digits.push((b'0' + crate::unicode::decimal_value(c)?) as char);
+        after_digit = true;
+    }
+    if !after_digit {
+        return None;
+    }
+    let v = BigInt::parse_bytes(digits.as_bytes(), 10)?;
+    Some(if neg { -v } else { v })
 }
 
 fn value_error_fit(f: &FieldDef, value: &Val) -> Error {
@@ -205,7 +232,7 @@ pub fn encode_value(f: &FieldDef, value: &Val, out: &mut Vec<u8>) -> Result<()> 
 pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -> Result<()> {
     match typ {
         TypeCode::F32 => {
-            let x = float_like(value).ok_or_else(|| value_error_fit(f, value))?;
+            let x = float_like(f, value)?;
             let y = x as f32;
             if x.is_finite() && y.is_infinite() {
                 return Err(value_error_fit(f, value));
@@ -213,7 +240,7 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
             out.extend_from_slice(&y.to_le_bytes());
         }
         TypeCode::F64 => {
-            let x = float_like(value).ok_or_else(|| value_error_fit(f, value))?;
+            let x = float_like(f, value)?;
             out.extend_from_slice(&x.to_le_bytes());
         }
         TypeCode::Bool => out.push(value.is_truthy() as u8),
@@ -239,6 +266,10 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
             }
         }
         TypeCode::Utf8 => {
+            if let Val::Bytes(_) = value {
+                // F039: Python's str(b'x') would silently store "b'x'"
+                return Err(Error::Type(format!("{}: utf8 field expects str, not bytes", f.name)));
+            }
             let s = value.py_str();
             put_vu64(out, s.len() as u64);
             out.extend_from_slice(s.as_bytes());
@@ -250,10 +281,28 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
                     out.extend_from_slice(b);
                     return Ok(());
                 }
-                Val::Int(n) if *n >= 0 => vec![0u8; *n as usize],
-                Val::Int(_) => return Err(Error::Value("negative count".into())),
+                Val::Bool(_) | Val::Int(_) | Val::Big(_) => {
+                    // Python `bytes(n)`: n zero bytes (F023: bounded, fallible)
+                    let n = int_like(value).unwrap_or_default();
+                    if n.sign() == Sign::Minus {
+                        return Err(Error::Value("negative count".into()));
+                    }
+                    let n = n.to_u64().filter(|n| *n <= BYTES_FROM_COUNT_MAX).ok_or_else(|| {
+                        Error::Value(format!(
+                            "{}: bytes({}) exceeds the limit of {} zero bytes for an integer count",
+                            f.name,
+                            value.py_repr(),
+                            BYTES_FROM_COUNT_MAX
+                        ))
+                    })? as usize;
+                    reserve(out, n.saturating_add(10))?;
+                    put_vu64(out, n as u64);
+                    out.resize(out.len() + n, 0);
+                    return Ok(());
+                }
                 Val::List(l) => {
-                    let mut v = Vec::with_capacity(l.len());
+                    let mut v = Vec::new();
+                    reserve(&mut v, l.len())?;
                     for x in l {
                         match x.as_i64() {
                             Some(b) if (0..=255).contains(&b) => v.push(b as u8),
@@ -289,14 +338,30 @@ pub fn encode_raw(f: &FieldDef, typ: TypeCode, value: &Val, out: &mut Vec<u8>) -
     Ok(())
 }
 
-fn float_like(v: &Val) -> Option<f64> {
-    match v {
-        Val::Bool(b) => Some(*b as i64 as f64),
-        Val::Int(i) => Some(*i as f64),
-        Val::Big(b) => b.to_f64(),
-        Val::Float(f) => Some(*f),
-        _ => None,
+/// `float(value)` for f32/f64 fields. Integers whose conversion is not
+/// finite raise `ValueError` instead of silently becoming `inf` (F039;
+/// Python's `struct.pack` raises `OverflowError` here).
+fn float_like(f: &FieldDef, v: &Val) -> Result<f64> {
+    let x = match v {
+        Val::Bool(b) => *b as i64 as f64,
+        Val::Int(i) => *i as f64,
+        Val::Big(b) => b.to_f64().unwrap_or(f64::INFINITY),
+        Val::Float(x) => return Ok(*x),
+        _ => return Err(value_error_fit(f, v)),
+    };
+    if !x.is_finite() {
+        return Err(Error::Value(format!("{}: int too large to convert to float", f.name)));
     }
+    Ok(x)
+}
+
+/// Largest `n` accepted for `bytes(n)` on a bytes field (1 GiB). Larger
+/// zero-filled values can still be stored explicitly as `b"\0" * n`.
+pub const BYTES_FROM_COUNT_MAX: u64 = 1 << 30;
+
+/// Fallible reservation: allocation failure becomes an exception, never an abort.
+fn reserve(v: &mut Vec<u8>, extra: usize) -> Result<()> {
+    v.try_reserve(extra).map_err(|_| Error::Memory(format!("cannot allocate {extra} bytes for a value")))
 }
 
 /// Decodes a value (including reverse enum mapping) starting at `*pos`.
@@ -321,11 +386,10 @@ pub fn enum_from_raw(f: &FieldDef, raw: Val) -> Val {
 
 pub fn decode_raw(f: &FieldDef, typ: TypeCode, buf: &[u8], pos: &mut usize) -> Result<Val> {
     if let Some(size) = typ.fixed_size() {
-        let end = *pos + size;
-        if end > buf.len() {
+        let end = pos.checked_add(size).filter(|e| *e <= buf.len()).ok_or_else(|| {
             let _ = &f.name;
-            return Err(Error::Corruption("fixed-width value incomplete".into()));
-        }
+            Error::Corruption("fixed-width value incomplete".into())
+        })?;
         let b = &buf[*pos..end];
         *pos = end;
         return Ok(match typ {
@@ -382,11 +446,12 @@ pub fn skip_value(f: &FieldDef, buf: &[u8], pos: &mut usize) -> Result<()> {
 /// error message only.
 pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() -> String) -> Result<()> {
     if let Some(size) = typ.fixed_size() {
-        if *pos + size > buf.len() {
+        let end = pos.checked_add(size).filter(|e| *e <= buf.len());
+        let Some(end) = end else {
             let _ = name;
             return Err(Error::Corruption("fixed-width value incomplete".into()));
-        }
-        *pos += size;
+        };
+        *pos = end;
         return Ok(());
     }
     match typ {
@@ -434,6 +499,57 @@ mod tests {
         let r = decode_value(&f, &out, &mut p).unwrap();
         assert_eq!(p, out.len());
         r
+    }
+
+    fn enc(t: TypeCode, v: &Val) -> Result<Vec<u8>> {
+        let f = FieldDef::new(Nat::ONE, "x", t);
+        let mut out = Vec::new();
+        encode_value(&f, v, &mut out).map(|_| out)
+    }
+
+    #[test]
+    fn stab_codec_limits() {
+        // F023: bytes(n) bounded, never an abort
+        assert_eq!(rt(TypeCode::Bytes, Val::Int(3)), Val::Bytes(vec![0, 0, 0]));
+        assert_eq!(rt(TypeCode::Bytes, Val::Bool(true)), Val::Bytes(vec![0]));
+        for n in [Val::Int(1 << 62), Val::Int(i64::MAX), Val::Big(BigInt::from(1u8) << 80), Val::Int((1 << 30) + 1)] {
+            assert!(matches!(enc(TypeCode::Bytes, &n), Err(Error::Value(_))), "{n:?}");
+        }
+        assert!(matches!(enc(TypeCode::Bytes, &Val::Int(-1)), Err(Error::Value(_))));
+        // F039: non-finite float from an integer, bytes into utf8
+        let huge = Val::Big(BigInt::from(1u8) << 2000);
+        assert!(matches!(enc(TypeCode::F64, &huge), Err(Error::Value(_))));
+        assert!(matches!(enc(TypeCode::F32, &huge), Err(Error::Value(_))));
+        assert!(matches!(enc(TypeCode::F32, &Val::Big(BigInt::from(1u8) << 200)), Err(Error::Value(_))));
+        assert_eq!(rt(TypeCode::F64, Val::Float(f64::INFINITY)), Val::Float(f64::INFINITY));
+        assert_eq!(rt(TypeCode::F64, Val::Big(BigInt::from(1u8) << 1000)), Val::Float(2f64.powi(1000)));
+        assert!(matches!(enc(TypeCode::Utf8, &Val::Bytes(b"x".to_vec())), Err(Error::Type(_))));
+        assert_eq!(rt(TypeCode::Utf8, Val::Int(5)), Val::str("5"));
+        // F041: position overflow → corruption, not a panic
+        let f = FieldDef::new(Nat::ONE, "x", TypeCode::U8);
+        for t in ALL_TYPES {
+            let mut p = usize::MAX;
+            assert!(decode_raw(&f, t, b"abc", &mut p).is_err());
+            let mut p = usize::MAX;
+            assert!(skip_raw(t, b"abc", &mut p, || "x".into()).is_err());
+        }
+        // F014: varuint/varint beyond the former decoder limit
+        for bits in [16_380u32, 16_400, 100_000, 1_000_000] {
+            let big = BigInt::from(1u8) << bits;
+            assert_eq!(rt(TypeCode::VarUInt, Val::Big(big.clone() + 1)), Val::Big(big.clone() + 1));
+            assert_eq!(rt(TypeCode::VarInt, Val::Big(-big.clone() - 1)), Val::Big(-big - 1));
+        }
+    }
+
+    #[test]
+    fn python_int_strings_f031() {
+        let ok = [("10", 10), (" +1_0 ", 10), ("-0", 0), ("007", 7), ("0_0", 0), ("\u{0665}", 5), ("1_000_000", 1_000_000)];
+        for (s, v) in ok {
+            assert_eq!(parse_py_int(s), Some(BigInt::from(v)), "{s:?}");
+        }
+        for s in ["1__0", "_5", "5_", "", "+", "-_1", "1.0", "0x10", "1 0", "--1"] {
+            assert_eq!(parse_py_int(s), None, "{s:?}");
+        }
     }
 
     #[test]

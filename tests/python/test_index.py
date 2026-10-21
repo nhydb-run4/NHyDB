@@ -44,7 +44,8 @@ def test_stale_index_is_detected_and_rebuilt(sample_db):
     sample_db.commit()
     with pytest.raises(nhydb.StaleIndexError):
         sample_db.index_candidates(1, "eq", "active", None)
-    assert not sample_db.verify()["ok"]
+    v = sample_db.verify()  # F054: a stale index is a warning, not a structural error
+    assert v["ok"] and any("stale" in w for w in v["warnings"])
     sample_db.build_indexes(commit=True)
     assert list(sample_db.index_candidates(1, "eq", "active", None))[-1] == 101
     assert sample_db.verify()["ok"]

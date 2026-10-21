@@ -73,4 +73,23 @@ def create(path, **kwargs):
     return NHyDB.create(path, **kwargs)
 
 
-__all__ = [n for n in dir() if not n.startswith("_")]
+# Explicit export list (F052): ``open`` is deliberately not exported by
+# ``from nhydb import *`` so that it cannot shadow the builtin ``open``;
+# use ``nhydb.open(...)``.
+__all__ = [
+    "NHyDB", "LayoutDef", "IndexDef", "QueryEngine", "MathLayoutState",
+    "NHyDBError", "CorruptionError", "SchemaError", "StaleIndexError",
+    "RealmLimitError", "AddressError", "DatabaseLockedError",
+    "DatabaseSizeLimitError", "IndexConfigError", "MathLayoutError",
+    "MathLayoutNotFound", "MappingFrozenError", "MathCellConflictError",
+    "MathError", "MathSyntaxError", "MathDomainError", "LayoutError",
+    "LayoutStateError", "RealmBudgetExceeded", "StalePlanError",
+    "AllocationConflictError", "QueryError", "QueryPlanError",
+    "QueryDomainError", "SQLSyntaxError",
+    "REALM_SPAN", "ENGINE_VERSION", "FILE_FORMAT_VERSION", "TYPE_CODES",
+    "normalize_lane", "lane_name", "validate_local_v", "realm_v_bounds",
+    "global_v", "split_global_v", "dynadron_address", "parse_n_reference",
+    "dynadron_n", "n_to_dynadron_address", "cell_address",
+    "enc_vu", "dec_vu", "enc_vi", "dec_vi",
+    "create",
+]

@@ -46,16 +46,56 @@ fn mapping_val(obj: &Bound<'_, PyAny>) -> PyResult<Val> {
     to_val(&d)
 }
 
+fn depth_error() -> PyErr {
+    crate::exceptions::QueryPlanError::new_err(q::depth_message())
+}
+
 /// Python expression object → `Expr` (`ensure_expr`).
+///
+/// Same-operator `&`/`|` chains (left-deep from Python operators) are
+/// collected iteratively into one n-ary node; every other nesting level
+/// counts against [`q::MAX_EXPR_DEPTH`] → `QueryPlanError` (F015).
 pub fn py_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
-    let tn = obj.get_type().name()?.to_string();
+    py_to_expr_at(obj, 0)
+}
+
+fn type_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(obj.get_type().name()?.to_string())
+}
+
+fn py_to_expr_at(obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr> {
+    if depth > q::MAX_EXPR_DEPTH {
+        return Err(depth_error());
+    }
+    let tn = type_name(obj)?;
     let attr = |n: &str| obj.getattr(n);
     let s = |n: &str| -> PyResult<String> { Ok(attr(n)?.str()?.to_string()) };
     Ok(match tn.as_str() {
-        "BoolExpr" => Expr::Bool {
-            op: s("op")?,
-            children: attr("children")?.try_iter()?.map(|c| py_to_expr(&c?)).collect::<PyResult<_>>()?,
-        },
+        "BoolExpr" => {
+            let op = s("op")?;
+            let mut children = Vec::new();
+            if op == "and" || op == "or" {
+                // Explicit stack, children in original left-to-right order.
+                let mut stack: Vec<Bound<'_, PyAny>> = attr("children")?.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+                stack.reverse();
+                while let Some(c) = stack.pop() {
+                    if type_name(&c)? == "BoolExpr" && c.getattr("op")?.str()?.to_string() == op {
+                        let mut kids: Vec<Bound<'_, PyAny>> = c.getattr("children")?.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+                        if !kids.is_empty() {
+                            kids.reverse();
+                            stack.extend(kids);
+                            continue;
+                        }
+                    }
+                    children.push(py_to_expr_at(&c, depth + 1)?);
+                }
+            } else {
+                for c in attr("children")?.try_iter()? {
+                    children.push(py_to_expr_at(&c?, depth + 1)?);
+                }
+            }
+            Expr::Bool { op, children }
+        }
         "FieldPredicate" => Expr::Field {
             name: s("name")?,
             op: s("op")?,
@@ -89,6 +129,17 @@ pub fn expr_to_py(py: Python<'_>, e: &Expr) -> PyResult<Py<PyAny>> {
 pub fn expr_to_py_ext(py: Python<'_>, e: &Expr, sql: bool) -> PyResult<Py<PyAny>> {
     let m = query_mod(py)?;
     Ok(match e {
+        Expr::Bool { op, children } if (op == "and" || op == "or") && children.len() > 2 => {
+            // n-ary chains come back as the left-deep binary objects that the
+            // Python operators (and the reference parser) build; iterative.
+            let bool_cls = m.getattr("BoolExpr")?;
+            let mut out = expr_to_py_ext(py, &children[0], sql)?;
+            for c in &children[1..] {
+                let rhs = expr_to_py_ext(py, c, sql)?;
+                out = bool_cls.call1((op.as_str(), PyTuple::new(py, [out, rhs])?))?.unbind();
+            }
+            out
+        }
         Expr::Bool { op, children } => {
             let kids: Vec<Py<PyAny>> = children.iter().map(|c| expr_to_py_ext(py, c, sql)).collect::<PyResult<_>>()?;
             m.getattr("BoolExpr")?.call1((op.as_str(), PyTuple::new(py, kids)?))?.unbind()
@@ -117,8 +168,15 @@ pub fn expr_to_py_ext(py: Python<'_>, e: &Expr, sql: bool) -> PyResult<Py<PyAny>
 /// `expr_from_spec` over Python objects (specifications may contain
 /// ready-made expression objects).
 pub fn spec_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
+    spec_to_expr_at(obj, 0)
+}
+
+fn spec_to_expr_at(obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<Expr> {
+    if depth > q::MAX_EXPR_DEPTH {
+        return Err(depth_error());
+    }
     if is_expr(obj)? {
-        return py_to_expr(obj);
+        return py_to_expr_at(obj, depth);
     }
     if let Ok(d) = obj.cast::<PyDict>() {
         if let Some(a) = d.get_item("all")? {
@@ -128,19 +186,16 @@ pub fn spec_to_expr(obj: &Bound<'_, PyAny>) -> PyResult<Expr> {
         }
         for op in ["and", "or"] {
             if let Some(items) = d.get_item(op)? {
-                let xs: Vec<Expr> = items.try_iter()?.map(|x| spec_to_expr(&x?)).collect::<PyResult<_>>()?;
-                let mut it = xs.into_iter();
-                let Some(mut out) = it.next() else {
-                    return Err(crate::exceptions::QueryPlanError::new_err(format!("{op} must not be empty")));
+                let mut xs: Vec<Expr> = items.try_iter()?.map(|x| spec_to_expr_at(&x?, depth + 1)).collect::<PyResult<_>>()?;
+                return match xs.len() {
+                    0 => Err(crate::exceptions::QueryPlanError::new_err(format!("{op} must not be empty"))),
+                    1 => Ok(xs.pop().unwrap()),
+                    _ => Ok(Expr::Bool { op: op.into(), children: xs }),
                 };
-                for x in it {
-                    out = if op == "and" { Expr::and(out, x) } else { Expr::or(out, x) };
-                }
-                return Ok(out);
             }
         }
         if let Some(x) = d.get_item("not")? {
-            return Ok(Expr::negate(spec_to_expr(&x)?));
+            return Ok(Expr::negate(spec_to_expr_at(&x, depth + 1)?));
         }
     }
     q::expr_from_spec(&to_val(obj).map_err(|_| crate::exceptions::QueryPlanError::new_err("query expression must be an object"))?).py()
@@ -192,14 +247,20 @@ pub struct PyQueryEngine {
 }
 
 impl PyQueryEngine {
-    fn run<T>(slf: &Bound<'_, Self>, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T>) -> PyResult<T> {
+    fn run<T: Send>(slf: &Bound<'_, Self>, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T> + Send) -> PyResult<T> {
         let py = slf.py();
         let this = slf.borrow();
         let dbb = this.db.bind(py).cast::<NHyDB>()?.clone();
         let dbr = dbb.borrow();
         let host: Py<PyAny> = slf.clone().into_any().unbind();
-        let eng = QueryEngine { db: &dbr.db, providers: &this.providers, host: Some(&host) };
-        f(&eng).py()
+        let (db, providers) = (&dbr.db, &this.providers);
+        // P009: GIL released during the evaluation; runtime providers
+        // (Python functions) re-acquire it for their call.
+        py.detach(|| {
+            let eng = QueryEngine { db, providers, host: Some(&host) };
+            f(&eng)
+        })
+        .py()
     }
 }
 
@@ -305,6 +366,7 @@ impl PyQueryEngine {
             explain: explain.map(|x| x.is_truthy()).transpose()?.unwrap_or(false),
             k1,
             b,
+            layout_id: None,
         };
         let r = Self::run(slf, |eng| eng.execute(&e, &opts))?;
         from_val(slf.py(), &r)
@@ -331,7 +393,7 @@ impl PyQueryEngine {
 
     /// `search(expr, *, realm=None, lane=0, select=None, limit=20, offset=0,
     /// explain=False, k1=1.2, b=0.75)`
-    #[pyo3(signature = (expr, *, realm=None, lane=None, select=None, limit=Some(20), offset=None, explain=None, k1=1.2, b=0.75))]
+    #[pyo3(signature = (expr, *, realm=None, lane=None, select=None, limit=Some(BigInt::from(20)), offset=None, explain=None, k1=1.2, b=0.75))]
     #[allow(clippy::too_many_arguments)]
     fn search(
         slf: &Bound<'_, Self>,
@@ -339,7 +401,7 @@ impl PyQueryEngine {
         realm: Option<&Bound<'_, PyAny>>,
         lane: Option<&Bound<'_, PyAny>>,
         select: Option<&Bound<'_, PyAny>>,
-        limit: Option<i64>,
+        limit: Option<BigInt>,
         offset: Option<&Bound<'_, PyAny>>,
         explain: Option<&Bound<'_, PyAny>>,
         k1: f64,
@@ -348,7 +410,8 @@ impl PyQueryEngine {
         let e = py_to_expr(expr)?;
         let (realm, lane) = (realm_arg(realm)?, lane_arg(lane)?);
         let sel = opt_val(select)?;
-        let lim = limit.map(Val::Int).unwrap_or(Val::None);
+        // F056: large Python ints are accepted like in `execute`.
+        let lim = limit.map(Val::from_bigint).unwrap_or(Val::None);
         let off = opt_val(offset)?.unwrap_or(Val::Int(0));
         let ex = explain.map(|x| x.is_truthy()).transpose()?.unwrap_or(false);
         let r = Self::run(slf, |eng| eng.search(&e, realm, lane, sel.as_ref(), &lim, &off, ex, k1, b))?;
@@ -567,7 +630,7 @@ pub fn rows_to_numpy(py: Python<'_>, result: &Val) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
     for name in &names {
         let col: Vec<Val> = rows.iter().map(|r| r.get(name).cloned().unwrap_or(Val::None)).collect();
-        d.set_item(name, crate::numpy_io::out_to_numpy(py, &crate::numpy_io::vals_to_out(col))?)?;
+        d.set_item(name, crate::numpy_io::out_to_numpy(py, crate::numpy_io::vals_to_out(col))?)?;
     }
     Ok(d.into_any().unbind())
 }
@@ -582,10 +645,16 @@ fn expr_from_spec(py: Python<'_>, raw: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>>
 }
 
 /// Shortcut for `NHyDB.query`/`explain_query` (fresh engine without runtime providers).
-pub fn run_core<T>(db: &nhydb_core::db::Db, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T>) -> PyResult<T> {
-    let providers = Providers::default();
-    let eng = QueryEngine::new(db, &providers);
-    f(&eng).py()
+/// Runs a query with the built-in providers. P009: the GIL is released
+/// for the evaluation (no Python objects are touched; Python layout plugins
+/// re-acquire it themselves).
+pub fn run_core<T: Send>(py: Python<'_>, db: &nhydb_core::db::Db, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T> + Send) -> PyResult<T> {
+    py.detach(|| {
+        let providers = Providers::default();
+        let eng = QueryEngine::new(db, &providers);
+        f(&eng)
+    })
+    .py()
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

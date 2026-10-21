@@ -19,6 +19,7 @@ use crate::schema::{LayoutKind, ShapeDef};
 use crate::val::Val;
 use crate::vmap;
 
+use super::blockcache::{bounded_insert, SPARSE_CELLS_BUDGET, SPARSE_INDEX_BUDGET};
 use super::{Db, SVal, SparseCellMeta, SparseMap, SparseSegment};
 
 /// Larger decoded/merged u groups are not cached
@@ -90,8 +91,8 @@ enum Declared<'a> {
 }
 
 
-/// Shared block payload and position `(start, length)` of a u group in it.
-pub(crate) type RecordSlice = (Arc<Vec<u8>>, usize, usize);
+/// Bytes of a u group and their position in the block payload.
+pub(crate) type RecordSlice = (super::blockcache::BlockBytes, usize);
 
 impl Db {
     /// Encodes all cells of a u group (`_encode_sparse_record`).
@@ -219,7 +220,10 @@ impl Db {
             put_vu64(&mut stream, rec.len() as u64);
             let rel = stream.len() as u64;
             stream.extend_from_slice(&rec);
-            local_index.push((u.clone(), rel, rec.len() as u32));
+            // R011: the in-memory index stores u32 lengths; never truncate
+            let rec_len = u32::try_from(rec.len())
+                .map_err(|_| Error::Value(format!("sparse cells of u={u} exceed 4 GiB in one group")))?;
+            local_index.push((u.clone(), rel, rec_len));
             cell_count += cells.len() as u64;
             prev_u = u.clone();
         }
@@ -267,11 +271,9 @@ impl Db {
             if c.sparse_merged.len() > 4096 {
                 c.sparse_merged.clear();
             }
-            c.sparse_block_index.insert(bid, Arc::new(idx));
+            bounded_insert(&mut c.sparse_block_index, &mut c.used.sparse_block_index, bid, Arc::new(idx), |v| v.len(), SPARSE_INDEX_BUDGET, usize::MAX);
         }
         self.register_sparse_segment(seg);
-        let us: Vec<Nat> = enc.local_index.iter().map(|(u, _, _)| u.clone()).collect();
-        self.uindex_note_written(realm, lane, &us);
         Ok(vmap! {
             "cells" => enc.cell_count as i64, "records" => enc.group_count as i64,
             "u_groups" => enc.group_count as i64, "block_offset" => off as i64,
@@ -348,7 +350,6 @@ impl Db {
                 ugroups += r.get("u_groups").and_then(|v| v.as_i64()).unwrap_or(0);
             }
         }
-        self.cache().sparse_record.clear();
         if commit {
             self.commit()?;
         }
@@ -369,7 +370,6 @@ impl Db {
             Some(enc) => self.write_sparse_segment(realm, enc, lane)?,
             None => vmap! {"cells" => 0i64, "records" => 0i64, "block_offset" => Val::None, "bytes" => 0i64},
         };
-        self.cache().sparse_record.clear();
         if commit {
             self.commit()?;
         }
@@ -391,6 +391,12 @@ impl Db {
         let bid = seg.block_id;
         let mut p = 0usize;
         let mut prev_u = seg.u_start.clone();
+        // F022: group_count comes from the file; every group needs at least
+        // 3 bytes (delta, length, record), so it is checked against the payload
+        // before it sizes an allocation.
+        if seg.group_count > (mv.len() / 3) as u64 {
+            return Err(Error::Corruption(format!("SPARSE block {bid}: group count {} exceeds the payload", seg.group_count)));
+        }
         let mut out: Vec<(Nat, u64, u32)> = Vec::with_capacity(seg.group_count as usize);
         for i in 0..seg.group_count {
             let delta = get_vu(mv, &mut p)?;
@@ -401,11 +407,13 @@ impl Db {
                 return Err(Error::Corruption(format!("SPARSE block {bid}: u delta must be >0")));
             }
             let u = if i == 0 { seg.u_start.clone() } else { prev_u.add(&delta) };
-            let rec_len = get_vu_u64(mv, &mut p, "SPARSE rec_len")? as usize;
-            if rec_len == 0 || p + rec_len > mv.len() {
+            let rec_len = get_vu_u64(mv, &mut p, "SPARSE rec_len")?;
+            let len32 = u32::try_from(rec_len).ok().filter(|l| *l > 0 && p.checked_add(*l as usize).is_some_and(|e| e <= mv.len()));
+            let Some(len32) = len32 else {
                 return Err(Error::Corruption(format!("SPARSE block {bid}: record length invalid")));
-            }
-            out.push((u.clone(), seg.entries_offset + p as u64, rec_len as u32));
+            };
+            let rec_len = len32 as usize;
+            out.push((u.clone(), seg.entries_offset + p as u64, len32));
             p += rec_len;
             prev_u = u;
         }
@@ -416,7 +424,9 @@ impl Db {
             return Err(Error::Corruption(format!("SPARSE block {bid}: u range contradicts stream")));
         }
         let arc = Arc::new(out);
-        self.cache().sparse_block_index.insert(bid, arc.clone());
+        let mut c = self.cache();
+        let c = &mut *c;
+        bounded_insert(&mut c.sparse_block_index, &mut c.used.sparse_block_index, bid, arc.clone(), |v| v.len(), SPARSE_INDEX_BUDGET, usize::MAX);
         Ok(arc)
     }
 
@@ -427,9 +437,8 @@ impl Db {
             return Ok(None);
         };
         let (_, abs, len) = &idx[i];
-        let payload = self.block_payload(seg.block_offset)?;
         let rel = (abs - seg.payload_offset) as usize;
-        Ok(Some((payload, rel, *len as usize)))
+        Ok(Some((self.block_range(seg.block_offset, rel, *len as usize)?, rel)))
     }
 
     fn sparse_record_states(&self, realm: &Nat, seg: &SparseSegment, u: &Nat) -> Result<Arc<Vec<(Nat, SVal)>>> {
@@ -439,8 +448,8 @@ impl Db {
         }
         let vals: Vec<(Nat, SVal)> = match self.read_sparse_record_bytes(seg, u)? {
             None => Vec::new(),
-            Some((payload, rel, len)) => self
-                .decode_sparse_record(realm, u, &payload[rel..rel + len])?
+            Some((raw, _)) => self
+                .decode_sparse_record(realm, u, &raw)?
                 .into_iter()
                 .map(|(v, m)| (v, m.value))
                 .collect(),
@@ -450,10 +459,8 @@ impl Db {
             return Ok(arc);
         }
         let mut c = self.cache();
-        if c.sparse_record.len() > 4096 {
-            c.sparse_record.clear();
-        }
-        c.sparse_record.insert(ck, arc.clone());
+        let c = &mut *c;
+        bounded_insert(&mut c.sparse_record, &mut c.used.sparse_record, ck, arc.clone(), |v| v.len(), SPARSE_CELLS_BUDGET, 4096);
         Ok(arc)
     }
 
@@ -481,10 +488,8 @@ impl Db {
             return Ok(arc);
         }
         let mut c = self.cache();
-        if c.sparse_merged.len() > 4096 {
-            c.sparse_merged.clear();
-        }
-        c.sparse_merged.insert(mk, arc.clone());
+        let c = &mut *c;
+        bounded_insert(&mut c.sparse_merged, &mut c.used.sparse_merged, mk, arc.clone(), |v| v.len(), SPARSE_CELLS_BUDGET, 4096);
         Ok(arc)
     }
 

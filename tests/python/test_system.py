@@ -71,7 +71,7 @@ LOCK_HOLDER = textwrap.dedent("""
     import sys, time, nhydb
     db = nhydb.NHyDB(sys.argv[1])
     print("locked", flush=True)
-    time.sleep(float(sys.argv[2]))
+    sys.stdin.readline()  # T011: released on signal from the test, no fixed sleep
     db.close()
 """)
 
@@ -79,14 +79,17 @@ LOCK_HOLDER = textwrap.dedent("""
 def test_write_lock_between_processes(tmp_path):
     p = tmp_path / "L.nhydb"
     _classic(p).close()
-    proc = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER, str(p), "1.5"], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER, str(p)], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
     try:
         assert proc.stdout.readline().strip() == "locked"
         with pytest.raises(nhydb.DatabaseLockedError):
             nhydb.NHyDB(p)
         with pytest.raises(nhydb.DatabaseLockedError):
             nhydb.NHyDB.compact_file(p, make_backup=False)
-        db = nhydb.NHyDB(p, lock_timeout_ms=10_000)  # waits until the other process closes
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        db = nhydb.NHyDB(p, lock_timeout_ms=30_000)  # waits until the other process closes
         db.close()
     finally:
         proc.wait(timeout=30)
@@ -146,7 +149,7 @@ def test_repair_cuts_blocks_without_published_schema(tmp_path):
     moved.parent.mkdir()
     key.rename(moved)
     rep = nhydb.NHyDB.repair_file(p, apply=True, make_backup=False, key_path=str(moved))
-    assert rep["applied"] and rep["cut_reason"] and "unpublished" in rep["cut_reason"]
+    assert rep["applied"] and rep["cut_reason"] and "unpublished schema" in rep["cut_reason"]
     assert rep["safe_end"] == committed
     db = nhydb.NHyDB(p, key_path=str(moved))
     assert db.verify(deep=True)["ok"] and db.get(1, 1)["b"] == "ok" and 7 not in db.realms

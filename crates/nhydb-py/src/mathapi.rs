@@ -445,7 +445,7 @@ fn dry_run(
     max_examples: usize,
 ) -> PyResult<PyDryRunReport> {
     let m = &mapping.get().inner;
-    let mut dr = mx::DryRun::new(realm_auto_limit.unwrap_or_else(|| BigInt::from(4096)), track_collisions, max_examples);
+    let mut dr = mx::DryRun::new(realm_auto_limit.unwrap_or_else(|| BigInt::from(nhydb_core::config::DEFAULT_REALM_AUTO_LIMIT)), track_collisions, max_examples);
     let bits = mx::default_max_bits();
     for row in rows.try_iter()? {
         dr.add(m, &inputs_of(&row?)?, bits);
@@ -528,8 +528,16 @@ fn normalize_side(value: &Bound<'_, PyAny>) -> PyResult<i64> {
 
 /// Process-wide safety limit of the MATH expression language (bits).
 #[pyfunction]
-fn set_math_max_intermediate_bits(bits: u64) {
-    mx::set_default_max_bits(bits)
+fn set_math_max_intermediate_bits(bits: num_bigint::BigInt) -> PyResult<()> {
+    // F056: 0/negative were silently clamped to 1; same rule as the TOML key
+    use num_traits::ToPrimitive;
+    match bits.to_u64().filter(|b| *b >= 1) {
+        Some(b) => {
+            mx::set_default_max_bits(b);
+            Ok(())
+        }
+        None => Err(pyo3::exceptions::PyValueError::new_err("math_max_intermediate_bits must be a positive integer (1..2^64-1)")),
+    }
 }
 
 #[pyfunction]
@@ -700,7 +708,7 @@ impl PyMathRealmMap {
     #[pyo3(signature = (layout_id, mapping_fingerprint, extents=None, realm_auto_limit=None))]
     fn new(layout_id: BigInt, mapping_fingerprint: String, extents: Option<&Bound<'_, PyAny>>, realm_auto_limit: Option<BigInt>) -> PyResult<Self> {
         Ok(PyMathRealmMap {
-            inner: MathRealmMap::new(layout_id, &mapping_fingerprint, extents_of(extents)?, realm_auto_limit.unwrap_or_else(|| BigInt::from(4096))).py()?,
+            inner: MathRealmMap::new(layout_id, &mapping_fingerprint, extents_of(extents)?, realm_auto_limit.unwrap_or_else(|| BigInt::from(nhydb_core::config::DEFAULT_REALM_AUTO_LIMIT))).py()?,
         })
     }
     #[getter]
@@ -1013,6 +1021,11 @@ impl PyMathLayoutState {
     #[getter]
     fn first_write_block_id(&self) -> Option<u64> {
         self.inner.first_write_block_id
+    }
+    /// Bit limit frozen at layout creation (F030).
+    #[getter]
+    fn max_intermediate_bits(&self) -> u64 {
+        self.inner.max_intermediate_bits
     }
     #[getter]
     fn name(&self) -> String {

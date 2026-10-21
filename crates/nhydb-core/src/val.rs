@@ -362,7 +362,7 @@ impl Val {
     }
 
     pub fn from_json(s: &str) -> Result<Val> {
-        let mut p = JsonParser { s: s.as_bytes(), i: 0 };
+        let mut p = JsonParser { s: s.as_bytes(), i: 0, depth: 0 };
         p.ws();
         let v = p.value()?;
         p.ws();
@@ -510,9 +510,14 @@ pub fn py_bytes_repr(b: &[u8]) -> String {
     out
 }
 
+/// Nesting limit of the JSON parser (R009): metadata JSON is flat; deeper
+/// input is rejected instead of risking a stack overflow.
+const JSON_MAX_DEPTH: usize = 256;
+
 struct JsonParser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl JsonParser<'_> {
@@ -536,6 +541,16 @@ impl JsonParser<'_> {
     }
 
     fn value(&mut self) -> Result<Val> {
+        if self.depth >= JSON_MAX_DEPTH {
+            return Err(self.err("nesting too deep"));
+        }
+        self.depth += 1;
+        let r = self.value_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn value_inner(&mut self) -> Result<Val> {
         self.ws();
         let Some(&c) = self.s.get(self.i) else {
             return Err(self.err("unexpected end"));
@@ -626,6 +641,11 @@ impl JsonParser<'_> {
             self.i += 1;
         }
         let txt = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| self.err("number"))?;
+        // JSON grammar (as Python's json): no leading zeros like `01` (F056)
+        let digits = txt.strip_prefix('-').unwrap_or(txt).as_bytes();
+        if digits.len() > 1 && digits[0] == b'0' && digits[1].is_ascii_digit() {
+            return Err(self.err("leading zeros"));
+        }
         if is_float {
             txt.parse::<f64>().map(Val::Float).map_err(|_| self.err("number"))
         } else if let Ok(v) = txt.parse::<i64>() {
@@ -684,7 +704,12 @@ impl JsonParser<'_> {
                                     self.i = save;
                                 }
                             }
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            // F056: a lone surrogate has no UTF-8 form; NHyDB never
+                            // writes one, so it is rejected instead of replaced.
+                            let Some(c) = char::from_u32(cp) else {
+                                return Err(self.err("lone surrogate in \\u escape"));
+                            };
+                            out.push(c);
                         }
                         _ => return Err(self.err("escape")),
                     }
@@ -873,6 +898,30 @@ impl Val {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn json_depth_limit_r009() {
+        let ok = format!("{}1{}", "[".repeat(255), "]".repeat(255));
+        assert!(Val::from_json(&ok).is_ok());
+        for n in [257usize, 100_000] {
+            let deep = format!("{}1{}", "[".repeat(n), "]".repeat(n));
+            assert!(matches!(Val::from_json(&deep), Err(Error::Corruption(_))));
+            let deep = "{\"a\":".repeat(n) + "1" + &"}".repeat(n);
+            assert!(matches!(Val::from_json(&deep), Err(Error::Corruption(_))));
+        }
+        assert!(Val::from_json("01").is_err() && Val::from_json("-00").is_err());
+        assert!(Val::from_json("0").is_ok() && Val::from_json("-0.5").is_ok() && Val::from_json("10").is_ok());
+    }
+
+    #[test]
+    fn json_lone_surrogate_is_rejected_f056() {
+        for bad in [r#""\ud800""#, r#""\udc00""#, r#""a\ud83dx""#, r#""\ud83d\u0041""#] {
+            assert!(matches!(Val::from_json(bad), Err(Error::Corruption(_))), "{bad}");
+        }
+        assert_eq!(Val::from_json(r#""\ud83d\ude00""#).unwrap(), Val::Str("\u{1F600}".into()));
+        assert_eq!(Val::from_json(r#""\u00e4""#).unwrap(), Val::Str("ä".into()));
+    }
+
     use super::*;
 
     #[test]

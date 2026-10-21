@@ -169,6 +169,12 @@ impl LayoutPlugin for PyPlugin {
         .map_err(from_pyerr)
     }
 
+    /// The plugin receives the Python `NHyDB` object (as in v0.14). During a
+    /// writing call (`delete_record`) the database is mutably borrowed:
+    /// methods called on `db` inside the callback then raise
+    /// `RuntimeError: Already mutably borrowed` (F053). Plugins must compute
+    /// the addresses from `layout`, `object_id` and `lane` alone; `db` is only
+    /// usable from read-only calls such as `occupied_n`.
     fn occupied_addresses(&self, _db: &Db, lay: &LayoutDef, object_id: &Nat, lane: Lane) -> Result<Vec<Val>> {
         Python::attach(|py| {
             let db = match &self.db {

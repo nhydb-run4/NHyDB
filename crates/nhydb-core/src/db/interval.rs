@@ -94,9 +94,24 @@ impl IntervalIndex {
         false
     }
 
+    /// Smallest `x >= from` covered by some interval (P004): O(log n) via the
+    /// prefix maximum of the end values instead of a scan over all segments.
+    pub fn first_covered_from(&self, from: &Nat) -> Option<Nat> {
+        let j = self.starts.partition_point(|s| s <= from);
+        if j > 0 && &self.max_end[j - 1] >= from {
+            return Some(from.clone());
+        }
+        self.starts.get(j).cloned()
+    }
+
     /// ids in `(start, id)` order.
     pub fn ids_by_start(&self) -> &[usize] {
         &self.ids
+    }
+
+    /// id of the first interval (in start order) that starts after `u`.
+    pub fn first_start_after(&self, u: &Nat) -> Option<usize> {
+        self.ids.get(self.starts.partition_point(|s| s <= u)).copied()
     }
 }
 
@@ -147,6 +162,30 @@ mod tests {
             got.sort();
             let exp: Vec<usize> = all.iter().enumerate().filter(|(_, (a, b))| *a <= u && u <= *b).map(|(i, _)| i).collect();
             assert_eq!(got, exp);
+        }
+    }
+
+    #[test]
+    fn first_covered_from_against_bruteforce() {
+        let mut seed = 777u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % 2000
+        };
+        let mut iv = IntervalIndex::default();
+        let mut all = vec![];
+        assert_eq!(iv.first_covered_from(&Nat::S(1)), None);
+        for id in 0..200 {
+            let a = rnd() + 1;
+            let b = a + rnd() % 15;
+            iv.insert(Nat::S(a), Nat::S(b), id);
+            all.push((a, b));
+            if id % 37 == 0 {
+                for from in 0..2100 {
+                    let exp = all.iter().filter(|(_, b)| *b >= from).map(|(a, _)| (*a).max(from)).min();
+                    assert_eq!(iv.first_covered_from(&Nat::S(from)), exp.map(Nat::S), "from={from}");
+                }
+            }
         }
     }
 }

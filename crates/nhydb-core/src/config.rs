@@ -21,6 +21,19 @@ pub const CONFIG_FILE_NAME: &str = "nhydb_config.toml";
 pub const CONFIG_ENV: &str = "NHYDB_CONFIG";
 
 pub const DEFAULT_DB_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// Smallest accepted DB size limit for new databases (superblocks, R0,u1 and
+/// DB_CONFIG need about 9 KiB; smaller limits make the database unusable).
+pub const MIN_DB_MAX_SIZE_BYTES: u64 = 64 * 1024;
+
+/// Checks the initial DB size limit of a new database.
+pub fn check_db_max_size(n: u64) -> Result<()> {
+    if n < MIN_DB_MAX_SIZE_BYTES {
+        return Err(Error::Value(format!(
+            "db_max_size_bytes must be at least {MIN_DB_MAX_SIZE_BYTES} bytes (got {n})"
+        )));
+    }
+    Ok(())
+}
 pub const DEFAULT_REALM_AUTO_LIMIT: u64 = 4096;
 pub const DEFAULT_MATH_MAX_INTERMEDIATE_BITS: u64 = 1 << 20;
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 64 << 20;
@@ -85,6 +98,13 @@ fn as_u64(v: &toml::Value, key: &str) -> Result<u64> {
     }
 }
 
+fn non_empty(s: String, key: &str) -> Result<String> {
+    if s.trim().is_empty() {
+        return Err(err(format!("'{key}' must not be empty")));
+    }
+    Ok(s)
+}
+
 fn as_bool(v: &toml::Value, key: &str) -> Result<bool> {
     v.as_bool().ok_or_else(|| err(format!("'{key}' must be true or false")))
 }
@@ -109,14 +129,17 @@ impl Config {
                 }
                 let full = format!("{section}.{key}");
                 match (section.as_str(), key.as_str()) {
-                    ("database", "db_max_size_bytes") => c.db_max_size_bytes = as_pos_u64(v, &full)?,
+                    ("database", "db_max_size_bytes") => {
+                        c.db_max_size_bytes = as_pos_u64(v, &full)?;
+                        check_db_max_size(c.db_max_size_bytes).map_err(|e| err(e.to_string()))?;
+                    }
                     ("database", "durability") => c.durability = Durability::parse(&as_string(v, &full)?)?,
                     ("math", "realm_auto_limit") => c.realm_auto_limit = as_pos_u64(v, &full)?,
                     ("math", "math_max_intermediate_bits") => c.math_max_intermediate_bits = as_pos_u64(v, &full)?,
                     ("lock", "enabled") => c.lock.enabled = as_bool(v, &full)?,
                     ("lock", "timeout_ms") => c.lock.timeout_ms = as_u64(v, &full)?,
-                    ("paths", "layout_path") => c.layout_path = Some(as_string(v, &full)?),
-                    ("paths", "key_path") => c.key_path = Some(as_string(v, &full)?),
+                    ("paths", "layout_path") => c.layout_path = Some(non_empty(as_string(v, &full)?, &full)?),
+                    ("paths", "key_path") => c.key_path = Some(non_empty(as_string(v, &full)?, &full)?),
                     ("cache", "block_cache_bytes") => c.block_cache_bytes = as_u64(v, &full)? as usize,
                     ("cache", "vindex_max_marks") => c.vindex_max_marks = as_u64(v, &full)? as usize,
                     ("cache", "vindex_max_indexes") => c.vindex_max_indexes = as_u64(v, &full)? as usize,
@@ -151,11 +174,20 @@ impl Config {
         Ok(Config::default())
     }
 
-    /// Expands a path template for a DB (`{db}` → file name).
+    /// Expands a path template for a DB (`{db}` → file name,
+    /// `{db_path_hash}` → first 16 hex digits of the SHA-256 of the absolute
+    /// DB path, unique per database location – use it when several
+    /// databases with the same file name share one key directory).
     /// Relative paths are resolved against the database's directory.
     pub fn resolve_template(template: &str, db_path: &Path) -> PathBuf {
         let name = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let p = PathBuf::from(template.replace("{db}", &name));
+        let mut t = template.replace("{db}", &name);
+        if t.contains("{db_path_hash}") {
+            let abs = std::path::absolute(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+            let h = crate::crypto::sha256_hex(abs.to_string_lossy().as_bytes());
+            t = t.replace("{db_path_hash}", &h[..16]);
+        }
+        let p = PathBuf::from(t);
         if p.is_absolute() { p } else { crate::platform::parent_dir(db_path).join(p) }
     }
 }
@@ -213,6 +245,11 @@ mod tests {
         let db = Path::new("/data/x.nhydb");
         assert_eq!(Config::resolve_template(c.layout_path.as_deref().unwrap(), db), PathBuf::from("/data/plans/x.nhydb.layout.enc"));
         assert_eq!(Config::resolve_template(c.key_path.as_deref().unwrap(), db), PathBuf::from("/secure/x.nhydb.layout.key"));
+        // F005: {db_path_hash} separates equally named databases in different directories
+        let a = Config::resolve_template("/secure/{db}.{db_path_hash}.key", Path::new("/a/kunden.nhydb"));
+        let b = Config::resolve_template("/secure/{db}.{db_path_hash}.key", Path::new("/b/kunden.nhydb"));
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().starts_with("/secure/kunden.nhydb."));
     }
 
     #[test]
@@ -223,6 +260,9 @@ mod tests {
         assert!(Config::from_toml_str("[database]\ndurability = \"weak\"").is_err());
         assert!(Config::from_toml_str("[math]\nrealm_auto_limit = 0").is_err());
         assert!(Config::from_toml_str("[database\n").is_err());
+        // F051: minimum DB size, empty sidecar paths
+        assert!(Config::from_toml_str("[database]\ndb_max_size_bytes = 1").unwrap_err().to_string().contains("at least"));
+        assert!(Config::from_toml_str("[paths]\nkey_path = \"\"").unwrap_err().to_string().contains("must not be empty"));
     }
 
     #[test]

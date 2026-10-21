@@ -15,20 +15,22 @@ def _classic(path):
     return db
 
 
-def test_strict_open_rejects_corrupt_header(tmpdb):
+def test_open_rejects_corrupt_header(tmpdb):
     db = _classic(tmpdb)
     db.put_dense_batch(1, 1, [[1, "a"]], commit=True)
-    off = db.stats()["storage"]["by_block_type"]
     db.close()
     raw = bytearray(tmpdb.read_bytes())
     raw[8192 + 9] ^= 0xFF  # corrupt the block ID of the first block → header CRC
     tmpdb.write_bytes(bytes(raw))
     with pytest.raises(nhydb.CorruptionError):
         nhydb.NHyDB(tmpdb)
-    # Fail closed: the committed region (including R0,u1) must be
-    # intact, regardless of strict.
+    # Fail closed: the committed region (including R0,u1) must be intact,
+    # also for a read-only open; the parameter strict no longer exists (D001).
     with pytest.raises(nhydb.CorruptionError):
+        nhydb.NHyDB(tmpdb, readonly=True)
+    with pytest.raises(TypeError):
         nhydb.NHyDB(tmpdb, strict=False)
+    assert tmpdb.read_bytes() == bytes(raw)
 
 
 def test_superblock_fallback(tmpdb):
@@ -39,8 +41,20 @@ def test_superblock_fallback(tmpdb):
     raw = bytearray(tmpdb.read_bytes())
     raw[slot * 4096 + 20] ^= 0xFF  # destroy the current superblock
     tmpdb.write_bytes(bytes(raw))
-    db = nhydb.NHyDB(tmpdb)  # falls back to the previous generation
-    assert db.verify()["ok"]
+    size = tmpdb.stat().st_size
+    with pytest.warns(RuntimeWarning, match="superblock slot"):
+        db = nhydb.NHyDB(tmpdb)  # falls back to the other slot (same state after close)
+    assert db.verify()["ok"] and db.get(1, 1)["a"] == 1
+    assert tmpdb.stat().st_size == size  # F002: nothing cut
+    assert db.open_warnings and "superblock" in db.open_warnings[0]
+    assert not nhydb.NHyDB.inspect_tail(tmpdb)["clean"]
+    # T021: the next commit rewrites the damaged slot, both superblocks valid again
+    db.put(1, 2, [2, "b"], commit=True)
+    db.close()
+    tail = nhydb.NHyDB.inspect_tail(tmpdb)
+    assert tail["clean"] and all(s["valid"] for s in tail["superblocks"]), tail
+    with nhydb.NHyDB(tmpdb) as db:
+        assert not db.open_warnings and db.get(1, 2)["b"] == "b"
 
 
 def test_compact_replace_original_with_backup(tmpdb):
@@ -48,9 +62,19 @@ def test_compact_replace_original_with_backup(tmpdb):
     for i in range(1, 6):
         db.put(1, i, [i, "v"], commit=True)  # many small blocks
     db.close()
+    original = tmpdb.read_bytes()
     res = nhydb.NHyDB.compact_file(tmpdb)
     assert res["replaced_original"] and res["backup"] and res["saved_bytes"] > 0
-    assert nhydb.NHyDB(tmpdb).get(1, 5)["a"] == 5
+    # T021: the backup is the byte-identical original and can be restored
+    from pathlib import Path
+    assert Path(res["backup"]).read_bytes() == original
+    assert len(tmpdb.read_bytes()) == len(original) - res["saved_bytes"]
+    with nhydb.NHyDB(tmpdb) as db:
+        assert [db.get(1, i)["a"] for i in range(1, 6)] == [1, 2, 3, 4, 5] and db.verify(deep=True)["ok"]
+    assert nhydb.NHyDB.restore_backup(res["backup"], tmpdb)["ok"]
+    assert tmpdb.read_bytes() == original
+    with nhydb.NHyDB(tmpdb) as db:
+        assert db.get(1, 5)["a"] == 5
 
 
 def test_close_releases_file_handle(tmpdb):
@@ -105,6 +129,35 @@ def test_plugin_reentrant_occupied(tmpdb):
     assert db.occupied_n(2, 3) == [f"N{nhydb.dynadron_n(1, 100, 5, 0)}", f"N{nhydb.dynadron_n(1, 100, 6, 0)}"]
 
 
+def test_plugin_db_callback_during_delete_record_fails_without_change(tmpdb):
+    """F053 (deliberate limitation): during delete_record the database is
+    mutably borrowed, so a plugin that calls back into `db` from
+    occupied_addresses gets a RuntimeError; nothing is written. A plugin that
+    computes the addresses without `db` deletes normally."""
+    db = _classic(tmpdb)
+    db.create_custom_layout(2, 1, "occ", plugin="occ", u_start=100, u_end=100,
+                            params={"fields": [{"name": "a"}, {"name": "b", "type": "utf8"}]})
+    db.register_layout_plugin("occ", Occ())
+    db.put_object(2, 3, {"a": -5, "b": "drei"})
+    db.commit()
+    size = tmpdb.stat().st_size
+    with pytest.raises(RuntimeError, match="(?i)borrow"):
+        db.delete_record(2, 3, commit=True)
+    assert tmpdb.stat().st_size == size
+    obj = db.get_object(2, 3)
+    assert (obj["a"], obj["b"]) == (-5, "drei")
+    assert db.verify(deep=True)["ok"]
+
+    class OccNoDb(Occ):
+        def occupied_addresses(self, db, layout, object_id, lane):
+            return [(100, (object_id - 1) * 2 + off + 1) for off in (0, 1)]
+
+    db.register_layout_plugin("occ", OccNoDb())
+    assert db.delete_record(2, 3, commit=True) == 2
+    assert db.get_cell(1, 100, 5, dyn_address=False) is None
+    db.close()
+
+
 def test_plugin_exception_propagates(tmpdb):
     class Bad:
         def logical_address(self, *a):
@@ -130,7 +183,16 @@ def test_cli_get_and_stats(tmpdb):
     out = subprocess.check_output([sys.executable, "-m", "nhydb", "stats", str(tmpdb)], text=True)
     assert "NHyDB STATS" in out
     out = subprocess.check_output([sys.executable, "-m", "nhydb", "health", str(tmpdb), "--deep"], text=True)
-    assert "Result      :" in out
+    # T021: the CLI report states exactly the result of the API health check
+    lines = dict(ln.split(":", 1) for ln in out.splitlines() if ":" in ln)
+    lines = {k.strip(): v.strip() for k, v in lines.items()}
+    with nhydb.NHyDB(tmpdb, readonly=True) as ro:
+        h = ro.health(deep=True)
+    word = {"ok": "OK", "warning": "WARN", "error": "ERROR"}
+    assert lines["Result"] == {"ok": "OK", "warning": "WARNING", "error": "ERROR"}[h["status"]], out
+    for check in h["checks"]:
+        assert lines[check["name"]].startswith(word[check["status"]]), (check, out)
+    assert lines["Mode"] == "deep" and lines["container"] == "OK", out
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="RLIMIT_FSIZE/SIGXFSZ are POSIX-only; on all platforms the "

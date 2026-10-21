@@ -6,9 +6,10 @@
 //! or strides are converted correctly). All other objects (lists,
 //! object/string arrays) are converted element by element into values.
 //!
-//! Output: `numpy.frombuffer(bytes, dtype)` (no Python loop).
+//! Output: `numpy.frombuffer(ColumnBuffer, dtype)` over the Rust vector (no copy, no Python loop).
 
 use pyo3::buffer::{PyBuffer, PyUntypedBuffer};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -126,78 +127,238 @@ fn typed<T: pyo3::buffer::Element + Copy>(py: Python<'_>, obj: &Bound<'_, PyAny>
     b.to_vec(py)
 }
 
+/// Raw element bytes of a buffer in C order (handles strides).
+fn raw_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let mv = pyo3::types::PyMemoryView::from(obj)?;
+    Ok(mv.call_method0("tobytes")?.cast::<PyBytes>()?.as_bytes().to_vec())
+}
+
+/// Decodes fixed-size elements from raw bytes with explicit byte order.
+fn decode_raw<T, const N: usize>(raw: &[u8], big: bool, conv: fn([u8; N]) -> T, conv_be: fn([u8; N]) -> T) -> Vec<T> {
+    raw.as_chunks::<N>().0.iter().map(|a| if big { conv_be(*a) } else { conv(*a) }).collect()
+}
+
+fn type_err(msg: String) -> PyErr {
+    pyo3::exceptions::PyTypeError::new_err(msg)
+}
+
+/// Rejects objects that are iterable but not a column (F033).
+fn reject_non_column(obj: &Bound<'_, PyAny>) -> PyResult<()> {
+    use pyo3::types::{PyByteArray, PyDict, PyString};
+    if obj.is_instance_of::<PyString>() || obj.is_instance_of::<PyBytes>() || obj.is_instance_of::<PyByteArray>() || obj.is_instance_of::<PyDict>() {
+        return Err(type_err(format!(
+            "a column must be a 1-D array or a sequence of values, not {}",
+            obj.get_type().name()?
+        )));
+    }
+    Ok(())
+}
+
 /// Arbitrary Python object → column.
+///
+/// Rules (F024/F033, documented in PYTHON_API):
+/// * only 1-D arrays/buffers (`ndim != 1` → `ValueError`);
+/// * NumPy dtypes bool, int8…int64, uint8…uint64, float32, float64 are taken
+///   over typed (any byte order/strides); object/str/bytes arrays and Python
+///   sequences are converted value by value; every other dtype (float16,
+///   longdouble, complex, datetime, structured …) → `TypeError`;
+/// * `str`, `bytes`, `bytearray` and `dict` are not columns → `TypeError`.
 pub fn col_from_py(obj: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
     let py = obj.py();
+    reject_non_column(obj)?;
+    let mut numeric_numpy = false;
+    if obj.hasattr("dtype")? && obj.hasattr("ndim")? {
+        let ndim: usize = obj.getattr("ndim")?.extract()?;
+        if ndim != 1 {
+            return Err(PyValueError::new_err(format!("a column must be 1-dimensional (got ndim={ndim})")));
+        }
+        let dt = obj.getattr("dtype")?;
+        let kind: String = dt.getattr("kind")?.extract()?;
+        let size: usize = dt.getattr("itemsize")?.extract()?;
+        match (kind.as_str(), size) {
+            ("O" | "U" | "S", _) => return vals_from_seq(&obj.call_method0("tolist")?),
+            ("b" | "i" | "u", _) | ("f", 4 | 8) => numeric_numpy = true,
+            _ => return Err(type_err(format!("unsupported column dtype {} (supported: bool, int8-64, uint8-64, float32, float64, object, str)", dt.str()?))),
+        }
+    }
     if let Ok(ub) = PyUntypedBuffer::get(obj) {
         let fmt = ub.format().to_str().unwrap_or("").to_string();
         let size = ub.item_size();
+        let ndim = ub.dimensions();
         drop(ub);
+        if ndim != 1 {
+            return Err(PyValueError::new_err(format!("a column must be 1-dimensional (got ndim={ndim})")));
+        }
         let code = fmt.trim_start_matches(['@', '=', '<', '>', '!']);
-        let swapped = (fmt.starts_with('>') || fmt.starts_with('!')) && cfg!(target_endian = "little");
+        let big = fmt.starts_with('>') || fmt.starts_with('!');
+        let swapped = big != cfg!(target_endian = "big") && (fmt.starts_with(['<', '>', '!']));
+        let kind = match (code, size) {
+            ("?", 1) => 'b',
+            ("B" | "c", 1) => 'B',
+            ("b", 1) => '1',
+            ("H", 2) => 'H',
+            ("h", 2) => '2',
+            ("I" | "L", 4) => 'I',
+            ("i" | "l", 4) => '4',
+            ("L" | "Q" | "N", 8) => 'Q',
+            ("l" | "q" | "n", 8) => '8',
+            ("f", 4) => 'f',
+            ("d", 8) => 'd',
+            _ if numeric_numpy => {
+                return Err(type_err(format!("unsupported column buffer format '{fmt}'")));
+            }
+            ("O", _) => return vals_from_seq(&obj.call_method0("tolist")?),
+            _ => return Err(type_err(format!("unsupported column buffer format '{fmt}'"))),
+        };
+        if kind == 'b' {
+            // bool: read the raw bytes (works for memoryview/array too, F033)
+            return Ok(OwnedCol::Bool(raw_bytes(obj)?.into_iter().map(|x| (x != 0) as u8).collect()));
+        }
         if !swapped {
-            let r = match (code, size) {
-                ("?", 1) => {
-                    let view = obj.call_method1("view", ("u1",))?;
-                    Some(OwnedCol::Bool(typed::<u8>(py, &view)?))
-                }
-                ("B", 1) => Some(OwnedCol::U8(typed(py, obj)?)),
-                ("b", 1) => Some(OwnedCol::I8(typed(py, obj)?)),
-                ("H", 2) => Some(OwnedCol::U16(typed(py, obj)?)),
-                ("h", 2) => Some(OwnedCol::I16(typed(py, obj)?)),
-                ("I" | "L", 4) => Some(OwnedCol::U32(typed(py, obj)?)),
-                ("i" | "l", 4) => Some(OwnedCol::I32(typed(py, obj)?)),
-                ("L" | "Q" | "N", 8) => Some(OwnedCol::U64(typed(py, obj)?)),
-                ("l" | "q" | "n", 8) => Some(OwnedCol::I64(typed(py, obj)?)),
-                ("f", 4) => Some(OwnedCol::F32(typed(py, obj)?)),
-                ("d", 8) => Some(OwnedCol::F64(typed(py, obj)?)),
-                _ => None,
-            };
-            if let Some(c) = r {
-                return Ok(c);
-            }
+            return Ok(match kind {
+                'B' => OwnedCol::U8(typed(py, obj)?),
+                '1' => OwnedCol::I8(typed(py, obj)?),
+                'H' => OwnedCol::U16(typed(py, obj)?),
+                '2' => OwnedCol::I16(typed(py, obj)?),
+                'I' => OwnedCol::U32(typed(py, obj)?),
+                '4' => OwnedCol::I32(typed(py, obj)?),
+                'Q' => OwnedCol::U64(typed(py, obj)?),
+                '8' => OwnedCol::I64(typed(py, obj)?),
+                'f' => OwnedCol::F32(typed(py, obj)?),
+                _ => OwnedCol::F64(typed(py, obj)?),
+            });
         }
-        // foreign endianness etc.: convert to native representation via NumPy
-        if obj.hasattr("dtype")? && obj.getattr("dtype")?.getattr("kind")?.extract::<String>()? != "O" {
-            let kind: String = obj.getattr("dtype")?.getattr("kind")?.extract()?;
-            if matches!(kind.as_str(), "i" | "u" | "f" | "b") {
-                let native = obj.call_method1("astype", (obj.getattr("dtype")?.call_method1("newbyteorder", ("=",))?,))?;
-                if !native.is(obj) {
-                    return col_from_py(&native);
-                }
-            }
-        }
+        // foreign byte order: decode explicitly (no recursion, F024)
+        let raw = raw_bytes(obj)?;
+        return Ok(match kind {
+            'B' => OwnedCol::U8(raw),
+            '1' => OwnedCol::I8(raw.into_iter().map(|x| x as i8).collect()),
+            'H' => OwnedCol::U16(decode_raw(&raw, big, u16::from_le_bytes, u16::from_be_bytes)),
+            '2' => OwnedCol::I16(decode_raw(&raw, big, i16::from_le_bytes, i16::from_be_bytes)),
+            'I' => OwnedCol::U32(decode_raw(&raw, big, u32::from_le_bytes, u32::from_be_bytes)),
+            '4' => OwnedCol::I32(decode_raw(&raw, big, i32::from_le_bytes, i32::from_be_bytes)),
+            'Q' => OwnedCol::U64(decode_raw(&raw, big, u64::from_le_bytes, u64::from_be_bytes)),
+            '8' => OwnedCol::I64(decode_raw(&raw, big, i64::from_le_bytes, i64::from_be_bytes)),
+            'f' => OwnedCol::F32(decode_raw(&raw, big, f32::from_le_bytes, f32::from_be_bytes)),
+            _ => OwnedCol::F64(decode_raw(&raw, big, f64::from_le_bytes, f64::from_be_bytes)),
+        });
     }
-    // lists, object/string arrays
+    if numeric_numpy {
+        return Err(type_err("numeric array without buffer protocol is not supported as a column".into()));
+    }
+    // lists, tuples, other iterables
     let src = if obj.hasattr("tolist")? { obj.call_method0("tolist")? } else { obj.clone() };
+    reject_non_column(&src)?;
+    vals_from_seq(&src)
+}
+
+fn vals_from_seq(src: &Bound<'_, PyAny>) -> PyResult<OwnedCol> {
+    let it = match src.try_iter() {
+        Ok(it) => it,
+        Err(_) => return Err(type_err(format!("a column must be a 1-D array or a sequence of values, not {}", src.get_type().name()?))),
+    };
     let mut vals = Vec::new();
-    for x in src.try_iter()? {
+    for x in it {
         vals.push(to_val(&x?)?);
     }
     Ok(OwnedCol::Vals(vals))
 }
 
+/// Scalar (Python int/float, NumPy scalar, 0-d array, Decimal …) – broadcast
+/// value instead of a column (F033); its value is converted strictly by
+/// `to_nat` (F040).
+pub fn is_scalar(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if obj.is_instance_of::<pyo3::types::PyInt>() || obj.is_instance_of::<pyo3::types::PyFloat>() {
+        return Ok(true);
+    }
+    if obj.hasattr("ndim")? {
+        let ndim: usize = obj.getattr("ndim")?.extract().unwrap_or(1);
+        return Ok(ndim == 0);
+    }
+    Ok(!obj.hasattr("__len__")? && !obj.hasattr("__iter__")? && (obj.hasattr("__index__")? || obj.hasattr("__float__")?))
+}
+
 /// Scalar or array → vector of natural numbers of length `n`.
 pub fn nats_from_py(obj: &Bound<'_, PyAny>, n: Option<usize>, what: &str) -> PyResult<Vec<Nat>> {
-    if obj.is_instance_of::<pyo3::types::PyInt>() {
+    if is_scalar(obj)? {
         let v = to_nat(obj)?;
         return Ok(vec![v; n.unwrap_or(1)]);
     }
     col_from_py(obj)?.to_nats(what)
 }
 
-/// Output column → NumPy array.
-pub fn out_to_numpy(py: Python<'_>, col: &OutCol) -> PyResult<Py<PyAny>> {
-    let np = py.import("numpy")?;
-    fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+/// Checks that a typed NumPy column suits the target field type (F033):
+/// bool arrays only for bool fields, float arrays only for float fields,
+/// integer arrays not for utf8/bytes fields. Object columns/sequences are
+/// converted value by value like the single-item API.
+pub fn check_col_type(col: &OwnedCol, typ: nhydb_core::codec::TypeCode, is_enum: bool, name: &str) -> PyResult<()> {
+    use nhydb_core::codec::TypeCode as T;
+    let (dtype, ok) = match col {
+        OwnedCol::Vals(_) => return Ok(()),
+        OwnedCol::Bool(_) => ("bool", typ == T::Bool && !is_enum),
+        OwnedCol::F32(_) | OwnedCol::F64(_) => ("float", matches!(typ, T::F32 | T::F64) && !is_enum),
+        _ => ("integer", !matches!(typ, T::Utf8 | T::Bytes) || is_enum),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(type_err(format!("column '{name}': {dtype} array does not match field type {}{}", typ.name(), if is_enum { " (enum)" } else { "" })))
     }
-    let (raw, dtype): (&[u8], &str) = match col {
-        OutCol::I64(v) => (bytes_of(v), "=i8"),
-        OutCol::U64(v) => (bytes_of(v), "=u8"),
-        OutCol::F32(v) => (bytes_of(v), "=f4"),
-        OutCol::F64(v) => (bytes_of(v), "=f8"),
-        OutCol::Bool(v) => (bytes_of(v), "?"),
+}
+
+/// Output column → NumPy array.
+/// Memory of a result column handed over to NumPy without a copy (P017):
+/// the array created by `numpy.frombuffer` references this object through
+/// the buffer protocol and keeps it alive; Rust never touches the data again.
+#[pyclass(module = "nhydb._native")]
+pub struct ColumnBuffer {
+    data: OutCol,
+}
+
+impl ColumnBuffer {
+    fn raw_parts(&mut self) -> (*mut std::ffi::c_void, usize) {
+        fn parts<T>(v: &mut [T]) -> (*mut std::ffi::c_void, usize) {
+            (v.as_mut_ptr() as *mut std::ffi::c_void, std::mem::size_of_val(v))
+        }
+        match &mut self.data {
+            OutCol::I64(v) => parts(v),
+            OutCol::U64(v) => parts(v),
+            OutCol::F32(v) => parts(v),
+            OutCol::F64(v) => parts(v),
+            OutCol::Bool(v) => parts(v),
+            OutCol::Vals(_) => (std::ptr::null_mut(), 0),
+        }
+    }
+}
+
+#[pymethods]
+impl ColumnBuffer {
+    /// Writable 1-D byte buffer over the column memory.
+    unsafe fn __getbuffer__(slf: Bound<'_, Self>, view: *mut pyo3::ffi::Py_buffer, flags: std::ffi::c_int) -> PyResult<()> {
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("View is null"));
+        }
+        let (ptr, len) = slf.borrow_mut().raw_parts();
+        // the vector is never resized after construction: the pointer stays
+        // valid as long as this object lives (the view holds a reference)
+        let rc = unsafe { pyo3::ffi::PyBuffer_FillInfo(view, slf.as_ptr(), ptr, len as pyo3::ffi::Py_ssize_t, 0, flags) };
+        if rc != 0 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
+}
+
+pub fn out_to_numpy(py: Python<'_>, col: OutCol) -> PyResult<Py<PyAny>> {
+    let np = py.import("numpy")?;
+    let dtype = match &col {
+        OutCol::I64(_) => "=i8",
+        OutCol::U64(_) => "=u8",
+        OutCol::F32(_) => "=f4",
+        OutCol::F64(_) => "=f8",
+        OutCol::Bool(_) => "?",
         OutCol::Vals(v) => {
             let list: Vec<Py<PyAny>> = v.iter().map(|x| from_val(py, x)).collect::<PyResult<_>>()?;
             let arr = np.call_method1("empty", (list.len(), "O"))?;
@@ -207,11 +368,12 @@ pub fn out_to_numpy(py: Python<'_>, col: &OutCol) -> PyResult<Py<PyAny>> {
             return Ok(arr.unbind());
         }
     };
-    let b = PyBytes::new(py, raw);
-    // frombuffer returns a read-only view → copy() for a regular array
-    Ok(np.call_method1("frombuffer", (b, dtype))?.call_method0("copy")?.unbind())
+    // P017: no copy – NumPy references the Rust vector (writable array)
+    let buf = Bound::new(py, ColumnBuffer { data: col })?;
+    Ok(np.call_method1("frombuffer", (buf, dtype))?.unbind())
 }
 
-pub fn register(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ColumnBuffer>()?;
     Ok(())
 }

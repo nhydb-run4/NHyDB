@@ -25,15 +25,22 @@ jobs:
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test --workspace --release
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --release --out dist
-      - name: Install wheel and run Python tests
+      - name: Install wheel
         shell: bash
         run: |
           python -m pip install numpy pytest cryptography
           python -m pip install --no-index --find-links dist nhydb
-          python -m pytest -q tests/python
+      - name: File format golden test
+        run: python -m pytest -q tests/python/test_stab_format_golden.py
+      - name: Python tests
+        run: python -m pytest -q tests/python

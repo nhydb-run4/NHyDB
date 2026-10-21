@@ -20,10 +20,28 @@ fn req_nat(d: &Val, k: &str) -> Result<Nat> {
     val_to_nat(req(d, k)?).ok_or_else(|| Error::Value(format!("{k}: positive integer expected")))
 }
 
-fn req_u64(d: &Val, k: &str) -> Result<u64> {
-    int_like(req(d, k)?)
-        .and_then(|b| b.to_u64())
-        .ok_or_else(|| Error::Value(format!("{k}: integer in range 0..2^64 expected")))
+/// Largest admissible administrative ID (shape_id, layout_id incl. MATH,
+/// index_id, default_shape_id). IDs are persisted as signed 64-bit JSON
+/// integers, so the range is 0..=2^63-1 (F004). Coordinates (R, u, v, N)
+/// are not affected.
+pub const MAX_ID: u64 = i64::MAX as u64;
+
+/// Input check for administrative IDs (`ValueError` above 2^63-1).
+pub fn check_id(what: &str, id: u64) -> Result<u64> {
+    if id > MAX_ID {
+        return Err(Error::Value(format!("{what} too large (max 2^63-1)")));
+    }
+    Ok(id)
+}
+
+/// Persisted administrative ID: anything outside 0..=2^63-1 is corruption
+/// (never clamped).
+fn req_id(d: &Val, k: &str) -> Result<u64> {
+    let v = req(d, k)?;
+    match v {
+        Val::Int(i) if *i >= 0 => Ok(*i as u64),
+        _ => Err(Error::Corruption(format!("{k}: ID {} outside 0..2^63-1", v.py_repr()))),
+    }
 }
 
 fn opt_str(d: &Val, k: &str) -> String {
@@ -96,6 +114,7 @@ pub struct ShapeDef {
 
 impl ShapeDef {
     pub fn new(shape_id: u64, realm_id: Nat, name: String, mut fields: Vec<FieldDef>, description: String) -> Result<Self> {
+        check_id("shape_id", shape_id)?;
         fields.sort_by(|a, b| a.v.cmp(&b.v));
         for w in fields.windows(2) {
             if w[0].v == w[1].v {
@@ -134,7 +153,7 @@ impl ShapeDef {
 
     pub fn to_val(&self) -> Val {
         vmap! {
-            "shape_id" => self.shape_id as i64, "realm_id" => &self.realm_id,
+            "shape_id" => Val::int(self.shape_id), "realm_id" => &self.realm_id,
             "name" => self.name.as_str(), "description" => self.description.as_str(),
             "fields" => Val::List(self.fields.iter().map(field_to_val).collect()),
         }
@@ -145,7 +164,7 @@ impl ShapeDef {
             Val::List(l) => l.iter().map(field_from_val).collect::<Result<Vec<_>>>()?,
             _ => return Err(Error::Schema("fields must be a list".into())),
         };
-        ShapeDef::new(req_u64(d, "shape_id")?, req_nat(d, "realm_id")?, req(d, "name")?.py_str(), fields, opt_str(d, "description"))
+        ShapeDef::new(req_id(d, "shape_id")?, req_nat(d, "realm_id")?, req(d, "name")?.py_str(), fields, opt_str(d, "description"))
     }
 }
 
@@ -167,7 +186,7 @@ impl RealmDef {
         vmap! {
             "realm_id" => &self.realm_id, "name" => self.name.as_str(),
             "description" => self.description.as_str(),
-            "default_shape_id" => self.default_shape_id.map(|x| x as i64),
+            "default_shape_id" => self.default_shape_id.map(Val::int),
             "base_reserve_to" => &self.base_reserve_to,
         }
     }
@@ -175,7 +194,7 @@ impl RealmDef {
     pub fn from_val(d: &Val) -> Result<Self> {
         let ds = match d.get("default_shape_id") {
             None | Some(Val::None) => None,
-            Some(_) => Some(req_u64(d, "default_shape_id")?),
+            Some(_) => Some(req_id(d, "default_shape_id")?),
         };
         let brt = match d.get("base_reserve_to") {
             None | Some(Val::None) => Nat::ZERO,
@@ -389,6 +408,10 @@ impl LayoutDef {
         if layout_id == 0 {
             return Err(Error::Value("layout_id must be > 0".into()));
         }
+        check_id("layout_id", layout_id)?;
+        if let Some(sid) = shape_id {
+            check_id("shape_id", sid)?;
+        }
         require_positive("realm_id", &realm_id)?;
         let kind = LayoutKind::parse(kind)?;
         require_positive("u_start", &u_start)?;
@@ -456,10 +479,10 @@ impl LayoutDef {
 
     pub fn to_val(&self) -> Val {
         vmap! {
-            "layout_id" => self.layout_id as i64, "realm_id" => &self.realm_id,
+            "layout_id" => Val::int(self.layout_id), "realm_id" => &self.realm_id,
             "name" => self.name.as_str(), "kind" => self.kind.name(),
             "u_start" => &self.u_start, "u_end" => Val::opt_nat(self.u_end.as_ref()),
-            "priority" => self.priority, "shape_id" => self.shape_id.map(|x| x as i64),
+            "priority" => self.priority, "shape_id" => self.shape_id.map(Val::int),
             "base_reserve_to" => &self.base_reserve_to,
             "params" => self.params.clone(), "spacemap" => self.spacemap.clone(),
             "plugin" => self.plugin.as_str(), "description" => self.description.as_str(),
@@ -477,14 +500,14 @@ impl LayoutDef {
         };
         let shape_id = match d.get("shape_id") {
             None | Some(Val::None) => None,
-            Some(_) => Some(req_u64(d, "shape_id")?),
+            Some(_) => Some(req_id(d, "shape_id")?),
         };
         let priority = d.get("priority").and_then(int_like).and_then(|b| b.to_i64()).unwrap_or(0);
         let brt = d.get("base_reserve_to").and_then(val_to_nat).unwrap_or(Nat::ZERO);
         let params = d.get("params").cloned().filter(|v| v.is_truthy()).unwrap_or(Val::map());
         let spacemap = d.get("spacemap").cloned().filter(|v| v.is_truthy()).unwrap_or(Val::map());
         LayoutDef::new(
-            req_u64(d, "layout_id")?,
+            req_id(d, "layout_id")?,
             req_nat(d, "realm_id")?,
             req(d, "name")?.py_str(),
             &req(d, "kind")?.py_str(),
@@ -542,7 +565,7 @@ impl IndexDef {
                 "casefold" => self.options.get("casefold").map(|v| v.is_truthy()).unwrap_or(true),
             };
             return vmap! {
-                "index_id" => self.index_id as i64, "realm_id" => &self.realm_id,
+                "index_id" => Val::int(self.index_id), "realm_id" => &self.realm_id,
                 "name" => self.name.as_str(), "v" => 0i64, "description" => self.description.as_str(),
                 "kind" => KIND_TOKEN, "source_v" => Val::None, "options" => compat,
                 "v024_kind" => KIND_FULLTEXT, "v024_source_v" => self.field_v(),
@@ -550,7 +573,7 @@ impl IndexDef {
             };
         }
         vmap! {
-            "index_id" => self.index_id as i64, "realm_id" => &self.realm_id,
+            "index_id" => Val::int(self.index_id), "realm_id" => &self.realm_id,
             "name" => self.name.as_str(), "v" => &self.v, "description" => self.description.as_str(),
             "kind" => self.kind.name(), "source_v" => Val::opt_nat(self.source_v.as_ref()),
             "options" => self.options.clone(),
@@ -560,7 +583,7 @@ impl IndexDef {
     pub fn from_val(d: &Val) -> Result<Self> {
         let base = |kind: IndexKind, v: Nat, source_v: Option<Nat>, options: Val| -> Result<IndexDef> {
             Ok(IndexDef {
-                index_id: req_u64(d, "index_id")?,
+                index_id: req_id(d, "index_id")?,
                 realm_id: req_nat(d, "realm_id")?,
                 name: req(d, "name")?.py_str(),
                 v,
@@ -581,5 +604,26 @@ impl IndexDef {
             Some(_) => Some(req_nat(d, "source_v")?),
         };
         base(kind, req_nat(d, "v")?, source_v, opts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_ids_out_of_range_are_corruption() {
+        // F004: negative or > 2^63-1 IDs are never clamped on load.
+        for bad in ["-5", "9223372036854775808", "18446744073709551615", "1.5", "\"7\""] {
+            let js = format!(r#"{{"shape_id": {bad}, "realm_id": 1, "name": "s", "fields": []}}"#);
+            let v = Val::from_json(&js).unwrap();
+            assert!(matches!(ShapeDef::from_val(&v), Err(Error::Corruption(_))), "{bad}");
+        }
+        let v = Val::from_json(r#"{"shape_id": 9223372036854775807, "realm_id": 1, "name": "s", "fields": []}"#).unwrap();
+        assert_eq!(ShapeDef::from_val(&v).unwrap().shape_id, MAX_ID);
+        let s = ShapeDef::new(MAX_ID, Nat::ONE, "s".into(), vec![], String::new()).unwrap();
+        assert_eq!(ShapeDef::from_val(&Val::from_json(&s.to_val().to_json().unwrap()).unwrap()).unwrap().shape_id, MAX_ID);
+        assert!(matches!(ShapeDef::new(MAX_ID + 1, Nat::ONE, "s".into(), vec![], String::new()), Err(Error::Value(_))));
+        assert!(matches!(check_id("index_id", u64::MAX), Err(Error::Value(_))));
     }
 }

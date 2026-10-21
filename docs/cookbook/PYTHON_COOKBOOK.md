@@ -1,7 +1,7 @@
 # NHyDB Python Cookbook
 
 Practical, copy-and-paste recipes for the Python package
-[`nhydb`](https://pypi.org/project/nhydb/) (version 0.27.1). The recipes
+[`nhydb`](https://pypi.org/project/nhydb/) (version 0.28.0). The recipes
 need no knowledge of the Rust core.
 
 Every Python block in this cookbook is a complete program: it has its own
@@ -46,8 +46,8 @@ NumPy package.
 ## 1. Installation, import and version
 
 ```bash
-pip install nhydb            # prebuilt wheels: CPython 3.9–3.14 on Linux, macOS, Windows
-pip install numpy            # optional, for the NumPy batch API (section 16)
+python -m pip install nhydb            # prebuilt wheels: CPython 3.9–3.14 on Linux, macOS, Windows
+python -m pip install numpy            # optional, for the NumPy batch API (section 16)
 ```
 
 ```python
@@ -55,17 +55,19 @@ import nhydb
 
 print(nhydb.ENGINE_VERSION)        # product version of the installed package
 print(nhydb.FILE_FORMAT_VERSION)   # identifier of the on-disk format
-assert nhydb.ENGINE_VERSION == "0.27.1"
+assert nhydb.ENGINE_VERSION == "0.28.0"
 assert nhydb.FILE_FORMAT_VERSION == "0.16"
 ```
 
 ```text
-0.27.1
+0.28.0
 0.16
 ```
 
-`FILE_FORMAT_VERSION` only changes when the file format changes; it is not a
-product version.
+`FILE_FORMAT_VERSION` identifies the block format (file identifier
+`NHYDB016`); it is not a product version. NHyDB 0.28.0 keeps this
+identifier but protects the schema digest with the key: databases created
+with NHyDB 0.27.1 or earlier do not open (section 21).
 
 ---
 
@@ -84,9 +86,10 @@ product version.
 * **Layout.** How logical records map onto cells. **CLASSIC** (record =
   `u`, field = `v`) is the common case; COLUMN, PACKED, CUSTOM and MATH
   are covered in sections 17 and 18.
-* **Dense and sparse.** Records written in batches are stored *dense*;
-  single cells, extensions and overrides are stored *sparse*. Reading
-  combines both; the newest write wins.
+* **Dense and sparse.** CLASSIC records (`put`, `put_record`,
+  `put_dense_batch`, `put_numpy_batch`) are stored *dense*; single cells,
+  extensions and overrides are stored *sparse*. Reading combines both; the
+  newest write wins.
 * **Commit boundary.** The file is append-only. Data becomes durable with
   `commit()`. Everything after the last commit is discarded when the
   database is opened again.
@@ -183,7 +186,7 @@ All options are keyword arguments.
 | `lock_timeout_ms=0` | ✓ | ✓ | wait for the lock instead of failing immediately |
 | `layout_path`, `key_path` | ✓ | ✓ | other locations of the schema and key files (section 21) |
 | `config` | ✓ | ✓ | path of a `nhydb_config.toml` (section 19) |
-| `strict=True` | | ✓ | accepted, but has no effect in 0.27.1 (opening is always fail-closed) |
+| `readonly=True` | | ✓ | open without changing the file (no lock, no commit; write APIs raise `NHyDBError`) |
 
 ```python
 import os
@@ -256,12 +259,16 @@ True 0 None
 * `close(commit=True)` commits and releases the file and the lock.
   `close(commit=False)` closes without committing.
 * After `close()` the file handle and the lock are released immediately.
-  Writes and uncached reads raise `NHyDBError("database is closed")`;
-  calling `close()` again does nothing. Do not use a closed object for
-  reading either: in 0.27.1 a record that was read before `close()` may
-  still be returned from the in-memory cache.
+  Every read, write, query or index call and every open iterator then
+  raises `NHyDBError("database is closed")`, also for data that was read
+  before; calling `close()` again does nothing.
 * Uncommitted data is discarded when the database is opened again;
-  `recovered_tail_bytes` tells you how many bytes were cut off.
+  `recovered_tail_bytes` tells you how many bytes were cut off. This only
+  happens when the commit boundary is unambiguous: if one of the two
+  superblocks is damaged and data follows the boundary, opening fails with
+  `CorruptionError` and changes nothing (open with `readonly=True` to read,
+  use `repair_file` to resolve – section 20). Committed data is never cut
+  off silently.
 
 ```python
 import os
@@ -297,16 +304,67 @@ database is closed
 ```
 
 **Durability modes.** `"fsync"` (default) uses the operating system's file
-sync. `"full"` additionally flushes the drive cache on macOS
-(`F_FULLFSYNC`); on Linux and Windows both modes perform the same call.
+sync (on macOS with an `F_BARRIERFSYNC` write barrier before the
+superblock). `"full"` additionally flushes the drive cache on macOS: the
+data are ordered before the superblock with `F_BARRIERFSYNC`, and the
+superblock sync is an `F_FULLFSYNC` that flushes data and superblock to the
+medium before `commit()` returns; on Linux and Windows both modes perform
+the same call.
 `"full"` is slower; on macOS it raises an error if the file system does not
-support it.
+support it. The aliases `"default"`/`"normal"` (= `"fsync"`) and
+`"fullfsync"` (= `"full"`) are accepted. If a sync fails during a commit,
+the object refuses further commits; reopen the database.
 
-**There is no rollback API.** Atomicity comes from the commit boundary: to
-discard work, close with `commit=False` (or let the process end) before
-committing. Note that a single call that writes several blocks (for example
-`put_points` across many `u` windows) is not atomic as a whole – only
-`put_math_batch` rolls back completely on errors.
+**Rollback.** `rollback()` discards every write and every schema change of
+this object since its last commit and returns the commit boundary. The
+object stays open and usable; session settings (registered plugins,
+`durability`) are kept. Without pending changes it does nothing. A
+`readonly=True` object raises `NHyDBError`; with `lock=False` a commit of
+another writer is detected first and raises `DatabaseLockedError` (nothing
+is cut). Closing with `commit=False` (or ending the process) before a
+commit discards the work as well. A single call that writes several blocks
+(for example `put_points` across many `u` windows) is not atomic as a
+whole – use `rollback()` after an error, or rely on `put_math_batch`, which
+rolls back by itself.
+
+```python
+import os
+import tempfile
+
+import nhydb
+
+path = os.path.join(tempfile.mkdtemp(), "rollback.nhydb")
+with nhydb.create(path) as db:
+    db.create_realm(1, "r")
+    db.create_shape(1, 1, "s", [{"v": 1, "name": "n", "type": "varuint"}])
+    db.create_classic_layout(1, 1, "c", shape_id=1)
+    db.put_record(1, 1, {"n": 100}, commit=True)
+    boundary = db.committed_end
+
+    db.put_record(1, 1, {"n": 111})                 # overwrite, not committed
+    db.put_record(1, 2, {"n": 200})
+    db.create_realm(2, "scratch")                   # schema change, not committed
+    print(db.get_record(1, 1)["n"], sorted(db.realms))
+
+    print(db.rollback() == boundary)                # back to the last commit
+    print(db.get_record(1, 1)["n"], db.get_record(1, 2), sorted(db.realms))
+    db.put_record(1, 3, {"n": 300}, commit=True)    # the handle stays usable
+
+with nhydb.open(path, readonly=True) as db:
+    print(db.get_record(1, 3)["n"])
+    try:
+        db.rollback()
+    except nhydb.NHyDBError as e:
+        print(e)
+```
+
+```text
+111 [1, 2]
+True
+100 None [1]
+300
+database is opened read-only (readonly=True); rollback is not possible
+```
 
 ---
 
@@ -360,10 +418,17 @@ Carol
 none yet, and `set_realm_default_shape(realm_id, shape_id)` changes it.
 
 **Overwrite and delete.** Writing the same `u` again replaces the record
-(the newest write wins). `delete_record(layout_id, object_id)` deletes a
-record including its extension cells and returns the number of deleted
-items (the dense record counts as one, plus one per extension cell);
-`delete(realm_id, u)` hides the dense record at `u`.
+(the newest write wins). `delete_record(layout_id, object_id)` is the
+standard way to delete a record completely: it hides the dense record and
+deletes all single cells stored for it (extension values and fields written
+as single cells with `put_cell`, `put_cells_numpy` or `batch()`). It
+returns the number of deleted items (the dense record counts as one, plus
+one per deleted cell). `delete(realm_id, u)` only hides the dense record as
+written by `put`/`put_dense_batch` and returns `True`/`False`; fields
+written afterwards as single cells and extension values stay visible
+through `get_value`/`get_cell`, queries and indexes (section 7). Deleted
+data stays in the append-only file until `compact_file()` removes it
+physically (section 20).
 
 ```python
 import os
@@ -496,6 +561,25 @@ None
 None right
 ```
 
+`delete_cell` returns `True` if the cell had a value and `False` otherwise;
+for an empty cell it writes nothing. `delete(realm, u)` returns `True`/
+`False` in the same way, `delete_record` the number of deleted elements.
+Deleting a single field of a dense record with `delete_cell` makes it read
+as `None`; the other fields stay.
+
+**Which delete to use.** A record can consist of a dense part (written by
+`put`/`put_dense_batch`) and sparse cells on top of it (fields written
+later with `put_cell`, `put_cells_numpy` or `batch().put_cell`, and
+extensions). `delete_record(layout_id, object_id)` removes both and is the
+way to delete a record completely. `delete(realm, u)` hides only the dense
+part: the sparse cells stay visible to `get_value`, `get_cell`, queries and
+indexes, while `get(realm, u)` returns `None`. Use `delete_cell`/
+`delete_point` to remove individual cells, for example to drop one field
+but keep the extensions. `delete_point` always writes a tombstone and
+returns the write report of `put_points`.
+Coordinates must be integers: `int`, NumPy integers and integral floats such
+as `3.0` are accepted, `2.7` raises `TypeError` (no silent truncation).
+
 Lanes can be given as `"NL"`/`"NR"`, `0`/`1` (also lower case). Without
 `type=` and without a declared field the write is rejected:
 
@@ -546,6 +630,52 @@ with nhydb.create(path) as db:
 ```text
 4 3
 21.0 b'\x00\x01'
+None
+```
+
+**Collecting single cells: `batch()`.** Many single `put_cell` calls each
+write a small block. `with db.batch(commit=False, u_window=10_000) as b:`
+collects `b.put_cell(...)` and `b.delete_cell(...)` (same arguments as on
+the database) and writes them when the block ends, with one `put_points`
+per realm and lane – fewer, larger blocks and a smaller file. Every call is
+checked immediately (same errors as `put_cell`/`delete_cell`); the last
+call per cell wins; reads inside the block do **not** see the collected
+cells; if the block ends with an exception, nothing is written.
+`commit=True` commits after writing. `b.flush()` writes early,
+`b.discard()` drops the collected cells, `len(b)` counts them.
+
+```python
+import os
+import tempfile
+
+import nhydb
+
+path = os.path.join(tempfile.mkdtemp(), "batch.nhydb")
+with nhydb.create(path) as db:
+    db.create_realm(1, "sensors")
+    db.put_cell(1, 5, 1, 99.0, type="f64", commit=True)
+
+    with db.batch(commit=True) as b:               # collect, write once at the end
+        for u in range(1, 1001):
+            b.put_cell(1, u, 1, u / 10, type="f64")
+        b.put_cell(1, 7, 1, -1.0, type="f64")      # last call per cell wins
+        b.delete_cell(1, 5, 1)                     # written as a tombstone at the end
+        print(len(b), db.get_value(1, 7, 1))       # no read-your-writes inside the block
+    print(db.get_value(1, 7, 1), db.get_value(1, 5, 1), db.get_value(1, 1000, 1))
+
+    try:
+        with db.batch() as b:
+            b.put_cell(1, 2000, 1, 1.0, type="f64")
+            b.put_cell(1, 2001, 1, "text", type="f64")   # checked at the call
+    except (TypeError, ValueError) as e:
+        print(type(e).__name__)
+    print(db.get_value(1, 2000, 1))                # an exception writes nothing
+```
+
+```text
+1000 None
+-1.0 None 100.0
+ValueError
 None
 ```
 
@@ -902,7 +1032,11 @@ u8 out of range -> ValueError
 `range`, `select`, `select_us`, `find` (section 13) and the
 `iter_materialized_*` methods return **lazy iterators**: records are loaded
 block by block, so memory use does not depend on the result size. Gaps in
-`u` are skipped efficiently.
+`u` are skipped efficiently. After `close()` an iterator raises
+`NHyDBError("database is closed")`. `find` takes its list of matching `u`
+from the index at the first `next()` and keeps it: later writes neither
+raise `StaleIndexError` nor show up in that iterator – create a new one for
+the current state.
 
 ```python
 import itertools
@@ -1016,7 +1150,20 @@ The field can be given by name or by `v`. Indexes are **not** maintained
 automatically: call `build_indexes()` after writing. An index that is older
 than the data is *stale*; the direct index APIs then raise
 `StaleIndexError`, the QueryEngine falls back to scanning, and `verify()`
-reports it.
+lists it under `warnings`.
+
+An index returns exactly what a scan returns:
+
+* Only records of **CLASSIC** layouts are indexed. In a realm that also has
+  COLUMN, PACKED or CUSTOM layouts the QueryEngine scans instead.
+* `== NaN` never matches; ranges skip `None` and NaN; values that cannot be
+  compared with the bounds (text against numbers) simply do not match.
+* `delete(realm, u)` hides the dense fields of a record; extensions and
+  single cells that survive it stay visible to `get_value`/`get_cell`, the
+  QueryEngine and the index (`delete_record` removes them as well,
+  section 7).
+* **After updating NHyDB, rebuild existing indexes** with
+  `build_indexes(commit=True)`.
 
 ```python
 import os
@@ -1146,6 +1293,12 @@ indexes where possible and scans otherwise.
 Return modes: `record` (default), `fields`, `count`, `n`, `cell`,
 `aggregate`; `search()` returns `ranked`.
 
+Comparisons follow Python (`1 == 1.0 == True`); comparing incompatible
+types (text with a number) is simply `False`, `== NaN` never matches, and
+rows with a NaN group value form groups of their own. Unknown columns in
+`select` yield `None`. Expressions may be nested up to 256 levels
+(`QueryPlanError` beyond); long `&`/`|` chains are fine.
+
 ```python
 import os
 import tempfile
@@ -1191,7 +1344,7 @@ with nhydb.create(path) as db:
 VALUE_INDEX by_region
 ```
 
-> **Tip:** In 0.27.1 `order_by` of `QueryEngine.execute` only takes
+> **Tip:** In 0.28.0 `order_by` of `QueryEngine.execute` only takes
 > effect for fields that are also listed in `select`. Include the sort
 > fields in `select` (NHySQL `ORDER BY` works without this restriction).
 
@@ -1387,6 +1540,13 @@ Structural references (`@u` or `STRUCT.u`, also `realm`, `v`, `lane`,
 `n`, `record_n`, `layout_id`, `layout_kind`, `layout_name`, `object`) are
 allowed in `WHERE`, not in the select list. Not supported: `DISTINCT`,
 `HAVING`, joins and all writing statements.
+
+`FROM <layout>` covers only the records routed to that layout; in a realm
+with several CLASSIC layouts each layout sees its own `u` range.
+`x IS NULL` is true only when the field is **missing** in a record (for
+example an extension that was never set); a stored null value counts as
+present. Brackets and `NOT` may be nested up to 256 levels
+(`SQLSyntaxError` beyond).
 The same SQL functions exist on the QueryEngine (`execute_sql`,
 `compile_sql`, `execute_sql_numpy`); `nhydb.query.parse_sql(text)` only
 parses.
@@ -1474,7 +1634,11 @@ with nhydb.create(path) as db:
 
 `read_numpy` returns one array per field plus `_present`; missing records
 have `_present=False` (values 0, NaN or `None`). Integer types come back as
-`int64` (`varuint` as `uint64`), `utf8`/`bytes`/enums as object arrays.
+`int64` (`u64` and `varuint` as `uint64`), `utf8`/`bytes`/enums as object arrays. The
+dtype depends only on the field type; a stored value that does not fit
+(for example a `varuint` above 2^64 − 1) raises `ValueError` unless you pass
+`object_fallback=True`. A `count` too large for the memory raises
+`MemoryError`.
 
 Objects of any layout, sparse cells and query results:
 
@@ -1513,11 +1677,21 @@ with nhydb.create(path) as db:
 ```
 
 Accepted column types: integer arrays of any width and byte order (ranges
-are checked), float arrays, bool arrays, object arrays or lists for text,
-bytes and enum labels. `u`/`v`/object-id arrays are limited to `uint64`;
-use lists of Python `int` for larger coordinates. Invalid input raises
-`ValueError` (wrong length, out of range) or `SchemaError` (missing field)
-before anything is written. `put_math_numpy` is shown in section 18.
+are checked) for integer fields, float or integer arrays for `f32`/`f64`,
+bool or integer arrays for `bool`, object arrays or lists for text, bytes
+and enum labels (integer arrays for enum codes). Columns must be
+one-dimensional and of equal length; bool or float arrays for integer
+fields, numeric arrays for text fields and dtypes such as float16, complex
+or datetime raise `TypeError`. `u`/`v`/object-id arrays are limited to
+`uint64`; use lists of Python `int` for larger coordinates; a scalar `u`/`v`
+is broadcast to all rows. Invalid input raises `TypeError`, `ValueError`
+(wrong length, out of range) or `SchemaError` (missing field) before
+anything is written. A batch becomes one block; it is read and checked
+completely once on first use, after that single accesses read only the
+bytes they need, so large batches stay fast to read (10,000–100,000
+records per batch remain a good default). `read_numpy`/`sql_numpy` return
+writable arrays that share the engine's result memory (no extra copy).
+`put_math_numpy` is shown in section 18.
 
 ---
 
@@ -1689,6 +1863,10 @@ blue 6
 Without a registered plugin, operations that need the mapping raise
 `SchemaError("CUSTOM layout requires registered plugin '…'")`. A plugin
 must not write into the same database from inside a callback.
+`occupied_addresses(db, layout, object_id, lane)` is also called during
+`delete_record`, while `db` is locked (`RuntimeError: Already mutably
+borrowed`); compute the addresses from `layout`, `object_id` and `lane`
+only and do not call `db` there.
 
 `create_layout(...)` is the generic form of all `create_*_layout` methods
 (`kind="CLASSIC" | "COLUMN" | "PACKED" | "CUSTOM"`, `replace=True` to
@@ -1735,7 +1913,17 @@ Expressions use Python syntax for integers: `+ - * // % **`, comparisons,
 `and`/`or`/`not` and the functions `abs`, `gcd`, `lcm`, `isqrt`, `min`,
 `max`. Not allowed: `/`, bit operators, attributes, conditional
 expressions. Errors raise `MathSyntaxError` or `MathDomainError` (both
-subclasses of `MathError`).
+subclasses of `MathError`, which is an `NHyDBError`). Brackets may be
+nested 200 levels deep as in CPython; long `+` chains are fine.
+
+**Logical and physical realms.** `V` is split into a *logical* realm
+(`⌊(V−1)/10^100⌋ + 1`, unbounded – 10^5000 is fine) and a local `v`. The
+engine stores the cell under the next free *physical* realm (small numbers
+from 1 upward) and keeps the mapping in the encrypted layout plan. The
+`N` of a stored MATH cell is therefore computed from the physical realm;
+`get_math_cell` also reports `_logical_realm` and `_V_global`.
+`realm_auto_limit` limits the **number** of logical realms a layout may
+use, not their size.
 
 Check a mapping before writing with `dry_run` (no database needed):
 
@@ -1892,6 +2080,21 @@ finally:
 too large
 ```
 
+There are two independent bit limits. Inside a database the limit comes
+from `[math] math_max_intermediate_bits` of the configuration (default
+2^20) and is **frozen into each MATH layout when it is created**
+(`db.math_layouts[id].max_intermediate_bits`). `set_math_max_intermediate_bits`
+changes only the process-wide limit for standalone `MathExpression`,
+`MathMap` and `dry_run` objects, as in the example above. Neither limit
+applies to values that a formula only passes through (`u="x"`): such
+inputs may have any size.
+
+**Very large numbers in Python output.** Python refuses to convert integers
+with more than 4,300 decimal digits to text (`ValueError: Exceeds the limit
+… for integer string conversion`). NHyDB stores and returns such numbers
+exactly; only printing them needs `sys.set_int_max_str_digits(0)` (or the
+environment variable `PYTHONINTMAXSTRDIGITS=0`, also for the command line).
+
 ---
 
 ## 19. Configuration and limits
@@ -1928,17 +2131,19 @@ size limit reached
 
 | Section / key | Meaning |
 |---|---|
-| `[database] db_max_size_bytes` | size limit for **new** databases (default 50 GiB) |
-| `[database] durability` | `"fsync"` or `"full"` |
+| `[database] db_max_size_bytes` | size limit for **new** databases (default 50 GiB, at least 64 KiB) |
+| `[database] durability` | `"fsync"` or `"full"` (aliases `"default"`/`"normal"`, `"fullfsync"`) |
 | `[math] realm_auto_limit` | realm budget for new MATH layouts (default 4096) |
-| `[math] math_max_intermediate_bits` | bit limit of MATH expressions |
+| `[math] math_max_intermediate_bits` | bit limit of MATH expressions, frozen into each new MATH layout |
 | `[lock] enabled`, `timeout_ms` | lock file and wait time |
-| `[paths] layout_path`, `key_path` | path templates, `{db}` = database file name |
-| `[cache] …` | accepted, but not used by the engine in 0.27.1 |
+| `[paths] layout_path`, `key_path` | path templates, `{db}` = database file name, `{db_path_hash}` = hash of the absolute database path (for equally named databases sharing a key folder) |
+| `[cache] block_cache_bytes` | budget of the block cache per open object (default 64 MiB, LRU; `0` = no cache); blocks up to max(8 MiB, budget/8) are cached |
+| `[cache] vindex_max_marks`, `vindex_max_indexes` | accepted and checked, not used yet (fixed values) |
 
-Explicit arguments win over the file. Values stored in the database (the
-size limit, the realm budget of a MATH layout) are never overridden when
-opening. Unknown keys are errors. Change the size limit of an existing
+Explicit arguments win over the file (`lock=`/`lock_timeout_ms=` override
+the `[lock]` keys one by one). Values stored in the database (the size
+limit, the realm budget and bit limit of a MATH layout) are never
+overridden when opening. Unknown keys are errors. Change the size limit of an existing
 database with `set_max_db_size`:
 
 ```python
@@ -1956,6 +2161,42 @@ with nhydb.open(path) as db:
 
 ```text
 10485760
+```
+
+**Block cache.** Every block is read completely and CRC-checked once per
+open object; then it is either kept in the block cache or, if it does not
+fit, later read only in the parts that are needed. `stats()["block_cache"]`
+shows the budget, the largest cacheable block, the cached and verified
+blocks and the counters `hits`, `loads`, `partial_reads` and `evictions`:
+
+```python
+import os
+import tempfile
+
+import nhydb
+
+folder = tempfile.mkdtemp()
+with open(os.path.join(folder, "nhydb_config.toml"), "w", encoding="utf-8") as f:
+    f.write("[cache]\nblock_cache_bytes = 16777216\n")      # 16 MiB block cache
+
+path = os.path.join(folder, "cached.nhydb")
+with nhydb.create(path) as db:
+    db.create_realm(1, "r")
+    db.create_shape(1, 1, "s", [{"v": 1, "name": "x", "type": "u32"}])
+    db.create_classic_layout(1, 1, "c", shape_id=1)
+    db.put_dense_batch(1, 1, [[u] for u in range(1, 10_001)], commit=True)
+
+with nhydb.open(path, readonly=True) as db:
+    for u in (1, 5_000, 10_000):
+        db.get(1, u)
+    bc = db.stats()["block_cache"]
+    print(bc["budget_bytes"], bc["max_item_bytes"])
+    print(bc["loads"], bc["hits"], bc["cached_blocks"], bc["verified_blocks"])
+```
+
+```text
+16777216 8388608
+1 2 1 1
 ```
 
 ---
@@ -2003,20 +2244,27 @@ True 200 True
 ```
 
 * `verify(deep=False)` checks the block structure (`deep=True` also the
-  payload checksums) and reports stale indexes.
+  payload checksums), continues after damage and lists every damaged
+  block; stale indexes appear under `warnings` (they are not errors).
 * `health(deep=False)` runs the checks `container`, `layouts`, `spacemap`,
   `layout_routing`, `math_layouts`, `definitions`, `indexes` and
-  `checkpoint`; status `healthy`, `warning` or `unhealthy`. A database
-  without a recent checkpoint reports a `checkpoint` warning;
+  `checkpoint`; status `healthy`, `warning` or `unhealthy` (a stale index
+  is a `warning`). A database without a recent checkpoint reports a
+  `checkpoint` warning;
   `checkpoint()` writes one (a diagnostic snapshot of the segment
   structure; it does not replace older blocks).
 * `stats()` reports file, format, realms, shapes, layouts, extensions,
-  indexes and storage statistics.
+  indexes and storage statistics, and under `block_cache` the block cache
+  of this object (section 19).
 * `compact_file(path, output=None, make_backup=True, ...)` is static and
   needs the database to be closed. In place it keeps the identity and side
-  files and writes a backup `<db>.before_compact_<timestamp>` (unless
+  files and writes a backup `<db>.before_compact_<timestamp>` plus
+  `<db>.before_compact_<timestamp>.layout.enc` (unless
   `make_backup=False`). With `output=` it exports to a **new** database
-  with its own side files.
+  with its own side files. A failed compaction leaves the source unchanged
+  and removes only the files it created. Memory use is bounded by one
+  batch (`batch_records`), not by the size of the database: records are
+  copied as raw bytes and sparse cells in chunks.
 
 **Repairing a damaged tail.** `inspect_tail` checks the end of the file
 without opening it; `repair_file(path, apply=False)` only reports,
@@ -2053,10 +2301,35 @@ True True
 kept
 ```
 
-`repair_file` never "repairs" committed data: if the damage lies before the
-last commit it raises `CorruptionError`. Opening a database with a damaged
-tail also works – the writer cuts off everything after the commit
-boundary automatically.
+`repair_file` never sacrifices committed data silently:
+
+* If intact committed blocks lie behind a damaged spot, it raises
+  `CorruptionError` and changes nothing. `allow_data_loss=True` cuts them
+  anyway and lists them in `lost_blocks`.
+* Uncommitted blocks after the commit boundary are discarded
+  (`discarded_uncommitted_blocks`); `keep_uncommitted=True` keeps intact
+  ones (`kept_uncommitted_blocks`).
+* If one superblock is damaged and complete blocks follow the boundary, you
+  must decide explicitly with one of these two switches.
+* The dry run (`apply=False`) reports the planned `action` (`none`,
+  `repair` or `abort`) and, if it would refuse, `plan_error`.
+* The backup consists of `<db>.bak_<timestamp>` and
+  `<db>.bak_<timestamp>.layout.enc`.
+
+Opening a database with a damaged tail also works – the writer cuts off
+everything after the commit boundary automatically, as long as both
+superblocks agree. If they do not (only possible after a power or system
+failure while a superblock was written – a killed process never causes
+it), opening fails without changing the file: `nhydb.open(path,
+readonly=True)` still reads the previous committed state, and
+`repair_file(path, apply=True, keep_uncommitted=True)` keeps the intact
+blocks after the boundary (`allow_data_loss=True` discards them).
+
+To go back to a backup of `repair_file` or `compact_file`, call
+`nhydb.NHyDB.restore_backup(backup_path, path)` (command line:
+`nhydb restore BACKUP DB`). It checks that the backup belongs to the
+database and opens with its key, then replaces the data file and the layout
+plan; the key file stays as it is.
 
 ---
 
@@ -2075,11 +2348,24 @@ Rules:
   `.layout.key`) while the database is **closed**. Keep a copy of the key
   file in a safe place; a lost key cannot be recovered.
 * The file name is part of the database identity: a renamed `.nhydb` does
-  not open. Restore backups under the **same file name** (another folder is
-  fine). To create a copy under a new name use
-  `compact_file(path, output=new_path)`.
+  not open (also not a change of upper/lower case only). Restore backups
+  under the **same file name** (another folder is fine). To create a copy
+  under a new name use `compact_file(path, output=new_path)`.
 * Only the schema is encrypted. The data in `X.nhydb` is stored in plain
   form; protect the files with file-system permissions or disk encryption.
+* The key file is created with permissions `0600` on Unix; if it is
+  readable by group or others, opening issues a `RuntimeWarning` (also in
+  `db.open_warnings`). **Windows:** the key file inherits the ACL of its
+  folder – NHyDB sets no ACL of its own. Keep key files in a folder only you
+  can access (for example below `%USERPROFILE%`) or point `key_path` there.
+* A backup copy on read-only media can be inspected with
+  `nhydb.open(path, readonly=True)`.
+* **Databases of NHyDB 0.27.1 or earlier do not open** with 0.28.0, also
+  not with `readonly=True`: opening fails closed with `CorruptionError`
+  (the message names 0.27.1) and changes nothing. There is no migration and
+  `repair_file` cannot convert such a file (its dry run reports
+  `action: "abort"`). Export the data with NHyDB 0.27.1 and re-import it
+  into a new database with 0.28.0.
 
 ```python
 import os
@@ -2166,23 +2452,38 @@ True
 
 ## 22. Errors, locks and concurrent access
 
-All engine errors derive from `nhydb.NHyDBError`, except the MATH
+All engine errors derive from `nhydb.NHyDBError`, including the MATH
 expression errors (`MathError`), the MATH realm planner (`LayoutError`)
-and the query layer (`QueryError`). `IndexConfigError` is a `ValueError`.
+and the query layer (`QueryError`). Only `IndexConfigError` is a
+`ValueError` instead.
 
 ```text
 NHyDBError
 ├── CorruptionError, SchemaError, StaleIndexError, RealmLimitError, AddressError
 ├── DatabaseLockedError, DatabaseSizeLimitError
-└── MathLayoutError ── MathLayoutNotFound, MappingFrozenError, MathCellConflictError
-MathError ── MathSyntaxError, MathDomainError
-LayoutError ── LayoutStateError, RealmBudgetExceeded, StalePlanError, AllocationConflictError
-QueryError ── QueryPlanError, QueryDomainError, SQLSyntaxError
+├── MathLayoutError ── MathLayoutNotFound, MappingFrozenError, MathCellConflictError
+├── MathError ── MathSyntaxError, MathDomainError
+├── LayoutError ── LayoutStateError, RealmBudgetExceeded, StalePlanError, AllocationConflictError
+└── QueryError ── QueryPlanError, QueryDomainError, SQLSyntaxError
 ValueError ── IndexConfigError
 ```
 
-The engine also raises `ValueError`, `TypeError`, `KeyError`,
-`FileNotFoundError` and `FileExistsError` for invalid arguments.
+The engine also raises built-in exceptions:
+
+* `ValueError`, `TypeError`, `KeyError` for invalid arguments (for example
+  `TypeError` for `u=2.7`, `ValueError` for IDs above 2^63 − 1 or values
+  nested deeper than 256 levels);
+* `OverflowError` when a Python integer does not fit a 64-bit parameter
+  (for example `u_window=2**64`), `UnicodeEncodeError` for text with lone
+  surrogates;
+* `MemoryError` when a result cannot fit into memory;
+* `OSError` subclasses with `errno` and, where known, `filename`:
+  `FileNotFoundError`, `FileExistsError`, `PermissionError`,
+  `IsADirectoryError` …;
+* `RuntimeError` when one object is used by two threads at the same time,
+  or when a plugin calls back into a database that is writing.
+
+Damaged files always raise `CorruptionError`.
 
 ```python
 import nhydb
@@ -2198,15 +2499,18 @@ except nhydb.NHyDBError as e:
 
 ```text
 True
-False True
+True True
 True True
 AddressError
 ```
 
-**One open database object per file.** Opening a database takes an
-exclusive lock on `<db>.lock` – also for reading. A second open (in the
-same or in another process) raises `DatabaseLockedError`, unless it waits
-with `lock_timeout_ms`. There is no shared read mode in NHyDB.
+**One writing object per file.** Opening a database for writing takes an
+exclusive lock on `<db>.lock`. A second such open (in the same or in
+another process) raises `DatabaseLockedError`, unless it waits with
+`lock_timeout_ms`. Readers that must not block can open with
+`readonly=True`: no lock, nothing in the file is changed, write calls and
+`commit()` raise `NHyDBError`, and the object sees the committed state at
+the time it was opened (later commits of the writer are not reloaded).
 
 ```python
 import os
@@ -2225,6 +2529,8 @@ with nhydb.open(path) as db:
         nhydb.open(path)                                # same process, second object
     except nhydb.DatabaseLockedError:
         print("locked (same process)")
+    with nhydb.open(path, readonly=True) as reader:     # readers need no lock
+        print("read-only:", reader.readonly)
 
 holder = textwrap.dedent("""
     import sys, time, nhydb
@@ -2248,12 +2554,29 @@ proc.stdout.close()
 
 ```text
 locked (same process)
+read-only: True
 locked (other process)
 opened after waiting
 ```
 
 `lock=False` disables the lock file. Only use it when you can guarantee
-that no other process opens the database at the same time.
+that no other process opens the database at the same time; with
+`lock=False` an uncommitted tail is never cut off (`DatabaseLockedError`).
+The lock file never follows a symbolic link.
+
+**Threads.** Long calls release the GIL while the Rust core works: queries
+(`query`, `sql`, `sql_numpy`, `explain_query`, `QueryEngine` methods),
+`stats`, `health`, `verify`, `read_numpy`, the batch writers, `commit`,
+`rollback` and the static file operations. Python callbacks (query
+providers, layout plugins) take the GIL back for their call. Short calls
+such as `get` and `find_u` keep the GIL on purpose (handing it over would
+cost more than the call). Several threads may run read-only queries on the
+same object at the same time; a write, `commit` or `rollback` while another
+call holds the object fails immediately with `RuntimeError`
+("Already borrowed") – it does not wait and changes nothing. For parallel
+work give each thread its own object (readers with `readonly=True`; four
+threads with own objects run SQL scans about 2.9 times faster than one) or
+protect a shared object with a `threading.Lock`.
 
 ---
 
@@ -2305,8 +2628,14 @@ python -m nhydb.query shop.nhydb --realm 1 --eq "status=paid" --return count
 Commands: `to-n`, `from-n`, `layout`, `layout-check`, `layout-plan`,
 `evolve-layout`, `route`, `describe`, `logical-address`, `occupied`,
 `stats`, `health`, `get`, `address`, `cell`, `cell-n`, `find`, `verify`,
-`rebuild-indexes`, `repair`, `compact`. The CLI uses the default side-file
-locations or the configuration file. The same calls from Python:
+`rebuild-indexes`, `repair`, `restore`, `compact`. The CLI uses the default
+side-file locations or the configuration file. Read commands open the
+database with `readonly=True` and never change the file; `verify` also works
+on damaged files. `repair` is a dry run unless `--apply` is given
+(`--allow-data-loss`, `--keep-uncommitted` as in `repair_file`). Exit codes:
+`0` success, `1` a check found problems, `2` usage error or refused
+operation, `3` error (message on stderr, no traceback). In JSON output
+`bytes` appear as `{"$bytes_b64": "…"}`. The same calls from Python:
 
 ```python
 import json
@@ -2360,27 +2689,37 @@ creates its database in a temporary directory:
 
 ## 26. Known limitations
 
-* **One open object per database.** The exclusive lock is taken for every
-  open, also for reading; there is no shared read mode and no multi-process
-  transaction.
-* **No rollback API.** Atomicity comes from the commit boundary;
-  multi-block calls are not atomic as a whole (exception: `put_math_batch`).
+* **One writing object per database.** The exclusive lock is taken for
+  every read-write open; further readers use `readonly=True` (no lock,
+  state at the time of opening). There are no multi-process transactions.
+* **One writing call per object.** A write on an object that another
+  thread is using raises `RuntimeError`; parallel read-only queries on one
+  object are allowed, separate objects per thread scale best.
+* **Rollback per object.** `rollback()` returns to the last commit of the
+  object; multi-block calls are not atomic by themselves (exception:
+  `put_math_batch`). There are no nested or multi-object transactions.
+* **`batch()`** has no read-your-writes inside the block.
 * **Context manager commits** on exit, even after an exception.
 * **Key file.** Without the matching `*.layout.key` the database cannot be
   opened; a lost key cannot be recovered. Only the schema is encrypted, not
   the data.
 * **Renamed database files** do not open (use `compact_file(output=...)`).
-* **Indexes** are not maintained automatically (`build_indexes`).
+* **No upgrade of older files.** Databases created with NHyDB 0.27.1 or
+  earlier raise `CorruptionError`; export them with 0.27.1 and re-import
+  the data (section 21).
+* **Indexes** are not maintained automatically (`build_indexes`), cover
+  CLASSIC records only and should be rebuilt after updating NHyDB.
 * **NHySQL** is read-only and works on CLASSIC layouts; no `DISTINCT`,
   `HAVING` or joins.
 * **QueryEngine `order_by`** only takes effect for fields listed in
-  `select` (0.27.1).
-* **Closed objects:** do not read through a closed database object; a
-  previously read record may still be returned from the cache (0.27.1).
+  `select` (0.28.0).
+* **Large batches:** the first access to a block reads and checks the
+  whole block once (a block of 1 million records is about 25 MB); later
+  accesses read only the needed bytes.
 * **CUSTOM layouts** need their plugin registered after every open;
   plugins must not write to the same database during a callback.
-* **`[cache]` configuration** keys and the `strict` open option are
-  accepted but not used in 0.27.1.
+* **`[cache]` configuration:** only `block_cache_bytes` is used; the
+  `vindex_*` keys are accepted but not used yet.
 * **NumPy coordinate arrays** (`u`, `v`, object ids) are limited to
   `uint64`; use Python `int` lists for larger values.
 * **Durability `full`** raises an error on macOS file systems without
@@ -2399,7 +2738,7 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | Name | Purpose | Key parameters | See |
 |---|---|---|---|
 | `create(path, **options)` / `NHyDB.create` | create a database | *overwrite, durability, lock, lock_timeout_ms, layout_path, key_path, config* | 3, 4 |
-| `open(path, **options)` / `NHyDB(path, ...)` | open a database | as `create` plus *strict* | 3, 4 |
+| `open(path, **options)` / `NHyDB(path, ...)` | open a database | as `create` plus *readonly* (without *overwrite*) | 3, 4, 22 |
 | `dynadron_n(realm, u, v, lane)` | address → N | | 9 |
 | `n_to_dynadron_address(n)` | N (int or `"N…"`) → address | | 9 |
 | `parse_n_reference(ref)` | `"N589"` → 589 | | 9 |
@@ -2418,16 +2757,18 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | Method / attribute | Purpose | Key parameters | See |
 |---|---|---|---|
 | `commit()` | make data durable; returns the commit boundary | | 5 |
+| `rollback()` | discard all changes since the last commit; returns the commit boundary | | 5 |
 | `sync()` | write buffers (no commit) | *hard=False* | 6 |
 | `close()` | release file and lock | *commit=True* | 5 |
 | `checkpoint()` | write a checkpoint block and commit | | 20 |
-| `closed`, `path`, `layout_path`, `key_path`, `config_source` | state and file locations | | 4 |
+| `closed`, `path`, `layout_path`, `key_path`, `config_source`, `readonly`, `open_warnings` | state, file locations (absolute) and warnings on open | | 4, 21, 22 |
 | `durability` | `"fsync"`/`"full"`, writable | | 4, 5 |
 | `max_db_size_bytes`, `set_max_db_size(size)` | size limit | | 19 |
 | `committed_end`, `last_valid_end`, `checkpoint_offset`, `next_block_id`, `recovered_tail_bytes` | container state | | 4, 5, 6, 20 |
-| `stats()`, `health()`, `verify()` | statistics and checks | *deep=False* | 20 |
-| `NHyDB.inspect_tail(path)` | check the file tail without opening | | 20 |
-| `NHyDB.repair_file(path)` | cut off a damaged tail | *apply=False, make_backup=True, rebuild_indexes=True*, side-file options | 20 |
+| `stats()`, `health()`, `verify()` | statistics (incl. `block_cache`) and checks | *deep=False* | 19, 20 |
+| `NHyDB.inspect_tail(path)` | check the file (superblocks, tail, damaged blocks) without opening | | 20 |
+| `NHyDB.repair_file(path)` | restore a consistent state; never cuts committed data silently | *apply=False, make_backup=True, rebuild_indexes=True, allow_data_loss=False, keep_uncommitted=False*, side-file options | 20 |
+| `NHyDB.restore_backup(backup, path)` | put a backup of repair/compaction back in place | side-file options | 20 |
 | `NHyDB.compact_file(path)` | rewrite in place or export | *output=None, make_backup=True, rebuild_indexes=True, batch_records=10000*, side-file options | 20, 21 |
 | `get_system_metadata()`, `get_system_cell(v)` | system space R0,u1 | | 23 |
 
@@ -2435,7 +2776,7 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 
 | Method / attribute | Purpose | Key parameters | See |
 |---|---|---|---|
-| `create_realm(realm_id, name)` | define a realm | *description, default_shape_id, base_reserve_to* | 3, 8 |
+| `create_realm(realm_id, name)` | define a realm (an occupied ID raises `SchemaError`; same for shapes, layouts and indexes) | *description, default_shape_id, base_reserve_to* | 3, 8 |
 | `realms`, `realm_bounds(realm_id)` | realm definitions, `v` range | | 4, 9 |
 | `create_shape(shape_id, realm_id, name, fields)` | BASE fields `[{v, name, type, enum?}]` | *description* | 3, 6 |
 | `set_realm_default_shape(realm_id, shape_id)` | default shape | | 6 |
@@ -2461,9 +2802,11 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | `put_object(layout_id, object_id, values)`, `put_objects_batch(layout_id, objects)` | records of any layout | *u_window* | 17 |
 | `put_cell(realm_id, u, v, value)` | one cell | *type* | 7 |
 | `put_points(realm_id, cells)` | many cells `(u, v, value[, type])` | *u_window* | 7 |
+| `batch()` → `WriteBatch` | context manager collecting `put_cell`/`delete_cell`; `flush()`, `discard()`, `len()` | *commit=False, u_window=10000* | 7 |
 | `put_extensions(realm_id, u, mapping)`, `put_extension_list(realm_id, u, vs, values)`, `put_extension_range(realm_id, u, start_v, values)` | extension values | *merge=True* | 8 |
-| `delete_record(layout_id, object_id)`, `delete(realm_id, u)` | delete records | | 6 |
-| `delete_cell(realm_id, u, v)`, `delete_point(realm_id, u, v)` | delete cells | | 7 |
+| `delete_record(layout_id, object_id)` | delete a record completely (dense record plus its single cells and extensions); returns the number of deleted items | | 6, 7 |
+| `delete(realm_id, u)` | hide only the dense record; later single cells and extensions stay visible; returns `True`/`False` | | 6, 7 |
+| `delete_cell(realm_id, u, v)`, `delete_point(realm_id, u, v)` | delete single cells; `delete_cell` returns `True`/`False`, `delete_point` the write report | | 7 |
 
 ### 27.5 `NHyDB` – reading and addresses
 
@@ -2471,7 +2814,7 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 |---|---|---|---|
 | `get_record(layout_id, object_id)`, `get_object(...)` | one record | *include_addresses* (`get_object`) | 3, 6, 17 |
 | `get(realm_id, u)` | dense record with extensions | *include_extensions, dyn_address, dyn_v* | 6, 12 |
-| `get_value(realm_id, u, v)` | value of one cell | | 3, 7 |
+| `get_value(realm_id, u, v)` | value of one cell (`v` also as a column name) | | 3, 7 |
 | `get_cell(realm_id, u, v)` | cell with metadata | *dyn_address=True* | 7 |
 | `get_internal(realm_id, u)` | raw values by `v` | | 6 |
 | `get_record_view(layout_id, object_id)` | record with all cell numbers | *request_n* | 10 |
@@ -2500,7 +2843,7 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | `put_numpy_batch(realm_id, u_start, columns)` | CLASSIC records from arrays | *shape_id* | 16 |
 | `put_objects_numpy(layout_id, object_ids, columns)` | objects of any layout | *u_window* | 16 |
 | `put_cells_numpy(realm_id, u, v, values)` | sparse cells | *type, u_window* | 16 |
-| `read_numpy(realm_id, u_start, count, fields=None)` | columns + `_present` | | 16 |
+| `read_numpy(realm_id, u_start, count, fields=None)` | columns + `_present` | *lane, object_fallback=False* | 16 |
 | `create_math_layout(spec)`, `create_math_map_layout(name, parameters, *, u, V)` | MATH layouts | *layout_id, payload_type, side, realm_auto_limit* | 18 |
 | `replace_math_spec(layout_id, spec)` | only before the first write | *payload_type* | 18 |
 | `put_math(layout_id, inputs, payload)`, `put_math_batch(layout_id, rows)`, `put_math_numpy(layout_id, inputs, payloads)` | write MATH cells | *overwrite=False* | 18 |
@@ -2524,7 +2867,7 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | `MathMap.compile(name, parameters, *, u, V, side)` | mapping; `target`, `targets`, `to_dict`, `from_dict`, `fingerprint` | 18 |
 | `MathMapLayoutSpec(name, mapping, realm_auto_limit)` | specification for `create_math_layout` | 18 |
 | `dry_run(mapping, rows)` → `MathDryRunReport` | check a mapping without a database | 18 |
-| `get_math_max_intermediate_bits()`, `set_math_max_intermediate_bits(bits)` | resource limit (process-wide) | 18 |
+| `get_math_max_intermediate_bits()`, `set_math_max_intermediate_bits(bits)` | resource limit (process-wide, standalone objects only; databases use the configuration value frozen per MATH layout) | 18 |
 | `split_global_v`, `join_global_v`, `normalize_side`, `NL`, `NR`, `REALM_SPAN`, `DEFAULT_*` | helpers and constants | 18 |
 
 ### 27.9 Deliberately not covered by recipes
