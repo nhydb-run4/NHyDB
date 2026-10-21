@@ -8,6 +8,13 @@ coordinates. The SHA-256 of every block payload (SYSTEM blocks only by
 type/id/flags: they hold the random db id, creation time and the plan
 digest) is compared with ``golden/format_blocks.json``.
 
+SECONDARY_INDEX blocks hold zlib-compressed posting lists. The engine
+compresses with the system libz on Unix and with miniz_oxide on Windows;
+both produce valid zlib streams, but the compressed bytes may differ. These
+blocks are therefore compared structurally (header, directory keys, counts
+and codecs) and by their fully decompressed postings against the matching
+block of the checked-in ``golden/golden.nhydb``.
+
 In addition a small database created with this scenario is checked in
 (``golden/golden.nhydb`` + layout plan + *test-only* key). Every future
 version must open and read it.
@@ -24,6 +31,7 @@ import os
 import shutil
 import struct
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
@@ -38,6 +46,8 @@ GOLDEN_DB = GOLDEN_DIR / "golden.nhydb"
 SIDECARS = ("", ".layout.enc", ".layout.key")
 DATA_START = 8192
 BT_SYSTEM = 13
+BT_SECONDARY = 7
+SEC_TAG = b"SI10"
 BIG = 10**100
 HUGE_U = 2**70 + 3
 
@@ -138,6 +148,60 @@ def describe_file(path):
     }
 
 
+def block_payloads(path):
+    """``block_id -> payload`` of all blocks in the file."""
+    raw = Path(path).read_bytes()
+    out, off = {}, DATA_START
+    while off + 32 <= len(raw):
+        magic, _ver, _bt, _flags, bid, plen, _pc, _hc = struct.unpack_from("<4sBBHQQII", raw, off)
+        if magic != b"NHBL":
+            break
+        out[bid] = raw[off + 32: off + 32 + plen]
+        off += (32 + plen + 7) & ~7
+    return out
+
+
+def _get_vu(buf, p):
+    n = shift = 0
+    while True:
+        b = buf[p]
+        p += 1
+        n |= (b & 0x7F) << shift
+        if b < 0x80:
+            return n, p
+        shift += 7
+
+
+def decode_secondary(payload):
+    """SECONDARY payload without its compressed bytes: header, directory
+    (key, count, codec per entry) and the decompressed posting lists."""
+    assert payload[:4] == SEC_TAG
+    p = 4
+    index_id, p = _get_vu(payload, p)
+    source_block_id, p = _get_vu(payload, p)
+    entry_count, p = _get_vu(payload, p)
+    dir_len, p = _get_vu(payload, p)
+    directory, postings = payload[p:p + dir_len], payload[p + dir_len:]
+    entries, q, next_rel = [], 0, 0
+    for _ in range(entry_count):
+        klen, q = _get_vu(directory, q)
+        key = directory[q:q + klen]
+        q += klen
+        rel, q = _get_vu(directory, q)
+        clen, q = _get_vu(directory, q)
+        count, q = _get_vu(directory, q)
+        width = directory[q]
+        q += 1
+        assert rel == next_rel, "posting lists not stored back to back"
+        comp = postings[rel:rel + clen]
+        assert len(comp) == clen, "posting list points beyond the block"
+        entries.append({"key": key, "count": count, "width": width, "postings": zlib.decompress(comp)})
+        next_rel += clen
+    assert q == len(directory), "SECONDARY directory trailing bytes"
+    assert next_rel == len(postings), "SECONDARY postings trailing bytes"
+    return {"index_id": index_id, "source_block_id": source_block_id, "entries": entries}
+
+
 def contents(db):
     """Representative reads of the scenario (compared between golden DB and fresh build)."""
     out = {
@@ -171,7 +235,8 @@ def _load_golden():
 
 
 def test_scenario_format_matches_golden(tmp_path):
-    """The current engine writes byte-identical block payloads for the scenario."""
+    """The current engine writes byte-identical block payloads for the scenario
+    (SECONDARY_INDEX: identical structure and decompressed postings)."""
     p = tmp_path / "golden.nhydb"
     build_scenario(p)
     got = describe_file(p)
@@ -179,9 +244,20 @@ def test_scenario_format_matches_golden(tmp_path):
     assert got["superblock_magic"] == want["superblock_magic"]
     assert [(b["type"], b["block_id"], b["flags"]) for b in got["blocks"]] == \
            [(b["type"], b["block_id"], b["flags"]) for b in want["blocks"]], "block sequence changed"
+    got_payloads, golden_payloads = block_payloads(p), block_payloads(GOLDEN_DB)
     for g, w in zip(got["blocks"], want["blocks"]):
-        assert g == w, f"block {w['block_id']} ({w['type']}) differs: format change? see module docstring"
-    assert got == want
+        msg = f"block {w['block_id']} ({w['type']}) differs: format change? see module docstring"
+        if w["bt"] != BT_SECONDARY:
+            assert g == w, msg
+            continue
+        ref = golden_payloads[w["block_id"]]
+        assert hashlib.sha256(ref).hexdigest() == w["sha256"], "checked-in golden.nhydb and format_blocks.json diverge"
+        assert {k: g[k] for k in ("type", "bt", "version", "block_id", "flags")} == \
+               {k: w[k] for k in ("type", "bt", "version", "block_id", "flags")}, msg
+        assert decode_secondary(got_payloads[g["block_id"]]) == decode_secondary(ref), msg
+    assert got["blocks_end"] == got["file_size"]
+    if all(g == w for g, w in zip(got["blocks"], want["blocks"])):
+        assert got == want
 
 
 def test_scenario_covers_all_file_block_types():
