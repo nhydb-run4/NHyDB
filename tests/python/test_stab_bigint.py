@@ -12,10 +12,17 @@ SPAN = 10**100
 
 @pytest.fixture(autouse=True)
 def _big_str():
+    # The digit limit exists from Python 3.9.14/3.10.7/3.11 on; older
+    # interpreters have no limit, so the tests run unchanged there.
+    if not hasattr(sys, "get_int_max_str_digits"):
+        yield
+        return
     old = sys.get_int_max_str_digits()
     sys.set_int_max_str_digits(0)
-    yield
-    sys.set_int_max_str_digits(old)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(old)
 
 
 def test_bigint_matrix_commit_reopen_verify(tmp_path):
