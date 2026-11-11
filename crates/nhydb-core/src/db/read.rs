@@ -1,7 +1,7 @@
 //! Read APIs: `get`, `get_cell`, object APIs, geometric GET
 //! (`cell`/`record`/`auto`), DESCRIBE, occupancy queries, `range`/`select`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::address::{self, lane_name, n_to_address, CellAddress, Lane};
 use crate::error::{Error, Result};
@@ -71,8 +71,13 @@ impl Db {
                 }
             }
         }
-        if include_extensions {
-            for (v, val) in &rec.extensions_by_v {
+        // cells outside the stored shape: extensions (above the BASE
+        // boundary) only on request; unnamed BASE cells (reserved positions
+        // up to `base_reserve_to`, fields of other shapes) always – they
+        // are BASE, whatever layer holds them
+        let boundary = self.extension_boundary(realm);
+        for (v, val) in &rec.extensions_by_v {
+            if include_extensions || v <= &boundary {
                 set_or_push(&mut items, &self.extension_label(realm, v), val.clone());
             }
         }
@@ -140,9 +145,9 @@ impl Db {
             return Ok(None);
         }
         // P016: BASE field of a dense record without overlays – decode only that field
-        if let Some(seg) = self.resolve_segment(realm, &u, lane) {
+        if let Some(seg) = self.resolve_segment(realm, &u, lane)? {
             let shape_id = seg.shape_id;
-            if let Some(value) = self.dense_base_value(seg, realm, &u, &v, lane)? {
+            if let Some(value) = self.dense_base_value(&seg, realm, &u, &v, lane)? {
                 let name = self.shape_of(shape_id)?.by_v(&v).map(|f| f.name.clone()).unwrap_or_default();
                 let mut out = vmap! {
                     "_realm" => realm, "_u" => &u, "_lane" => lane as i64, "_lane_name" => lane_name(lane),
@@ -172,18 +177,22 @@ impl Db {
             return Ok(Some(out));
         };
         let stored = self.shape_of(rec.shape_id)?;
+        // `present`: the cell lives (a stored None included); a tombstoned
+        // field or a field the stored shape lacks reads as None, not present
+        let live = rec.by_v_get(&v).cloned();
         let (name, value) = if let Some(f) = stored.by_v(&v) {
-            (f.name.clone(), rec.base_by_v.get(&v).cloned().unwrap_or(Val::None))
+            (f.name.clone(), live.clone())
         } else if let Some(cf) = self.current_base_shape(realm).and_then(|b| b.by_v(&v)) {
-            (cf.name.clone(), Val::None)
+            (cf.name.clone(), live.clone())
         } else if let Some(x) = rec.extensions_by_v.get(&v) {
-            (self.extension_label(realm, &v), x.clone())
+            (self.extension_label(realm, &v), Some(x.clone()))
         } else {
             return Ok(None);
         };
+        let present = value.is_some();
         let mut out = vmap! {
             "_realm" => realm, "_u" => &u, "_lane" => lane as i64, "_lane_name" => lane_name(lane),
-            "_v" => &v, "_shape" => rec.shape_id as i64, "field" => name, "present" => true, "value" => value,
+            "_v" => &v, "_shape" => rec.shape_id as i64, "field" => name, "present" => present, "value" => value.unwrap_or(Val::None),
         };
         if dyn_address {
             self.dyn_address(realm, &u, &v)?.flatten_into(&mut out);
@@ -198,8 +207,8 @@ impl Db {
         if v.is_zero() || u.is_zero() {
             return Ok(None);
         }
-        if let Some(seg) = self.resolve_segment(realm, u, lane) {
-            if let Some(value) = self.dense_base_value(seg, realm, u, v, lane)? {
+        if let Some(seg) = self.resolve_segment(realm, u, lane)? {
+            if let Some(value) = self.dense_base_value(&seg, realm, u, v, lane)? {
                 return Ok(Some(value));
             }
         }
@@ -210,12 +219,32 @@ impl Db {
             });
         };
         let stored = self.shape_of(rec.shape_id)?;
-        Ok(if stored.by_v(v).is_some() {
+        Ok(if stored.by_v(v).is_some() || self.current_base_shape(realm).and_then(|b| b.by_v(v)).is_some() {
             Some(rec.base_by_v.get(v).cloned().unwrap_or(Val::None))
-        } else if self.current_base_shape(realm).and_then(|b| b.by_v(v)).is_some() {
-            Some(Val::None)
         } else {
             rec.extensions_by_v.get(v).cloned()
+        })
+    }
+
+    /// Value of a *live* cell (`Some`, a stored `None` included) or `None`
+    /// when the cell is tombstoned, was never written or is a field the
+    /// stored shape of the record lacks. The occupancy rule of the cell
+    /// cursor, SQL and the index (one rule for every read path), used by
+    /// the delete operations to decide what exists.
+    pub fn live_cell_value(&self, realm: &Nat, u: &Nat, v: &Nat, lane: Lane) -> Result<Option<Val>> {
+        self.check_open()?;
+        if v.is_zero() || u.is_zero() {
+            return Ok(None);
+        }
+        if let Some(seg) = self.resolve_segment(realm, u, lane)? {
+            if let Some(value) = self.dense_base_value(&seg, realm, u, v, lane)? {
+                return Ok(Some(value));
+            }
+            return Ok(self.get_internal(realm, u, lane)?.and_then(|rec| rec.by_v_get(v).cloned()));
+        }
+        Ok(match self.sparse_point(realm, u, v, lane)? {
+            Some(SVal::V(value)) => Some(value),
+            _ => None,
         })
     }
 
@@ -356,26 +385,30 @@ impl Db {
                 prev = Some(oid.clone());
             }
             let nf = shape.fields.len() as i64;
-            let (mut total_cells, mut total_bytes, mut blocks) = (0i64, 0i64, 0i64);
-            for run in runs {
-                let r = self.put_dense_batch(
-                    &lay.realm_id,
-                    &run.start,
-                    &super::dense::DenseRows::Tuples(&run.rows),
-                    Some(sid),
-                    &run.ext,
-                    lane,
-                    false,
-                )?;
-                total_cells += run.rows.len() as i64 * nf;
-                total_bytes += r.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
-                blocks += 1;
-                if let Some(s) = r.get("sparse").filter(|s| s.is_truthy()) {
-                    total_cells += s.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
-                    total_bytes += s.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+            // N2 (RUN8): one DATA block per contiguous run, all or none
+            let (total_cells, total_bytes, blocks) = self.write_scope(|db| {
+                let (mut total_cells, mut total_bytes, mut blocks) = (0i64, 0i64, 0i64);
+                for run in runs {
+                    let r = db.put_dense_batch(
+                        &lay.realm_id,
+                        &run.start,
+                        &super::dense::DenseRows::Tuples(&run.rows),
+                        Some(sid),
+                        &run.ext,
+                        lane,
+                        false,
+                    )?;
+                    total_cells += run.rows.len() as i64 * nf;
+                    total_bytes += r.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
                     blocks += 1;
+                    if let Some(s) = r.get("sparse").filter(|s| s.is_truthy()) {
+                        total_cells += s.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
+                        total_bytes += s.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+                        blocks += 1;
+                    }
                 }
-            }
+                Ok((total_cells, total_bytes, blocks))
+            })?;
             if commit {
                 self.commit()?;
             }
@@ -463,27 +496,8 @@ impl Db {
         let mut raw_cells: Vec<(CellAddress, Val)> = Vec::new();
         match lay.kind {
             LayoutKind::Classic => {
-                let rec = self.get_internal(&lay.realm_id, obj, lane)?;
-                let updates = self.sparse_updates_for_u(&lay.realm_id, obj, lane)?;
-                if rec.is_some() || !updates.is_empty() {
-                    let mut vs: BTreeSet<Nat> = rec.as_ref().map(|r| r.by_v().into_keys().collect()).unwrap_or_default();
-                    for (v, s) in updates.iter() {
-                        if s.is_tomb() {
-                            vs.remove(v);
-                        } else {
-                            vs.insert(v.clone());
-                        }
-                    }
-                    for v in vs {
-                        let value = match updates.get(&v) {
-                            Some(SVal::V(x)) => x.clone(),
-                            _ => match rec.as_ref().and_then(|r| r.by_v_get(&v)) {
-                                Some(x) => x.clone(),
-                                None => continue,
-                            },
-                        };
-                        raw_cells.push((self.cell_address(&lay.realm_id, obj, &v, lane)?, value));
-                    }
+                for (v, value) in self.live_cells_of_u(&lay.realm_id, obj, lane)? {
+                    raw_cells.push((self.cell_address(&lay.realm_id, obj, &v, lane)?, value));
                 }
             }
             LayoutKind::Packed => {
@@ -612,7 +626,7 @@ impl Db {
             "layout_id" => lay.map(|l| l.layout_id as i64), "layout_name" => lay.map(|l| l.name.clone()),
             "layout_kind" => lay.map(|l| l.kind.name()),
             "object" => record_id.as_ref().map(Val::nat).unwrap_or(Val::None), "record_N" => record_n,
-            "field" => field, "anchor" => is_anchor, "present" => cell.is_some(),
+            "field" => field, "anchor" => is_anchor, "present" => cell_present(&cell),
             "value" => cell.as_ref().and_then(|c| c.get("value").cloned()).unwrap_or(Val::None),
             "requested_mode" => mode.name(), "effective_mode" => "cell",
         };
@@ -660,7 +674,9 @@ impl Db {
                 out.set("interpretation", Val::None);
             }
         }
-        let occ = self.get_cell(a.realm(), a.u(), &Val::nat(a.v_local()), a.lane, false)?.is_some();
+        // R9A-04: a tombstoned BASE value or a field missing from the stored
+        // shape is reported by get_cell with present=False
+        let occ = cell_present(&self.get_cell(a.realm(), a.u(), &Val::nat(a.v_local()), a.lane, false)?);
         out.set("occupied", Val::Bool(occ));
         Ok(out)
     }
@@ -673,20 +689,7 @@ impl Db {
         let mut out = Vec::new();
         match lay.kind {
             LayoutKind::Classic => {
-                let rec = self.get_internal(rid, obj, lane)?;
-                let updates = self.sparse_updates_for_u(rid, obj, lane)?;
-                if rec.is_none() && updates.is_empty() {
-                    return Ok(out);
-                }
-                let mut vs: BTreeSet<Nat> = rec.map(|r| r.by_v().into_keys().collect()).unwrap_or_default();
-                for (v, s) in updates.iter() {
-                    if s.is_tomb() {
-                        vs.remove(v);
-                    } else {
-                        vs.insert(v.clone());
-                    }
-                }
-                for v in vs {
+                for v in self.live_cells_of_u(rid, obj, lane)?.into_keys() {
                     out.push(address::dynadron_n(rid, obj, &v, lane)?);
                 }
             }
@@ -800,12 +803,12 @@ impl Db {
     /// Smallest u ≥ `from` (and ≥ 1) covered by a dense segment of
     /// `(realm, lane)` (P004: O(log segments) via the interval index; deleted
     /// or overlaid u are resolved by the caller through `get`/`get_internal`).
-    pub(crate) fn next_dense_u(&self, realm: &Nat, lane: Lane, from: &Nat) -> Option<Nat> {
-        let idx = self.dense.get(&(realm.clone(), lane))?;
+    pub(crate) fn next_dense_u(&self, realm: &Nat, lane: Lane, from: &Nat) -> Result<Option<Nat>> {
+        let Some(idx) = self.dense.get(&(realm.clone(), lane)) else { return Ok(None) };
         if from.is_zero() {
-            return idx.iv.first_covered_from(&Nat::ONE);
+            return idx.idx.first_covered_from(self, &Nat::ONE);
         }
-        idx.iv.first_covered_from(from)
+        idx.idx.first_covered_from(self, from)
     }
 
     /// [`Db::next_dense_u`] for range reads up to `to` (F021 rest, G3-03):
@@ -817,7 +820,7 @@ impl Db {
     /// next, and its block (the nearest segment above the gap) is
     /// CRC-checked before use.
     pub(crate) fn next_dense_u_checked(&self, realm: &Nat, lane: Lane, from: &Nat, to: &Nat) -> Result<Option<Nat>> {
-        let next = self.next_dense_u(realm, lane, from);
+        let next = self.next_dense_u(realm, lane, from)?;
         let start = if from.is_zero() { &Nat::ONE } else { from };
         if start <= to && next.as_ref().is_none_or(|u| u > to) {
             self.check_uncovered_u(realm, start, lane)?;
@@ -916,4 +919,11 @@ pub(crate) fn set_or_push(items: &mut Vec<(String, Val)>, k: &str, v: Val) {
     } else {
         items.push((k.to_string(), v));
     }
+}
+
+/// R9A-04: existence of a `get_cell` result – the cell map reports
+/// `present` itself (a tombstone or a field missing from the stored shape
+/// of a live record yields a map with `present: False`).
+fn cell_present(cell: &Option<Val>) -> bool {
+    cell.as_ref().is_some_and(|c| c.get("present").is_none_or(|p| p.is_truthy()))
 }

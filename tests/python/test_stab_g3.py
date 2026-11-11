@@ -5,18 +5,29 @@ G3-04 batch flush atomic across (realm, lane) groups."""
 
 import random
 import struct
+import zlib
 
 import pytest
 
 import nhydb
 from nhydb.query import Q
 
-DATA_TAG = b"D10D"
+DATA_TAG = b"D28D"
 
 
 # ----------------------------------------------------------------------
 # G3-01 / G3-03: shifted u_start (same varint length, payload CRC not fixed)
 # ----------------------------------------------------------------------
+
+
+def _crc32c(data):
+    """CRC-32C (Castagnoli) – the prefix checksum of DATA/SPARSE blocks."""
+    c = 0xFFFFFFFF
+    for x in data:
+        c ^= x
+        for _ in range(8):
+            c = (c >> 1) ^ (0x82F63B78 & -(c & 1))
+    return c ^ 0xFFFFFFFF
 
 def _skip_vu(b, i):
     while b[i] & 0x80:
@@ -24,9 +35,19 @@ def _skip_vu(b, i):
     return i + 1
 
 
+def _seal_prefix(b, ps, fields):
+    """Recomputes the prefix checksum (CRC32 behind `fields` VarUInts after
+    the tag) of the payload at `ps`: models a flip that also forges it."""
+    q = ps + 4
+    for _ in range(fields):
+        q = _skip_vu(b, q)
+    struct.pack_into("<I", b, q, _crc32c(bytes(b[ps:q])))
+
+
 def _shifted_db(path):
     """Two committed DATA blocks (u 1..10, u 11..23); the u_start of the 2nd
-    is flipped 11 -> 41 in the file (header CRC intact, payload CRC not)."""
+    is flipped 11 -> 41 in the file (header CRC intact, prefix checksum
+    forged, payload CRC not): the open accepts it, reads must not."""
     db = nhydb.NHyDB.create(str(path))
     db.create_realm(1, "r")
     db.create_shape(1, 1, "s", [{"v": 1, "name": "a", "type": "varuint"}])
@@ -45,6 +66,7 @@ def _shifted_db(path):
                 pos = _skip_vu(b, _skip_vu(b, ps + 4))
                 assert b[pos] == 11
                 b[pos] = 41
+                _seal_prefix(b, ps, 4)
                 break
         off = (ps + plen + 7) & ~7
     path.write_bytes(bytes(b))

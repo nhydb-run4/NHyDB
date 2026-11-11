@@ -1,11 +1,11 @@
-# NHyDB 0.27.1 – Notebook Series v1
+# NHyDB 0.28.2 – Notebook Series v1
 
 An interactive introduction to **NHyDB**, the database in which every value has a mathematical
 address, and to the **Dynadron** mathematics behind it. Every notebook combines short
-explanations, runnable code against the real NHyDB 0.27.1 API, figures drawn from real engine data,
+explanations, runnable code against the real NHyDB 0.28.2 API, figures drawn from real engine data,
 and small experiments you can change yourself.
 
-> Written for **NHyDB 0.27.1**. With other versions, outputs may differ.
+> Written for **NHyDB 0.28.2**. With other versions, outputs may differ.
 >
 > 🇩🇪 **Deutsch:** A German edition with identical code is available in [`../de/`](../de/README_v1.md).
 
@@ -44,8 +44,8 @@ are marked ⏩ *Advanced*.
 ### Cookbook Reference Lab (`reference/`)
 
 Based on the official
-[NHyDB Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md),
-which remains the authoritative reference: all 57 runnable cookbook examples, each as an
+[NHyDB Python Cookbook](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md),
+which remains the authoritative reference: all 61 runnable cookbook examples, each as an
 independent code cell with the expected output below it.
 
 | Notebook | Cookbook sections |
@@ -63,17 +63,17 @@ independent code cell with the expected output below it.
 **1. Get the notebooks.** Clone the repository (or download it as a ZIP file from GitHub):
 
 ```bash
-git clone https://github.com/nhydb/NHyDB.git
+git clone https://github.com/nhydb-run4/NHyDB.git
 cd NHyDB
 ```
 
-**2. Install Python packages.** You need Python 3.9 or newer. A virtual environment keeps the
+**2. Install Python packages.** You need Python 3.12–3.15. A virtual environment keeps the
 installation separate from your system Python (recommended):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install "nhydb==0.27.1" numpy pandas matplotlib jupyterlab ipykernel
+python -m pip install "nhydb==0.28.2" numpy pandas matplotlib jupyterlab ipykernel
 ```
 
 **3. Start JupyterLab** in the notebook folder:
@@ -95,8 +95,8 @@ open `main/00_start_here_v1.ipynb` and work through the notebooks one after anot
 To stop JupyterLab, close the browser tab and press *Ctrl + C* in the terminal.
 
 All notebooks create their databases in a temporary folder and remove it at the end; no file
-outside that folder is touched. Timings in notebooks 08, 10 and 13 were measured on a MacBook Air
-(Apple M2) and will differ on other machines.
+outside that folder is touched. Timings in notebooks 08, 10 and 13 were measured on a MacBook Pro
+(Apple M1 Max) and will differ on other machines.
 
 **Automated execution (optional).** To run notebooks without the browser interface, for example
 as a test, use `jupyter execute` inside `notebooks/en/`:

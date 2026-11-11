@@ -321,6 +321,39 @@ def fuzz_base(tmp_path_factory):
     return work, raw
 
 
+@pytest.fixture(scope="module")
+def fuzz_base_dir(tmp_path_factory):
+    """RD-10: the golden database with a persistent block directory (root,
+    run and pages cover every block), so that the directory decoders are
+    fuzzed as well."""
+    import nhydb
+    work = tmp_path_factory.mktemp("fuzzdir")
+    p = work / GOLDEN_DB.name
+    for s in ("", ".layout.enc", ".layout.key"):
+        shutil.copyfile(str(GOLDEN_DB) + s, str(p) + s)
+    if os.name == "posix":
+        os.chmod(str(p) + ".layout.key", 0o600)
+    (work / "nhydb_config.toml").write_text("[directory]\nflush_blocks = 4\n")
+    with nhydb.NHyDB(p) as db:
+        db.put_cell(2, 999, 1, 1, type="varuint", commit=True)
+        assert db.stats()["directory"]["runs"] >= 1
+    (work / "nhydb_config.toml").unlink()
+    raw = p.read_bytes()
+    (work / "orig.bin").write_bytes(raw)
+    return work, raw
+
+
+@pytest.mark.parametrize("kind", ["flip", "crc", "varint", "header"])
+def test_fuzz_directory_base_only_nhydb_errors(fuzz_base_dir, kind):
+    work, raw = fuzz_base_dir
+    cases = [c for c in make_cases(raw) if c["kind"] == kind]
+    assert cases
+    findings, _results = run_cases(work, cases)
+    by_case = {cid: (next(c for c in cases if c["id"] == cid), msg) for cid, msg in sorted(findings.items())}
+    report = "\n".join(f"{json.dumps(c)} -> {msg}" for c, msg in list(by_case.values())[:25])
+    assert not findings, f"{len(findings)} of {len(cases)} {kind} cases on the directory base raised non-NHyDBError / crashed:\n{report}"
+
+
 N_PROBES = 86  # number of successful probes on the intact file (both opens)
 KINDS = ["flip", "trunc", "crc", "varint", "header", "super"]
 

@@ -1,13 +1,14 @@
-//! Secondary content indexes (`SECONDARY`, tag `SI10`).
+//! Secondary content indexes (`SECONDARY`, root tag `SI28`).
 //!
 //! Coupled to BASE/dense records: dense records are indexed
 //! (BASE fields from the stored raw values, extension fields
-//! from the merged record view). Posting lists are stored zlib-compressed as
-//! u32/u64 arrays or (for u > 2^64) as VarUInt deltas.
+//! from the merged record view). Posting lists are stored as u32/u64
+//! arrays or (for u > 2^64) as VarUInt deltas, inline in the leaf pages of
+//! the persistent key tree or zlib-compressed in chunk blocks
+//! (`secindex.rs`).
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,13 +16,18 @@ use crate::address::{lane_flags, lane_name, Lane};
 use crate::codec::{decode_value, skip_value};
 use crate::error::{Error, Result};
 use crate::format::*;
-use crate::nat::{get_vu, get_vu_u64, put_vu64, Nat};
+use crate::nat::{get_vu, Nat};
 use crate::schema::{IndexDef, LayoutKind};
-use crate::textindex::{self, FtCorpus, FtPosting, IndexKind, FULLTEXT_DOCLEN_KEY, PAYLOAD_FULLTEXT_DOCLENS, PAYLOAD_FULLTEXT_POSITIONS};
+use crate::textindex::{
+    self, FtCorpus, FtPosting, IndexKind, FULLTEXT_DOCLEN_KEY, PAYLOAD_FULLTEXT_DOCLENS, PAYLOAD_FULLTEXT_DOCLEN_SEGMENT,
+    PAYLOAD_FULLTEXT_DOCLEN_SUMMARY, PAYLOAD_FULLTEXT_POSITIONS,
+};
+use super::{PostKey, PostVal};
 use crate::val::{Val, ValKey};
 use crate::vmap;
 
-use super::{BlockInfo, Db, PostingRef, SecondaryDir, SVal};
+use super::secindex::{self, SecEntry};
+use super::{BlockInfo, Db, SecondaryDir, SVal};
 
 /// Filter condition for `find_u`.
 #[derive(Clone, Debug)]
@@ -54,7 +60,7 @@ fn grow<T>(v: &mut Vec<T>) -> Result<()> {
 }
 
 impl UList {
-    fn push(&mut self, u: &Nat) -> Result<()> {
+    pub(crate) fn push(&mut self, u: &Nat) -> Result<()> {
         match (&mut *self, u) {
             (UList::Tiny(v), Nat::S(x)) if *x <= u32::MAX as u64 => {
                 grow(v)?;
@@ -85,7 +91,7 @@ impl UList {
         Ok(())
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             UList::Tiny(v) => v.len(),
             UList::Small(v) => v.len(),
@@ -93,7 +99,7 @@ impl UList {
         }
     }
 
-    fn last(&self) -> Option<Nat> {
+    pub(crate) fn last(&self) -> Option<Nat> {
         match self {
             UList::Tiny(v) => v.last().map(|x| Nat::S(*x as u64)),
             UList::Small(v) => v.last().map(|x| Nat::S(*x)),
@@ -109,7 +115,7 @@ impl UList {
         }
     }
 
-    fn to_nats(&self) -> Vec<Nat> {
+    pub(crate) fn to_nats(&self) -> Vec<Nat> {
         match self {
             UList::Tiny(v) => v.iter().map(|x| Nat::S(*x as u64)).collect(),
             UList::Small(v) => v.iter().map(|x| Nat::S(*x)).collect(),
@@ -130,7 +136,7 @@ pub(crate) enum Bucket {
 }
 
 impl Bucket {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Bucket::Us(v) => v.len(),
             Bucket::Ft(v) => v.len(),
@@ -145,6 +151,22 @@ pub(crate) struct ValueMap {
     pos: HashMap<ValKey, usize>,
     /// Fast path for text keys (TOKEN/TRIGRAM/FULLTEXT).
     spos: HashMap<String, usize>,
+    /// estimated heap bytes (keys, map entries, lists) for the build budget
+    bytes: usize,
+    /// largest document u of the buckets already spilled (posting width)
+    spilled_max_u: Option<Nat>,
+}
+
+/// Estimated bytes of one key of a `ValueMap` (item, hash entry, key copies).
+const KEY_COST: usize = 192;
+
+fn key_heap(v: &Val) -> usize {
+    match v {
+        Val::Str(s) => s.len(),
+        Val::Bytes(b) => b.len(),
+        Val::Big(_) | Val::List(_) | Val::Map(_) => 64,
+        _ => 0,
+    }
 }
 
 impl ValueMap {
@@ -155,6 +177,7 @@ impl ValueMap {
                 let i = self.items.len();
                 self.spos.insert(key.to_string(), i);
                 self.items.push((Val::str(key), make()));
+                self.bytes += KEY_COST + 2 * key.len();
                 i
             }
         };
@@ -166,6 +189,7 @@ impl ValueMap {
         let i = match self.pos.get(&k) {
             Some(&i) => i,
             None => {
+                self.bytes += KEY_COST + 2 * key_heap(&key);
                 self.pos.insert(k, self.items.len());
                 self.items.push((key, make()));
                 self.items.len() - 1
@@ -173,28 +197,33 @@ impl ValueMap {
         };
         &mut self.items[i].1
     }
-    fn get(&self, key: &str) -> Option<&Bucket> {
-        self.spos.get(key).or_else(|| self.pos.get(&ValKey(Val::str(key)))).map(|&i| &self.items[i].1)
-    }
 }
 
-/// Header of a SECONDARY block (the directory is loaded only when needed).
+/// Where the document lengths of a FULLTEXT index are.
+enum DocLenSource {
+    Empty,
+    /// 0.28.0/0.28.1: one list (decoded through the posting pool)
+    Whole(Arc<textindex::DocLenSeg>),
+    /// 0.28.2: summary + segments in the key tree
+    Paged { docs: u64, tokens: u64 },
+}
+
+/// Root of the key tree of an index (the pages are read only when needed).
 #[derive(Clone, Debug)]
 pub struct SecondaryMeta {
     pub index_id: u64,
     pub lane: Lane,
     pub source_block_id: u64,
+    /// distinct keys of the index
     pub entry_count: u64,
-    pub dir_offset: u64,
-    pub dir_len: u64,
-    pub postings_base: u64,
-    pub payload_end: u64,
+    /// tree height (0: the root holds the only leaf)
+    pub height: u64,
     pub block_id: u64,
-    /// Offset of the block header (for the one-time payload CRC check).
+    /// Offset of the root block header.
     pub block_offset: u64,
-    /// Payload CRC already verified in this session (F011). Shared between
-    /// clones; a later per-block "verified" registry can replace it.
-    pub verified: Arc<AtomicBool>,
+    /// FULLTEXT: number of document length segments (entries that are no
+    /// keys), read once on first use
+    pub(crate) doclen_segments: std::sync::OnceLock<u64>,
 }
 
 /// Python-style comparison of two scalars (`lo <= value`).
@@ -320,6 +349,11 @@ fn contains_nan(v: &Val) -> bool {
 /// fits into 64 bits (width 4/8 postings) the union is sorted as plain
 /// `u64` (no enum comparisons); postings with u > 2^64 (width 0, BigInt)
 /// take the general `Nat` path, so arbitrarily large u stay exact.
+/// RUN¹⁰: estimated bytes of a FULLTEXT posting list (limiter growth).
+fn posting_bytes(p: &[textindex::FtPosting]) -> u64 {
+    p.iter().map(|x| (std::mem::size_of::<textindex::FtPosting>() + x.positions.len() * 8) as u64).sum()
+}
+
 pub(crate) fn union_postings(postings: &[Arc<Vec<Nat>>]) -> Vec<Nat> {
     let total: usize = postings.iter().map(|p| p.len()).sum();
     let mut small: Vec<u64> = Vec::with_capacity(total);
@@ -359,17 +393,269 @@ fn sort_dedup_check<T: Ord + Clone>(v: &mut [T]) {
 /// Value lists per `(index_id, lane)` during the build.
 type IndexMaps = HashMap<(u64, Lane), ValueMap>;
 
-/// I001: bytes per posting reference assumed when planning a build: the
-/// list element for the largest u of the lane, the worst-case growth
-/// reserve of a doubling `Vec` and the write buffers (measured with KQ-10M:
-/// about 8.6 bytes per reference for `u32` lists).
-fn ref_bytes_estimate(max_u: &Nat) -> u64 {
-    match max_u {
-        Nat::S(x) if *x <= u32::MAX as u64 => 10,
-        Nat::S(_) => 20,
-        Nat::B(_) => 80,
+/// Range lookups over at most this many keys cache their postings.
+const RANGE_CACHED_KEYS: usize = 64;
+
+/// Estimated bytes of one document reference in a list (with growth reserve).
+const REF_COST: usize = 10;
+/// The build budget is checked at least after this many record bytes.
+const CHECK_BYTES: usize = 64 << 10;
+
+/// Spilled runs of one build (external sort, `idxspill.rs`).
+pub(crate) struct Spill {
+    budget: usize,
+    dirs: Vec<std::path::PathBuf>,
+    file: Option<Arc<super::idxspill::SpillFile>>,
+    runs: HashMap<(u64, Lane), Vec<super::idxspill::SpillRun>>,
+    pub(crate) spills: u64,
+    pub(crate) bytes: u64,
+    /// RUN¹⁰: elastic job of the RAM limiter; `SHRINK` spills the maps
+    /// before the budget is reached
+    meter: crate::limiter::Meter,
+    /// bytes of the maps at the last check (growth for the meter)
+    held: usize,
+}
+
+impl Spill {
+    /// Writes every map as a sorted run and empties it once the maps
+    /// together exceed the budget (or the RAM limiter asks for memory).
+    fn check(&mut self, maps: &mut IndexMaps) -> Result<()> {
+        let total = maps.values().map(|m| m.bytes).sum::<usize>();
+        let grown = total.saturating_sub(self.held);
+        self.held = total;
+        let shrink = self.meter.grow(grown as u64)?;
+        if total <= self.budget && !(shrink && total > 0) {
+            return Ok(());
+        }
+        self.held = 0;
+        if self.file.is_none() {
+            let dirs: Vec<&std::path::Path> = self.dirs.iter().map(|d| d.as_path()).collect();
+            self.file = Some(super::idxspill::SpillFile::create(&dirs)?);
+        }
+        let file = self.file.clone().unwrap();
+        let mut keys: Vec<(u64, Lane)> = maps.keys().copied().collect();
+        keys.sort();
+        for k in keys {
+            let vm = maps.get_mut(&k).unwrap();
+            if vm.items.is_empty() {
+                continue;
+            }
+            sort_buckets(vm);
+            for (_, b) in &vm.items {
+                if let Bucket::Us(us) = b {
+                    if let Some(last) = us.last() {
+                        if vm.spilled_max_u.as_ref().is_none_or(|m| &last > m) {
+                            vm.spilled_max_u = Some(last);
+                        }
+                    }
+                }
+            }
+            vm.items.sort_by(|a, b| secindex::cmp_vals(&a.0, &b.0));
+            let mut w = super::idxspill::SpillWriter::create(&file)?;
+            for (v, b) in &vm.items {
+                w.push(&secindex::encode_key_vec(v)?, b)?;
+            }
+            let run = w.finish()?;
+            self.bytes = self.bytes.max(run_end(&run));
+            self.runs.entry(k).or_default().push(run);
+            vm.items = Vec::new();
+            vm.pos = HashMap::new();
+            vm.spos = HashMap::new();
+            vm.bytes = 0;
+        }
+        self.spills += 1;
+        Ok(())
     }
 }
+
+/// Flags the ranges (inclusive bounds) that overlap at least one other
+/// range: only their u need the newest-wins deduplication of the index
+/// build (RA2-03: no set over all records of non-overlapping blocks).
+fn overlapping<'a>(ranges: impl Iterator<Item = (&'a Nat, &'a Nat)>) -> Vec<bool> {
+    let ranges: Vec<(&Nat, &Nat)> = ranges.collect();
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by(|a, b| ranges[*a].0.cmp(ranges[*b].0));
+    let mut flags = vec![false; ranges.len()];
+    let mut holder: Option<usize> = None;
+    for i in order {
+        if let Some(h) = holder {
+            if ranges[i].0 <= ranges[h].1 {
+                flags[i] = true;
+                flags[h] = true;
+            }
+            if ranges[i].1 > ranges[h].1 {
+                holder = Some(i);
+            }
+        } else {
+            holder = Some(i);
+        }
+    }
+    flags
+}
+
+/// Head of one merge source (min-heap order: key, then source index).
+struct MergeHead {
+    key: Vec<u8>,
+    src: usize,
+}
+
+impl Ord for MergeHead {
+    fn cmp(&self, o: &Self) -> Ordering {
+        secindex::cmp_keys(&o.key, &self.key).then(o.src.cmp(&self.src))
+    }
+}
+
+impl PartialOrd for MergeHead {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl PartialEq for MergeHead {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == Ordering::Equal
+    }
+}
+
+impl Eq for MergeHead {}
+
+fn run_end(r: &super::idxspill::SpillRun) -> u64 {
+    r.end_offset()
+}
+
+/// RUN9 V4: from this many entries on, a key spread over several runs is
+/// merged entry by entry instead of being decoded as a whole (below: at most
+/// about 64 B per entry, i.e. a few MiB).
+const STREAM_MERGE_MIN: u64 = 1 << 16;
+
+/// Test-only: the threshold of [`STREAM_MERGE_MIN`] (1 = merge every
+/// spilled key entry by entry); both paths write the same bytes.
+#[cfg(test)]
+static STREAM_MERGE_MIN_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(STREAM_MERGE_MIN);
+
+fn stream_merge_min() -> u64 {
+    #[cfg(test)]
+    return STREAM_MERGE_MIN_TEST.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    STREAM_MERGE_MIN
+}
+
+/// What [`Db::persist_merged`] wrote: references, or the document count of
+/// the FULLTEXT document lengths.
+enum Merged {
+    Refs(u64),
+    Docs(u64),
+}
+
+/// RUN9 V4: k-way merge of `sources` sorted streams (`next(s)` yields the
+/// next entry of source `s`): `f` receives the entries in ascending `key`
+/// order, equal keys in source order and, within a source, in stream order
+/// – the order of the stable sort of the concatenated sources that
+/// `merge_buckets` produces. One entry per source is held.
+fn stream_merge<E, K: Ord>(sources: usize, next: &mut impl FnMut(usize) -> Result<Option<E>>, key: impl Fn(&E) -> K, mut f: impl FnMut(E) -> Result<()>) -> Result<()> {
+    use std::cmp::Reverse;
+    let mut heads: Vec<Option<E>> = Vec::with_capacity(sources);
+    let mut heap = BinaryHeap::with_capacity(sources);
+    for s in 0..sources {
+        let e = next(s)?;
+        if let Some(e) = &e {
+            heap.push(Reverse((key(e), s)));
+        }
+        heads.push(e);
+    }
+    while let Some(Reverse((_, s))) = heap.pop() {
+        let e = heads[s].take().expect("head of a source in the heap");
+        let n = next(s)?;
+        if let Some(x) = &n {
+            heap.push(Reverse((key(x), s)));
+        }
+        heads[s] = n;
+        f(e)?;
+    }
+    Ok(())
+}
+
+/// Lists sorted by document u (persisted postings and spilled runs).
+fn sort_buckets(vm: &mut ValueMap) {
+    for (_, b) in vm.items.iter_mut() {
+        match b {
+            Bucket::Us(v) => v.sort_check(),
+            Bucket::Ft(v) => {
+                if v.windows(2).any(|w| w[0].0 > w[1].0) {
+                    v.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+            }
+            Bucket::Doc(v) => {
+                if v.windows(2).any(|w| w[0].0 > w[1].0) {
+                    v.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+            }
+        }
+    }
+}
+
+/// Raw posting bytes of a bucket in its codec (`width`: 4/8 = u32/u64
+/// arrays, 0 = VarUInt deltas).
+fn encode_bucket(bucket: &Bucket, width: u8) -> Result<(u8, Vec<u8>)> {
+    let too_wide = || Error::Value("posting u exceeds the posting width".into());
+    Ok(match bucket {
+        Bucket::Ft(e) => (PAYLOAD_FULLTEXT_POSITIONS, textindex::encode_fulltext_posting(e)?),
+        Bucket::Doc(e) => (PAYLOAD_FULLTEXT_DOCLENS, textindex::encode_fulltext_doc_lengths(e)?),
+        Bucket::Us(UList::Tiny(us)) if width == 4 || width == 8 => {
+            let mut raw = Vec::with_capacity(us.len() * width as usize);
+            for &x in us {
+                if width == 4 {
+                    raw.extend_from_slice(&x.to_le_bytes());
+                } else {
+                    raw.extend_from_slice(&(x as u64).to_le_bytes());
+                }
+            }
+            (width, raw)
+        }
+        Bucket::Us(UList::Small(us)) if width == 4 || width == 8 => {
+            let mut raw = Vec::with_capacity(us.len() * width as usize);
+            for &x in us {
+                if width == 4 {
+                    raw.extend_from_slice(&u32::try_from(x).map_err(|_| too_wide())?.to_le_bytes());
+                } else {
+                    raw.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            (width, raw)
+        }
+        Bucket::Us(us) => match (width, us) {
+            (4, UList::Big(us)) => {
+                let mut raw = Vec::with_capacity(us.len() * 4);
+                for u in us {
+                    let x = u.as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(too_wide)?;
+                    raw.extend_from_slice(&x.to_le_bytes());
+                }
+                (4, raw)
+            }
+            (8, UList::Big(us)) => {
+                let mut raw = Vec::with_capacity(us.len() * 8);
+                for u in us {
+                    raw.extend_from_slice(&u.as_u64().ok_or_else(too_wide)?.to_le_bytes());
+                }
+                (8, raw)
+            }
+            (_, us) => (0, encode_big_posting(&us.to_nats())?),
+        },
+    })
+}
+
+/// Result of writing one index tree.
+pub(crate) struct Persisted {
+    pub off: u64,
+    pub bid: u64,
+    pub bytes: usize,
+    pub keys: u64,
+    /// references without the FULLTEXT document lengths
+    pub refs: u64,
+    /// FULLTEXT: documents (entries of the document-length key)
+    pub docs: Option<u64>,
+}
+
 /// Positional postings per query term (shared, without copying).
 pub type TermPostingsOwned = Vec<(String, Arc<Vec<FtPosting>>)>;
 
@@ -378,139 +664,44 @@ impl Db {
     // SECONDARY blocks: header on open, directory on demand
     // ------------------------------------------------------------------
 
-    /// `_register_secondary_header`
+    /// `_register_secondary_header`: root of the key tree.
     pub(crate) fn parse_secondary_directory(&mut self, info: &BlockInfo) -> Result<()> {
         let lane = crate::address::lane_from_flags(info.flags);
         let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
         let raw = self.store.read_upto(payload_off, 128.min(info.payload_len as usize))?;
-        if !raw.starts_with(SEC_TAG) {
+        if !raw.starts_with(secindex::ROOT_TAG) {
             return Err(Error::Corruption(format!("SECONDARY block {}: wrong tag", info.block_id)));
         }
-        let mut p = 4;
-        let index_id = get_vu_u64(&raw, &mut p, "SECONDARY index")?;
-        let source_bid = get_vu_u64(&raw, &mut p, "SECONDARY source")?;
-        let entry_count = get_vu_u64(&raw, &mut p, "SECONDARY entries")?;
-        let dir_len = get_vu_u64(&raw, &mut p, "SECONDARY dirlen")?;
-        let dir_off = payload_off + p as u64;
-        let payload_end = payload_off + info.payload_len;
-        let postings_base = dir_off.saturating_add(dir_len);
-        if postings_base > payload_end {
-            return Err(Error::Corruption("SECONDARY directory outside the block".into()));
-        }
+        let h = secindex::parse_root_head(&raw)?;
+        let (index_id, source_bid, entry_count, height) = (h.index_id, h.source_bid, h.entry_count, h.height);
         let meta = SecondaryMeta {
             index_id,
             lane,
             source_block_id: source_bid,
             entry_count,
-            dir_offset: dir_off,
-            dir_len,
-            postings_base,
-            payload_end,
+            height,
             block_id: info.block_id,
             block_offset: info.offset,
-            verified: Arc::new(AtomicBool::new(false)),
+            doclen_segments: std::sync::OnceLock::new(),
         };
         self.secondary_blocks.insert((index_id, lane), meta);
         self.secondary_source_block.insert((index_id, lane), source_bid);
-        let c = self.caches.get_mut().unwrap_or_else(|e| e.into_inner());
-        c.postings.retain(|k, _| !(k.0 == index_id && k.1 == lane));
-        c.sec_dirs.remove(&(index_id, lane));
-        c.sec_sorted.remove(&(index_id, lane));
-        c.ft_postings.retain(|k, _| !(k.0 == index_id && k.1 == lane));
-        c.ft_corpus.remove(&(index_id, lane));
+        self.cache().postings.retain(|k| match k {
+            PostKey::Us(i, l, _) | PostKey::Ft(i, l, _) | PostKey::DocLens(i, l, _) | PostKey::Ov(i, l, _, _) => !(*i == index_id && *l == lane),
+        });
+        // AP9: overlays of sources no index of the realm lane uses any more
+        if let Some(realm) = self.index_defs.get(&index_id).map(|i| i.realm_id.clone()) {
+            self.ixm_drop_unused_overlays(&realm, lane);
+        }
         Ok(())
     }
 
     /// `_ensure_secondary_directory`
-    pub(crate) fn secondary_dir(&self, index_id: u64, lane: Lane) -> Result<Arc<SecondaryDir>> {
-        if let Some(d) = self.cache().sec_dirs.get(&(index_id, lane)) {
-            return Ok(d.clone());
-        }
-        let Some(meta) = self.secondary_blocks.get(&(index_id, lane)) else {
-            return Ok(Arc::new(SecondaryDir::default()));
-        };
-        // F011: the whole SECONDARY payload is CRC-checked once before its
-        // first use (directory and postings); the directory comes from the
-        // verified payload.
-        let payload = self.verified_secondary_payload(meta)?;
-        let payload_off = meta.block_offset + BLOCK_HEADER_SIZE as u64;
-        let rel = (meta.dir_offset - payload_off) as usize;
-        let dbytes = payload
-            .get(rel..rel.saturating_add(meta.dir_len as usize))
-            .ok_or_else(|| Error::Corruption("SECONDARY directory outside the block".into()))?;
-        let mut q = 0usize;
-        let mut dir = SecondaryDir::default();
-        for _ in 0..meta.entry_count {
-            let klen = get_vu_u64(dbytes, &mut q, "SECONDARY key")? as usize;
-            if q.checked_add(klen).is_none_or(|e| e > dbytes.len()) {
-                return Err(Error::Corruption("Length value ends beyond payload".into()));
-            }
-            let value = json_key_decode(&dbytes[q..q + klen])?;
-            q += klen;
-            let rel = get_vu_u64(dbytes, &mut q, "SECONDARY rel")?;
-            let clen = get_vu_u64(dbytes, &mut q, "SECONDARY clen")?;
-            let cnt = get_vu_u64(dbytes, &mut q, "SECONDARY cnt")?;
-            let Some(&width) = dbytes.get(q) else {
-                return Err(Error::Corruption("SECONDARY width missing".into()));
-            };
-            q += 1;
-            if !matches!(width, 0 | 4 | 8 | PAYLOAD_FULLTEXT_POSITIONS | PAYLOAD_FULLTEXT_DOCLENS) {
-                return Err(Error::Corruption("SECONDARY payload codec invalid".into()));
-            }
-            if meta.postings_base.checked_add(rel).and_then(|a| a.checked_add(clen)).map(|e| e > meta.payload_end).unwrap_or(true) {
-                return Err(Error::Corruption("SECONDARY posting list points beyond the block".into()));
-            }
-            let r = PostingRef { value: value.clone(), abs_offset: meta.postings_base + rel, compressed_len: clen, raw_count: cnt, width };
-            match dir.by_key.get(&ValKey(value.clone())) {
-                Some(&i) => dir.entries[i] = r,
-                None => {
-                    dir.by_key.insert(ValKey(value), dir.entries.len());
-                    dir.entries.push(r);
-                }
-            }
-        }
-        if q != dbytes.len() {
-            return Err(Error::Corruption("SECONDARY directory trailing bytes".into()));
-        }
-        let arc = Arc::new(dir);
-        self.cache().sec_dirs.insert((index_id, lane), arc.clone());
-        Ok(arc)
-    }
-
-    /// Reads the payload of a SECONDARY block with CRC check and marks the
-    /// block as verified (F011).
-    fn verified_secondary_payload(&self, meta: &SecondaryMeta) -> Result<Vec<u8>> {
-        let (info, payload) = self.read_block(meta.block_offset)?;
-        if info.block_type != BT_SECONDARY || info.block_id != meta.block_id {
-            return Err(Error::Corruption(format!("SECONDARY block {}: header changed", meta.block_id)));
-        }
-        meta.verified.store(true, AtomicOrdering::Release);
-        Ok(payload)
-    }
-
-    /// Directory keys ordered for range lookups (F025): numbers (without
-    /// NaN), then `str`, then `bytes`, each in natural order; all other keys
-    /// (None, NaN, lists, dicts) follow unordered. Range bounds of one of the
-    /// three ordered classes only ever match keys of the same class.
-    fn secondary_keys_sorted(&self, index_id: u64, lane: Lane) -> Result<Arc<Vec<Val>>> {
-        if let Some(k) = self.cache().sec_sorted.get(&(index_id, lane)) {
-            return Ok(k.clone());
-        }
-        let dir = self.secondary_dir(index_id, lane)?;
-        let mut keys: Vec<Val> = dir.entries.iter().map(|e| e.value.clone()).collect();
-        keys.sort_by(|a, b| {
-            let (ca, cb) = (range_class(a), range_class(b));
-            ca.cmp(&cb).then_with(|| if ca < 3 { crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal) } else { Ordering::Equal })
-        });
-        let arc = Arc::new(keys);
-        self.cache().sec_sorted.insert((index_id, lane), arc.clone());
-        Ok(arc)
-    }
-
-    /// Public view of the (lazily loaded) directory.
+    /// All keys of an index as a directory (`_ensure_secondary_directory`;
+    /// a debug view whose memory grows with the keys of the index).
     pub fn secondary_directory(&self, index_id: u64, lane: Lane) -> Result<Arc<SecondaryDir>> {
         self.check_open()?;
-        self.secondary_dir(index_id, lane)
+        Ok(Arc::new(self.sec_full_directory(index_id, lane)?))
     }
 
     pub fn secondary_source_block_id(&self, index_id: u64, lane: Lane) -> Option<u64> {
@@ -518,12 +709,32 @@ impl Db {
     }
 
     /// Number of directory entries of the current SECONDARY block.
+    /// Document length segments of a FULLTEXT index are not counted (the
+    /// summary under `FULLTEXT_DOCLEN_KEY` is, like the list of 0.28.0).
     pub(crate) fn secondary_entry_count(&self, index_id: u64, lane: Lane) -> usize {
-        self.secondary_blocks.get(&(index_id, lane)).map(|m| m.entry_count as usize).unwrap_or(0)
+        let Some(m) = self.secondary_blocks.get(&(index_id, lane)) else {
+            return 0;
+        };
+        let fulltext = self.index_defs.get(&index_id).is_some_and(|i| i.kind == IndexKind::Fulltext);
+        let segs = if fulltext {
+            // RB3-06: a read error is not remembered as a count (statistics
+            // only; `verify(deep)` reports the damage)
+            match m.doclen_segments.get() {
+                Some(n) => *n,
+                None => match self.fulltext_internal_entries(index_id, lane) {
+                    Ok(n) => *m.doclen_segments.get_or_init(|| n.saturating_sub(1)),
+                    Err(_) => 0,
+                },
+            }
+        } else {
+            0
+        };
+        m.entry_count.saturating_sub(segs) as usize
     }
 
+    /// Whether the top page of the key tree is cached.
     pub(crate) fn secondary_directory_loaded(&self, index_id: u64, lane: Lane) -> bool {
-        self.cache().sec_dirs.contains_key(&(index_id, lane))
+        self.sec_top_cached(index_id, lane)
     }
 
     // ------------------------------------------------------------------
@@ -536,12 +747,14 @@ impl Db {
                 if let Bucket::Us(v) = map.bucket(value.clone(), || Bucket::Us(UList::default())) {
                     v.push(u)?;
                 }
+                map.bytes += REF_COST;
             }
             IndexKind::Fulltext => {
                 let tokens = textindex::simple_tokens(value, kg.casefold);
                 if let Bucket::Doc(v) = map.bucket_str(FULLTEXT_DOCLEN_KEY, || Bucket::Doc(Vec::new())) {
                     v.push((u.clone(), tokens.len() as u64));
                 }
+                map.bytes += 48;
                 let mut order: Vec<&str> = Vec::new();
                 let mut pos: HashMap<&str, Vec<u64>> = HashMap::new();
                 for (i, t) in tokens.iter().enumerate() {
@@ -554,26 +767,34 @@ impl Db {
                 }
                 for t in order {
                     let p = pos.remove(t).unwrap();
+                    let cost = 64 + p.len() * 8;
                     if let Bucket::Ft(v) = map.bucket_str(t, || Bucket::Ft(Vec::new())) {
                         v.push((u.clone(), p));
                     }
+                    map.bytes += cost;
                 }
             }
             IndexKind::Token | IndexKind::Trigram => {
                 if value.is_none() {
                     return Ok(());
                 }
-                let keys = if idef.kind == IndexKind::Token {
-                    textindex::simple_tokens(value, kg.casefold)
+                // RUN9 V4: n-grams as slices of the normalized text (no
+                // string per position); keys are created only for new ones
+                let (owned, text);
+                let keys: Vec<&str> = if idef.kind == IndexKind::Token {
+                    owned = textindex::simple_tokens(value, kg.casefold);
+                    owned.iter().map(String::as_str).collect()
                 } else {
-                    textindex::ngrams(value, kg.ngram, kg.casefold)
+                    text = textindex::normalize_text(value, kg.casefold);
+                    textindex::ngram_slices(&text, kg.ngram)
                 };
                 let mut seen: HashSet<&str> = HashSet::with_capacity(keys.len());
-                for k in &keys {
-                    if seen.insert(k.as_str()) {
+                for &k in &keys {
+                    if seen.insert(k) {
                         if let Bucket::Us(v) = map.bucket_str(k, || Bucket::Us(UList::default())) {
                             v.push(u)?;
                         }
+                        map.bytes += REF_COST;
                     }
                 }
             }
@@ -583,7 +804,7 @@ impl Db {
 
     /// Value lists of all selected indexes (`_build_maps_fast`):
     /// BASE fields via the dense path, extensions directly from sparse blocks.
-    fn build_maps(&self, selected: &[IndexDef]) -> Result<(IndexMaps, u64, u64)> {
+    fn build_maps(&self, selected: &[IndexDef], spill: &mut Spill) -> Result<(IndexMaps, u64, u64)> {
         let mut maps: HashMap<(u64, Lane), ValueMap> = HashMap::new();
         let mut kgs: HashMap<u64, KeyGen> = HashMap::new();
         for idx in selected {
@@ -617,17 +838,18 @@ impl Db {
                 // sparse blocks in block order). Pure sparse records are indexed
                 // as well.
                 let base_vs_wanted: HashSet<&Nat> = base_idxs.iter().map(|i| i.field_v()).collect();
-                let mut overlay: HashMap<(Nat, Nat), SVal> = HashMap::new();
+                // (state, block id): F1 compares the id with the DENSE record
+                let mut overlay: HashMap<(Nat, Nat), (SVal, u64)> = HashMap::new();
                 if !base_idxs.is_empty() {
                     if let Some(sidx) = self.sparse.get(&key) {
-                        for seg in &sidx.segs {
+                        for seg in &sidx.idx.collect_block_order(self)? {
                             let bi = self.sparse_block_index(seg)?;
                             let payload = self.block_payload_once(seg.block_offset)?;
                             for (u, abs, len) in bi.iter() {
-                                let rel = (abs - seg.payload_offset) as usize;
-                                for (v, meta) in self.decode_sparse_record(&realm, u, &payload[rel..rel + *len as usize])? {
+                                let rel = abs.checked_sub(seg.payload_offset).ok_or_else(|| Error::Corruption(format!("SPARSE block {}: group directory outside the block", seg.block_id)))? as usize;
+                                for (v, meta) in self.decode_sparse_record(&realm, u, payload.get(rel..rel + *len as usize).ok_or_else(|| Error::Corruption(format!("SPARSE block {}: record outside the block", seg.block_id)))?)? {
                                     if base_vs_wanted.contains(&v) {
-                                        overlay.insert((u.clone(), v), meta.value);
+                                        overlay.insert((u.clone(), v), (meta.value, seg.block_id));
                                     }
                                 }
                             }
@@ -635,9 +857,9 @@ impl Db {
                     }
                 }
                 if !base_idxs.is_empty() {
-                    if let Some(didx) = self.dense.get(&key).filter(|d| !d.segs.is_empty()) {
-                        let mut by_start: Vec<&super::DenseSegment> = didx.segs.iter().collect();
-                        by_start.sort_by(|a, b| a.u_start.cmp(&b.u_start).then(a.block_id.cmp(&b.block_id)));
+                    if let Some(didx) = self.dense.get(&key).filter(|d| !d.idx.is_empty()) {
+                        let all_segs = didx.idx.collect_by_start(self)?;
+                        let by_start: Vec<&super::DenseSegment> = all_segs.iter().collect();
                         let mut dense_overlap = false;
                         let mut prev_end: Option<&Nat> = None;
                         for seg in &by_start {
@@ -649,16 +871,17 @@ impl Db {
                                 prev_end = Some(&seg.u_end);
                             }
                         }
-                        let newest_wins = dense_overlap || self.deletes.keys().any(|(r, l, _)| r == &realm && *l == lane);
+                        let newest_wins = dense_overlap || self.has_deletes(&key);
                         let segs: Vec<&super::DenseSegment> = if newest_wins {
-                            let mut s: Vec<_> = didx.segs.iter().collect();
+                            let mut s: Vec<_> = all_segs.iter().collect();
                             s.sort_by_key(|x| std::cmp::Reverse(x.block_id));
                             s
                         } else {
                             by_start
                         };
+                        let dedup = overlapping(segs.iter().map(|s| (&s.u_start, &s.u_end)));
                         let mut seen: HashSet<Nat> = HashSet::new();
-                        for seg in segs {
+                        for (si, seg) in segs.into_iter().enumerate() {
                             let shape = self.shape_of(seg.shape_id)?;
                             let mut wanted_here: Vec<(usize, Vec<&IndexDef>)> = Vec::new();
                             for (fi, f) in shape.fields.iter().enumerate() {
@@ -668,19 +891,43 @@ impl Db {
                                 }
                             }
                             if wanted_here.is_empty() {
+                                // a newer record of a shape without an indexed
+                                // field still hides the older records of its u
+                                // (newest segment first): mark them, or an older
+                                // segment would index a field this record
+                                // dropped (review 2026-11-09, T2 finding 2).
+                                // A DELETE newer than this segment hides it
+                                // in turn, then an older record may show.
+                                if newest_wins && dedup[si] {
+                                    for i in 0..seg.count {
+                                        let u = seg.u_start.add_u64(i);
+                                        if self.delete_block_id(&key, &u)?.is_some_and(|d| d > seg.block_id) {
+                                            continue;
+                                        }
+                                        seen.insert(u);
+                                    }
+                                }
                                 continue;
                             }
                             let payload = self.block_payload_once(seg.block_offset)?;
+                            // RD-01: the block must be the one of the entry
+                            self.check_dense_prefix(seg, &payload)?;
                             let toff = (seg.offsets_offset - seg.payload_offset) as usize;
                             let rbase = (seg.records_offset - seg.payload_offset) as usize;
                             let max_fi = wanted_here.last().unwrap().0;
+                            // RA2-03: budget check every 256 records or 64 KiB of records
+                            let mut pending = 0usize;
                             for i in 0..seg.count as usize {
+                                if i & 255 == 255 || pending >= CHECK_BYTES {
+                                    spill.check(&mut maps)?;
+                                    pending = 0;
+                                }
                                 let u = seg.u_start.add_u64(i as u64);
                                 if newest_wins {
-                                    if !seen.insert(u.clone()) {
+                                    if dedup[si] && !seen.insert(u.clone()) {
                                         continue;
                                     }
-                                    if self.deletes.get(&(realm.clone(), lane, u.clone())).is_some_and(|d| *d > seg.block_id) {
+                                    if self.delete_block_id(&key, &u)?.is_some_and(|d| d > seg.block_id) {
                                         continue;
                                     }
                                 }
@@ -694,6 +941,7 @@ impl Db {
                                     return Err(Error::Corruption("DATA record offset invalid".into()));
                                 }
                                 let rec = &payload[rbase + s..rbase + e];
+                                pending += rec.len();
                                 let mut p = 0usize;
                                 let mut wi = 0;
                                 for (fi, f) in shape.fields.iter().enumerate().take(max_fi + 1) {
@@ -701,11 +949,13 @@ impl Db {
                                         let mut val = decode_value(f, rec, &mut p)?;
                                         if !overlay.is_empty() {
                                             match overlay.get(&(u.clone(), f.v.clone())) {
-                                                Some(SVal::Tomb) => {
+                                                // F1: older than the record → the record's value
+                                                Some((_, bid)) if *bid < seg.block_id => {}
+                                                Some((SVal::Tomb, _)) => {
                                                     wi += 1;
                                                     continue;
                                                 }
-                                                Some(SVal::V(x)) => val = x.clone(),
+                                                Some((SVal::V(x), _)) => val = x.clone(),
                                                 None => {}
                                             }
                                         }
@@ -718,48 +968,72 @@ impl Db {
                                     }
                                 }
                             }
+                            spill.check(&mut maps)?;
                         }
                     }
                 }
                 if !overlay.is_empty() {
-                    // pure sparse records (no live dense record at u)
-                    let mut extra: Vec<(&(Nat, Nat), &Val)> = overlay
-                        .iter()
-                        .filter_map(|(k, st)| st.val().map(|v| (k, v)))
-                        .filter(|((u, _), _)| self.resolve_segment(&realm, u, lane).is_none() && !foreign(u))
-                        .collect();
+                    // cells written alone where no live dense record holds
+                    // the field: pure sparse records, and BASE fields the
+                    // stored shape of the record lacks
+                    let mut extra: Vec<(&(Nat, Nat), &Val)> = Vec::new();
+                    for (k, (st, _)) in overlay.iter() {
+                        let Some(v) = st.val() else { continue };
+                        if foreign(&k.0) {
+                            continue;
+                        }
+                        let held = match self.resolve_segment(&realm, &k.0, lane)? {
+                            Some(seg) => self.shape_of(seg.shape_id)?.by_v(&k.1).is_some(),
+                            None => false,
+                        };
+                        if !held {
+                            extra.push((k, v));
+                        }
+                    }
                     extra.sort_by(|a, b| a.0.cmp(b.0));
-                    for ((u, v), val) in extra {
+                    for (n, ((u, v), val)) in extra.into_iter().enumerate() {
                         for idef in base_idxs.iter().filter(|i| i.field_v() == v) {
                             Self::append_index_document(maps.get_mut(&(idef.index_id, lane)).unwrap(), idef, &kgs[&idef.index_id], u, val)?;
+                        }
+                        if n & 255 == 255 {
+                            spill.check(&mut maps)?;
                         }
                     }
                 }
                 if !ext_idxs.is_empty() {
-                    if let Some(sidx) = self.sparse.get(&key).filter(|s| !s.segs.is_empty()) {
-                        let mut segs: Vec<_> = sidx.segs.iter().collect();
-                        segs.sort_by_key(|x| std::cmp::Reverse(x.block_id));
+                    if let Some(sidx) = self.sparse.get(&key).filter(|s| !s.idx.is_empty()) {
+                        let mut segs = sidx.idx.collect_block_order(self)?;
+                        segs.reverse();
                         let wanted: HashSet<&Nat> = ext_idxs.iter().map(|i| i.field_v()).collect();
                         let max_wanted: Nat = wanted.iter().map(|v| (*v).clone()).max().unwrap_or_default();
+                        let dedup = overlapping(segs.iter().map(|s| (&s.u_start, &s.u_end)));
                         let mut seen_cells: HashSet<(Nat, Nat)> = HashSet::new();
-                        for seg in segs {
+                        for (si, seg) in segs.iter().enumerate() {
                             let bi = self.sparse_block_index(seg)?;
                             let payload = self.block_payload_once(seg.block_offset)?;
-                            for (u, abs, len) in bi.iter() {
+                            let mut pending = 0usize;
+                            for (gi, (u, abs, len)) in bi.iter().enumerate() {
                                 sparse_groups += 1;
-                                let rel = (abs - seg.payload_offset) as usize;
+                                // RA2-03/RX-01: every 256 groups or 64 KiB of group bytes
+                                pending += *len as usize;
+                                if gi & 255 == 255 || pending >= CHECK_BYTES {
+                                    spill.check(&mut maps)?;
+                                    pending = 0;
+                                }
+                                let rel = abs.checked_sub(seg.payload_offset).ok_or_else(|| Error::Corruption(format!("SPARSE block {}: group directory outside the block", seg.block_id)))? as usize;
                                 if foreign(u) {
                                     continue;
                                 }
-                                let vals = self.decode_sparse_selected(&realm, u, &payload[rel..rel + *len as usize], &max_wanted)?;
-                                // F026: `delete(realm, u)` hides only the dense
-                                // record; extension cells stay visible to the
-                                // read path and therefore stay indexed.
+                                let vals = self.decode_sparse_selected(&realm, u, payload.get(rel..rel + *len as usize).ok_or_else(|| Error::Corruption(format!("SPARSE block {}: record outside the block", seg.block_id)))?, &max_wanted)?;
+                                // F026: a DELETE block hides only the dense
+                                // record; extension cells a delete left alive
+                                // (e.g. `delete_area` over the BASE fields)
+                                // stay visible and therefore stay indexed.
                                 for (v, meta) in vals {
                                     if !wanted.contains(&v) {
                                         continue;
                                     }
-                                    if !seen_cells.insert((u.clone(), v.clone())) {
+                                    if dedup[si] && !seen_cells.insert((u.clone(), v.clone())) {
                                         continue;
                                     }
                                     let SVal::V(val) = meta.value else { continue };
@@ -768,6 +1042,7 @@ impl Db {
                                     }
                                 }
                             }
+                            spill.check(&mut maps)?;
                         }
                     }
                 }
@@ -775,30 +1050,25 @@ impl Db {
         }
         // Persisted postings must be sorted by document u.
         for vm in maps.values_mut() {
-            for (_, b) in vm.items.iter_mut() {
-                match b {
-                    Bucket::Us(v) => v.sort_check(),
-                    Bucket::Ft(v) => {
-                        if v.windows(2).any(|w| w[0].0 > w[1].0) {
-                            v.sort_by(|a, b| a.0.cmp(&b.0));
-                        }
-                    }
-                    Bucket::Doc(v) => {
-                        if v.windows(2).any(|w| w[0].0 > w[1].0) {
-                            v.sort_by(|a, b| a.0.cmp(&b.0));
-                        }
-                    }
-                }
-            }
+            sort_buckets(vm);
         }
         Ok((maps, dense_scanned, sparse_groups))
     }
 
-    fn persist_secondary(&mut self, idx: &IndexDef, value_map: &ValueMap, source_bid: u64, lane: Lane, lane_max_u: &Nat) -> Result<(u64, u64, usize)> {
+    /// Writes the key tree of one index: the in-memory keys merged with the
+    /// spilled runs, key by key (lists of one key merged by document u).
+    fn persist_secondary(&mut self, idx: &IndexDef, value_map: &ValueMap, runs: &[super::idxspill::SpillRun], source_bid: u64, lane: Lane, lane_max_u: &Nat) -> Result<Persisted> {
+        // RUN¹⁰: checkpoint of the RAM limiter per MiB of merged postings
+        let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::IndexBuild);
         // F009: the posting width covers the largest document u actually
         // indexed (sparse u may exceed the dense maximum of the lane); the
         // lane maximum keeps the width of the reference for ordinary data.
         let mut max_u = lane_max_u.clone();
+        if let Some(m) = &value_map.spilled_max_u {
+            if m > &max_u {
+                max_u = m.clone();
+            }
+        }
         for (_, b) in &value_map.items {
             if let Bucket::Us(us) = b {
                 if let Some(last) = us.last() {
@@ -809,78 +1079,235 @@ impl Db {
             }
         }
         let width = width_for(&max_u);
-        let too_wide = || Error::Value("posting u exceeds the posting width".into());
+        // key order of the tree (references only; the map holds the keys)
         let mut items: Vec<&(Val, Bucket)> = value_map.items.iter().collect();
-        crate::val::py_sort_keys(&mut items, |kv| &kv.0);
-        let mut postings: Vec<u8> = Vec::new();
-        let mut directory: Vec<u8> = Vec::new();
-        for (value, bucket) in items {
-            let (w, raw): (u8, Vec<u8>) = match bucket {
-                Bucket::Ft(e) => (PAYLOAD_FULLTEXT_POSITIONS, textindex::encode_fulltext_posting(e)?),
-                Bucket::Doc(e) => (PAYLOAD_FULLTEXT_DOCLENS, textindex::encode_fulltext_doc_lengths(e)?),
-                Bucket::Us(UList::Tiny(us)) if width == 4 || width == 8 => {
-                    let mut raw = Vec::with_capacity(us.len() * width as usize);
-                    for &x in us {
-                        if width == 4 {
-                            raw.extend_from_slice(&x.to_le_bytes());
-                        } else {
-                            raw.extend_from_slice(&(x as u64).to_le_bytes());
-                        }
-                    }
-                    (width, raw)
-                }
-                Bucket::Us(UList::Small(us)) if width == 4 || width == 8 => {
-                    let mut raw = Vec::with_capacity(us.len() * width as usize);
-                    for &x in us {
-                        if width == 4 {
-                            raw.extend_from_slice(&u32::try_from(x).map_err(|_| too_wide())?.to_le_bytes());
-                        } else {
-                            raw.extend_from_slice(&x.to_le_bytes());
-                        }
-                    }
-                    (width, raw)
-                }
-                Bucket::Us(us) => match (width, us) {
-                    (4, UList::Big(us)) => {
-                        let mut raw = Vec::with_capacity(us.len() * 4);
-                        for u in us {
-                            let x = u.as_u64().and_then(|x| u32::try_from(x).ok()).ok_or_else(too_wide)?;
-                            raw.extend_from_slice(&x.to_le_bytes());
-                        }
-                        (4, raw)
-                    }
-                    (8, UList::Big(us)) => {
-                        let mut raw = Vec::with_capacity(us.len() * 8);
-                        for u in us {
-                            raw.extend_from_slice(&u.as_u64().ok_or_else(too_wide)?.to_le_bytes());
-                        }
-                        (8, raw)
-                    }
-                    (_, us) => (0, encode_big_posting(&us.to_nats())?),
-                },
-            };
-            let comp = crate::zlib::compress(&raw, 1);
-            let rel = postings.len() as u64;
-            postings.extend_from_slice(&comp);
-            let k = json_key_encode(value)?;
-            put_vu64(&mut directory, k.len() as u64);
-            directory.extend_from_slice(k.as_bytes());
-            put_vu64(&mut directory, rel);
-            put_vu64(&mut directory, comp.len() as u64);
-            put_vu64(&mut directory, bucket.len() as u64);
-            directory.push(w);
+        items.sort_by(|a, b| secindex::cmp_vals(&a.0, &b.0));
+        let window = self.index_build_budget() / 4 / runs.len().max(1);
+        let mut readers: Vec<super::idxspill::SpillReader> =
+            runs.iter().cloned().map(|r| super::idxspill::SpillReader::open(r, window)).collect::<Result<_>>()?;
+        let mut mi = 0usize;
+        let doc_key = secindex::encode_key_vec(&Val::str(FULLTEXT_DOCLEN_KEY))?;
+        let mut w = secindex::SecWriter::new(idx.index_id, lane);
+        let (mut keys, mut refs, mut docs) = (0u64, 0u64, None);
+        // RA2-06: k-way merge over a heap (smallest key, then source: the
+        // in-memory map first, runs in spill order), O(log runs) per key
+        let mut heap: BinaryHeap<MergeHead> = BinaryHeap::new();
+        if let Some(kv) = items.first() {
+            heap.push(MergeHead { key: secindex::encode_key_vec(&kv.0)?, src: 0 });
         }
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(SEC_TAG);
-        put_vu64(&mut prefix, idx.index_id);
-        put_vu64(&mut prefix, source_bid);
-        put_vu64(&mut prefix, value_map.items.len() as u64);
-        put_vu64(&mut prefix, directory.len() as u64);
-        let plen = prefix.len() + directory.len() + postings.len();
-        let (off, bid) = self.append_block_parts(BT_SECONDARY, &[&prefix, &directory, &postings], lane_flags(lane))?;
+        for (i, r) in readers.iter().enumerate() {
+            if let Some(h) = &r.head {
+                heap.push(MergeHead { key: h.key.clone(), src: i + 1 });
+            }
+        }
+        while let Some(top) = heap.pop() {
+            let key = top.key;
+            let mut same = vec![top.src];
+            while heap.peek().is_some_and(|h| secindex::cmp_keys(&h.key, &key) == Ordering::Equal) {
+                same.push(heap.pop().unwrap().src);
+            }
+            let mut from_runs: Vec<usize> = Vec::new();
+            let mut mem_bucket: Option<&Bucket> = None;
+            for i in same {
+                if i == 0 {
+                    mem_bucket = Some(&items[mi].1);
+                    mi += 1;
+                    if let Some(kv) = items.get(mi) {
+                        heap.push(MergeHead { key: secindex::encode_key_vec(&kv.0)?, src: 0 });
+                    }
+                } else {
+                    from_runs.push(i - 1);
+                }
+            }
+            let mut spilled: Vec<Bucket> = Vec::new();
+            if !from_runs.is_empty() {
+                // RUN9 V4: the entries of the runs are read one by one and
+                // merged straight into the encoder; a key spread over many
+                // runs is never decoded as a whole (same bytes as
+                // merge_buckets + encode_bucket)
+                let done = self.persist_merged(&mut w, &key, &mut readers, &from_runs, mem_bucket, key == doc_key, width)?;
+                if done.is_none() {
+                    for &r in &from_runs {
+                        spilled.push(readers[r].take_bucket()?);
+                    }
+                }
+                for &r in &from_runs {
+                    readers[r].next_record()?;
+                    if let Some(h) = &readers[r].head {
+                        heap.push(MergeHead { key: h.key.clone(), src: r + 1 });
+                    }
+                }
+                if let Some(done) = done {
+                    keys += 1;
+                    match done {
+                        Merged::Docs(n) => docs = Some(n),
+                        Merged::Refs(n) => refs += n,
+                    }
+                    continue;
+                }
+            }
+            let merged;
+            let bucket: &Bucket = match (mem_bucket, spilled.is_empty()) {
+                (Some(b), true) => b,
+                (mem, _) => {
+                    spilled.extend(mem.cloned());
+                    merged = super::idxspill::merge_buckets(spilled)?;
+                    &merged
+                }
+            };
+            let count = bucket.len() as u64;
+            keys += 1;
+            if let (Bucket::Doc(entries), true) = (bucket, key == doc_key) {
+                // 0.28.2: summary + segments of about 4 KiB (`textindex.rs`)
+                docs = Some(count);
+                let segs = textindex::doclen_segments(entries, secindex::page_bytes().min(textindex::DOCLEN_SEGMENT_BYTES));
+                let tokens: u64 = entries.iter().map(|e| e.1).sum();
+                let summary = textindex::encode_doclen_summary(count, tokens, segs.len() as u64);
+                w.add(self, key, count, PAYLOAD_FULLTEXT_DOCLEN_SUMMARY, &summary)?;
+                for seg in segs {
+                    let last = &seg.last().expect("segments are not empty").0;
+                    let k = secindex::encode_key_vec(&Val::Str(textindex::doclen_segment_key(last)))?;
+                    let raw = textindex::encode_fulltext_doc_lengths(seg)?;
+                    w.add(self, k, seg.len() as u64, PAYLOAD_FULLTEXT_DOCLEN_SEGMENT, &raw)?;
+                }
+                continue;
+            }
+            let (code, raw) = encode_bucket(bucket, width)?;
+            meter.grow(raw.len() as u64)?;
+            refs += count;
+            w.add(self, key, count, code, &raw)?;
+        }
+        let (root, pages, page_blocks) = w.finish(self, source_bid)?;
+        self.dir.unlisted_blocks += page_blocks;
+        let (off, bid) = self.append_block(BT_SECONDARY, &root, lane_flags(lane))?;
         let info = self.read_header_at(off)?;
         self.parse_secondary_directory(&info)?;
-        Ok((off, bid, plen))
+        Ok(Persisted { off, bid, bytes: pages as usize + root.len(), keys, refs, docs })
+    }
+
+    /// RUN9 V4: writes the key `key` whose posting is spread over the
+    /// current records of the runs `runs` (in spill order) and the
+    /// in-memory part `mem`, merged entry by entry into the encoder: only
+    /// one entry per source is decoded at a time. `None`: a small key (below
+    /// `STREAM_MERGE_MIN` entries) or a case the merge does not cover (u
+    /// wider than 64 bit, document lengths under another key); nothing was
+    /// read then, the caller merges as before.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_merged(
+        &mut self,
+        w: &mut secindex::SecWriter,
+        key: &[u8],
+        readers: &mut [super::idxspill::SpillReader],
+        runs: &[usize],
+        mem: Option<&Bucket>,
+        doc_key: bool,
+        width: u8,
+    ) -> Result<Option<Merged>> {
+        use super::idxspill::RunEntry;
+        let mem_kind = mem.map(|b| match b {
+            Bucket::Us(_) => 0u8,
+            Bucket::Ft(_) => 1,
+            Bucket::Doc(_) => 2,
+        });
+        let heads: Vec<(u8, u64)> = runs.iter().map(|&r| readers[r].head.as_ref().map(|h| (h.kind, h.left)).expect("run record")).collect();
+        let kind = heads[0].0;
+        if heads.iter().any(|h| h.0 != kind) || mem_kind.is_some_and(|k| k != kind) {
+            return Err(Error::Value("index build: one key with different posting kinds".into()));
+        }
+        if (kind == 0 && width != 4 && width != 8) || (kind == 2 && !doc_key) {
+            return Ok(None);
+        }
+        let count = heads.iter().map(|h| h.1).sum::<u64>() + mem.map_or(0, |b| b.len() as u64);
+        // a small key is cheaper decoded and sorted as before (a few MiB at
+        // most); only large ones are merged entry by entry
+        if count < stream_merge_min() {
+            return Ok(None);
+        }
+        // sources: the runs, then the in-memory part (the order of the
+        // concatenation merge_buckets sorted stably)
+        let mut mi = 0usize;
+        let mut next = |s: usize| -> Result<Option<RunEntry>> {
+            if s < runs.len() {
+                return readers[runs[s]].next_entry();
+            }
+            let e = match mem {
+                Some(Bucket::Us(UList::Tiny(v))) => v.get(mi).map(|x| RunEntry::U(Nat::S(*x as u64))),
+                Some(Bucket::Us(UList::Small(v))) => v.get(mi).map(|x| RunEntry::U(Nat::S(*x))),
+                Some(Bucket::Us(UList::Big(v))) => v.get(mi).map(|x| RunEntry::U(x.clone())),
+                Some(Bucket::Ft(v)) => v.get(mi).map(|(u, p)| RunEntry::Ft(u.clone(), p.clone())),
+                Some(Bucket::Doc(v)) => v.get(mi).map(|(u, d)| RunEntry::Doc(u.clone(), *d)),
+                None => None,
+            };
+            mi += 1;
+            Ok(e)
+        };
+        let sources = runs.len() + mem.is_some() as usize;
+        let u_of = |e: &RunEntry| match e {
+            RunEntry::U(u) | RunEntry::Ft(u, _) | RunEntry::Doc(u, _) => u.clone(),
+        };
+        match kind {
+            0 => {
+                let too_wide = || Error::Value("posting u exceeds the posting width".into());
+                let mut raw: Vec<u8> = Vec::new();
+                raw.try_reserve_exact(count as usize * width as usize).map_err(|e| Error::Memory(format!("index build: {e}")))?;
+                stream_merge(sources, &mut next, u_of, |e| {
+                    let RunEntry::U(u) = e else { unreachable!() };
+                    let x = u.as_u64().ok_or_else(too_wide)?;
+                    if width == 4 {
+                        raw.extend_from_slice(&u32::try_from(x).map_err(|_| too_wide())?.to_le_bytes());
+                    } else {
+                        raw.extend_from_slice(&x.to_le_bytes());
+                    }
+                    Ok(())
+                })?;
+                w.add(self, key.to_vec(), count, width, &raw)?;
+                Ok(Some(Merged::Refs(count)))
+            }
+            1 => {
+                let mut enc = textindex::FtPostingEncoder::new(count);
+                stream_merge(sources, &mut next, u_of, |e| {
+                    let RunEntry::Ft(u, pos) = e else { unreachable!() };
+                    enc.push(&u, &pos)
+                })?;
+                w.add(self, key.to_vec(), count, PAYLOAD_FULLTEXT_POSITIONS, &enc.finish())?;
+                Ok(Some(Merged::Refs(count)))
+            }
+            _ => {
+                // 0.28.2: summary + segments of about 4 KiB; the summary
+                // names the segment count, so the encoded segments (a few
+                // bytes per document) are kept until the summary is written
+                let target = secindex::page_bytes().min(textindex::DOCLEN_SEGMENT_BYTES);
+                let mut cut = textindex::DoclenSegmenter::new(target);
+                let (mut seg, mut tokens) = (Vec::new(), 0u64);
+                let mut segs: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
+                let close = |seg: &mut Vec<(Nat, u64)>, segs: &mut Vec<(Vec<u8>, u64, Vec<u8>)>| -> Result<()> {
+                    let last = &seg.last().expect("segments are not empty").0;
+                    let sk = secindex::encode_key_vec(&Val::Str(textindex::doclen_segment_key(last)))?;
+                    segs.push((sk, seg.len() as u64, textindex::encode_fulltext_doc_lengths(seg)?));
+                    seg.clear();
+                    Ok(())
+                };
+                stream_merge(sources, &mut next, u_of, |e| {
+                    let RunEntry::Doc(u, dl) = e else { unreachable!() };
+                    tokens += dl;
+                    let end = cut.push(&u, dl);
+                    seg.push((u, dl));
+                    if end {
+                        close(&mut seg, &mut segs)?;
+                    }
+                    Ok(())
+                })?;
+                if !seg.is_empty() {
+                    close(&mut seg, &mut segs)?;
+                }
+                let summary = textindex::encode_doclen_summary(count, tokens, segs.len() as u64);
+                w.add(self, key.to_vec(), count, PAYLOAD_FULLTEXT_DOCLEN_SUMMARY, &summary)?;
+                for (sk, n, raw) in segs {
+                    w.add(self, sk, n, PAYLOAD_FULLTEXT_DOCLEN_SEGMENT, &raw)?;
+                }
+                Ok(Some(Merged::Docs(count)))
+            }
+        }
     }
 
     /// Rebuilds indexes (`build_indexes`).
@@ -888,63 +1315,10 @@ impl Db {
     /// A lane with any data blocks (even only sparse or
     /// deletes) always receives a SECONDARY block, so that indexes of
     /// pure sparse realms also become fresh.
-    /// I001: estimated memory of the posting lists of one index during the
-    /// build – one reference per dense record and per sparse u group of its
-    /// realm (exact for VALUE indexes; a lower bound for TOKEN, TRIGRAM and
-    /// FULLTEXT, which can produce several references per record).
-    pub(crate) fn index_build_estimate(&self, idx: &IndexDef) -> u64 {
-        let mut refs = 0u64;
-        let mut per_ref = 10u64;
-        for lane in [0u8, 1] {
-            let key = (idx.realm_id.clone(), lane);
-            if let Some(d) = self.dense.get(&key) {
-                refs = refs.saturating_add(d.segs.iter().map(|s| s.count).sum::<u64>());
-            }
-            if let Some(sp) = self.sparse.get(&key) {
-                refs = refs.saturating_add(sp.segs.iter().map(|s| s.group_count).sum::<u64>());
-            }
-            if let Some(m) = self.max_u.get(&key) {
-                per_ref = per_ref.max(ref_bytes_estimate(m));
-            }
-        }
-        refs.saturating_mul(per_ref)
-    }
-
-    /// I001: splits the selected indexes into scan passes. All indexes of a
-    /// pass are built from one scan and held in memory together, so a pass
-    /// may use at most half of the physical memory; consecutive indexes are
-    /// grouped (order kept). Normally that is a single pass, as before; only
-    /// for very large databases the build falls back to fewer indexes per
-    /// scan. An index that alone would need more than the physical memory
-    /// is refused with `Error::Memory` before anything is read or written.
-    fn plan_index_passes(&self, selected: &[IndexDef]) -> Result<Vec<Vec<IndexDef>>> {
-        let Some(phys) = self.index_build_memory_override.or_else(super::columns::physical_memory_bytes) else {
-            return Ok(vec![selected.to_vec()]);
-        };
-        let limit = phys / 2;
-        let mut passes: Vec<Vec<IndexDef>> = Vec::new();
-        let (mut cur, mut cur_bytes): (Vec<IndexDef>, u64) = (Vec::new(), 0);
-        for idx in selected {
-            let need = self.index_build_estimate(idx);
-            if need > phys {
-                return Err(Error::Memory(format!(
-                    "build_indexes: index '{}' would need about {} MiB of memory during the build, more than the physical memory ({} MiB)",
-                    idx.name,
-                    need >> 20,
-                    phys >> 20
-                )));
-            }
-            if !cur.is_empty() && cur_bytes.saturating_add(need) > limit {
-                passes.push(std::mem::take(&mut cur));
-                cur_bytes = 0;
-            }
-            cur.push(idx.clone());
-            cur_bytes = cur_bytes.saturating_add(need);
-        }
-        if !cur.is_empty() {
-            passes.push(cur);
-        }
-        Ok(passes)
+    /// Memory budget of the index build: beyond it the collected keys are
+    /// spilled as sorted runs (`idxspill.rs`).
+    fn index_build_budget(&self) -> usize {
+        self.index_build_memory_override.map(|b| b as usize).unwrap_or(self.config.index_build_memory_bytes)
     }
 
     pub fn build_indexes(&mut self, index_ids: Option<&[u64]>, commit: bool) -> Result<Val> {
@@ -962,14 +1336,24 @@ impl Db {
             }
             return Ok(vmap! {"scan_s" => 0.0, "persist_s" => 0.0, "total_s" => 0.0, "records_scanned" => 0i64, "indexes" => Val::List(vec![])});
         }
-        let passes = self.plan_index_passes(&selected)?;
+        let passes = vec![selected.clone()];
+        let mut spill = Spill {
+            budget: self.index_build_budget(),
+            dirs: vec![std::env::temp_dir(), crate::platform::parent_dir(&self.path)],
+            file: None,
+            runs: HashMap::new(),
+            spills: 0,
+            bytes: 0,
+            meter: crate::limiter::Meter::new(crate::limiter::JobKind::Elastic, crate::limiter::JobPath::IndexBuild),
+            held: 0,
+        };
         let (mut scan_s, mut persist_s) = (0.0f64, 0.0f64);
         let (mut dense_scanned, mut sparse_groups) = (0u64, 0u64);
         let mut scanned_realms: HashSet<Nat> = HashSet::new();
         let mut stats = Vec::new();
         for pass in &passes {
             let t0 = Instant::now();
-            let (maps, pass_dense, pass_sparse) = self.build_maps(pass)?;
+            let (maps, pass_dense, pass_sparse) = self.build_maps(pass, &mut spill)?;
             scan_s += t0.elapsed().as_secs_f64();
             // a realm scanned again in a later pass is not counted twice
             let new_realm = pass.iter().fold(false, |acc, i| scanned_realms.insert(i.realm_id.clone()) | acc);
@@ -989,25 +1373,26 @@ impl Db {
                     let source = self.data_max_block_id_by_lane.get(&rk).copied().unwrap_or(0);
                     let max_u = self.max_u.get(&rk).cloned().unwrap_or_default();
                     let vm = &maps[&sk];
-                    let (off, bid, nbytes) = self.persist_secondary(idx, vm, source, lane, &max_u)?;
+                    let runs = spill.runs.remove(&sk).unwrap_or_default();
+                    // N2 (RUN8): a failed tree leaves no unreferenced pages behind
+                    let p = self.write_scope(|db| db.persist_secondary(idx, vm, &runs, source, lane, &max_u))?;
+                    let (off, bid, nbytes) = (p.off, p.bid, p.bytes);
                     let mut row = vmap! {
                         "index_id" => idx.index_id as i64, "name" => idx.name.as_str(), "kind" => idx.kind.name(),
                         "lane" => lane as i64, "lane_name" => lane_name(lane),
                     };
                     if idx.kind == IndexKind::Fulltext {
-                        let docs = vm.get(FULLTEXT_DOCLEN_KEY).map(|b| b.len()).unwrap_or(0);
-                        let has_doc = vm.get(FULLTEXT_DOCLEN_KEY).is_some();
-                        let refs: usize = vm.items.iter().filter(|(k, _)| k.as_str() != Some(FULLTEXT_DOCLEN_KEY)).map(|(_, b)| b.len()).sum();
-                        row.set("distinct_values", Val::Int(vm.items.len() as i64 - has_doc as i64));
-                        row.set("u_references", Val::Int(refs as i64));
+                        let docs = p.docs.unwrap_or(0);
+                        let has_doc = p.docs.is_some();
+                        row.set("distinct_values", Val::Int(p.keys as i64 - has_doc as i64));
+                        row.set("u_references", Val::Int(p.refs as i64));
                         row.set("block_offset", Val::Int(off as i64));
                         row.set("block_id", Val::Int(bid as i64));
                         row.set("payload_bytes", Val::Int(nbytes as i64));
                         row.set("documents", Val::Int(docs as i64));
                     } else {
-                        let refs: usize = vm.items.iter().map(|(_, b)| b.len()).sum();
-                        row.set("distinct_values", Val::Int(vm.items.len() as i64));
-                        row.set("u_references", Val::Int(refs as i64));
+                        row.set("distinct_values", Val::Int(p.keys as i64));
+                        row.set("u_references", Val::Int(p.refs as i64));
                         row.set("block_offset", Val::Int(off as i64));
                         row.set("block_id", Val::Int(bid as i64));
                         row.set("payload_bytes", Val::Int(nbytes as i64));
@@ -1019,12 +1404,7 @@ impl Db {
             persist_s += t1.elapsed().as_secs_f64();
         }
         self.store.flush()?;
-        {
-            let c = self.caches.get_mut().unwrap_or_else(|e| e.into_inner());
-            c.postings.clear();
-            c.ft_postings.clear();
-            c.ft_corpus.clear();
-        }
+        self.cache().postings.clear();
         if commit {
             self.commit()?;
         }
@@ -1033,6 +1413,7 @@ impl Db {
             "records_scanned" => (dense_scanned + sparse_groups) as i64,
             "scan_detail" => vmap! {"dense_records_scanned" => dense_scanned as i64, "sparse_groups_scanned" => sparse_groups as i64},
             "passes" => passes.len() as i64,
+            "spill_rounds" => spill.spills as i64, "spill_bytes" => spill.bytes as i64,
             "indexes" => Val::List(stats),
         })
     }
@@ -1052,39 +1433,44 @@ impl Db {
     // Reading
     // ------------------------------------------------------------------
 
-    fn read_payload(&self, r: &PostingRef) -> Result<Vec<u8>> {
-        let comp = self.store.read_vec(r.abs_offset, r.compressed_len as usize)?;
-        // R010: `decompress` is bounded by deflate's maximum ratio
-        crate::zlib::decompress(&comp).map_err(|e| Error::Corruption(format!("Index payload zlib-corrupt: {e}")))
+    /// Entry of the key `value` (key equality as in a Python dict).
+    fn lookup_entry(&self, index_id: u64, lane: Lane, value: &Val) -> Result<Option<SecEntry>> {
+        self.sec_lookup(index_id, lane, &secindex::encode_key_vec(value)?)
+    }
+
+    /// Posting count of the key `value` (0 if absent).
+    fn key_count(&self, index_id: u64, lane: Lane, value: &Val) -> Result<u64> {
+        Ok(self.lookup_entry(index_id, lane, value)?.map(|e| e.raw_count).unwrap_or(0))
+    }
+
+    /// Posting of an entry through the posting cache (point lookups; range
+    /// walks decode without caching, see `posting_for_condition`).
+    fn entry_posting(&self, index_id: u64, lane: Lane, e: &SecEntry) -> Result<Arc<Vec<Nat>>> {
+        let ck = PostKey::Us(index_id, lane, ValKey(e.value()?));
+        if let Some(PostVal::Us(c)) = self.cache().postings.get(&ck) {
+            return Ok(c);
+        }
+        let arc = Arc::new(self.sec_posting_us(index_id, lane, e)?);
+        self.posting_cache_put(ck, PostVal::Us(arc.clone()));
+        Ok(arc)
+    }
+
+    /// Inserts into the posting pool (`[cache] posting_cache_bytes`).
+    pub(crate) fn posting_cache_put(&self, k: PostKey, v: PostVal) {
+        let cost = v.cost();
+        let budget = self.config.posting_cache_bytes;
+        self.cache().postings.insert(k, v, cost, budget);
     }
 
     pub(crate) fn load_posting(&self, index_id: u64, value: &Val, lane: Lane) -> Result<Arc<Vec<Nat>>> {
-        let ck = (index_id, lane, ValKey(value.clone()));
-        if let Some(c) = self.cache().postings.get(&ck) {
-            return Ok(c.clone());
+        let ck = PostKey::Us(index_id, lane, ValKey(value.clone()));
+        if let Some(PostVal::Us(c)) = self.cache().postings.get(&ck) {
+            return Ok(c);
         }
-        let dir = self.secondary_dir(index_id, lane)?;
-        let Some(&i) = dir.by_key.get(&ValKey(value.clone())) else {
-            return Ok(Arc::new(Vec::new()));
-        };
-        let r = &dir.entries[i];
-        if r.width == PAYLOAD_FULLTEXT_POSITIONS || r.width == PAYLOAD_FULLTEXT_DOCLENS {
-            return Err(Error::Schema("typed FULLTEXT payload is not a plain document ID posting list".into()));
+        match self.lookup_entry(index_id, lane, value)? {
+            None => Ok(Arc::new(Vec::new())),
+            Some(e) => self.entry_posting(index_id, lane, &e),
         }
-        let raw = self.read_payload(r)?;
-        let list: Vec<Nat> = match r.width {
-            0 => decode_big_posting(&raw, r.raw_count)?,
-            4 => raw.as_chunks::<4>().0.iter().map(|c| Nat::S(u32::from_le_bytes(*c) as u64)).collect(),
-            _ => raw.as_chunks::<8>().0.iter().map(|c| Nat::S(u64::from_le_bytes(*c))).collect(),
-        };
-        if list.len() as u64 != r.raw_count {
-            return Err(Error::Corruption("Posting count mismatch".into()));
-        }
-        let arc = Arc::new(list);
-        let mut c = self.cache();
-        let c = &mut *c;
-        super::blockcache::bounded_insert(&mut c.postings, &mut c.used.postings, ck, arc.clone(), |v| v.len(), super::blockcache::POSTINGS_BUDGET, usize::MAX);
-        Ok(arc)
     }
 
     fn require_fulltext(&self, index_id: u64) -> Result<&IndexDef> {
@@ -1098,135 +1484,443 @@ impl Db {
     pub fn fulltext_term_posting(&self, index_id: u64, term: &str, lane: Lane) -> Result<Arc<Vec<FtPosting>>> {
         self.check_open()?;
         self.require_fulltext(index_id)?;
-        let ck = (index_id, lane, term.to_string());
-        if let Some(c) = self.cache().ft_postings.get(&ck) {
-            return Ok(c.clone());
+        // AP9: a stale index answers through its overlay
+        if let Some(ov) = self.ixm_ft_overlay(index_id, lane)? {
+            return self.ov_fulltext_term_posting(&ov, index_id, term, lane);
         }
-        let dir = self.secondary_dir(index_id, lane)?;
-        let out = match dir.by_key.get(&ValKey(Val::str(term))) {
+        self.base_fulltext_term_posting(index_id, term, lane)
+    }
+
+    /// Term posting of the key tree (no overlay).
+    pub(crate) fn base_fulltext_term_posting(&self, index_id: u64, term: &str, lane: Lane) -> Result<Arc<Vec<FtPosting>>> {
+        let ck = PostKey::Ft(index_id, lane, term.to_string());
+        if let Some(PostVal::Ft(c)) = self.cache().postings.get(&ck) {
+            return Ok(c);
+        }
+        let out = match self.lookup_entry(index_id, lane, &Val::str(term))? {
             None => Vec::new(),
-            Some(&i) => {
-                let r = &dir.entries[i];
+            Some(r) => {
                 if r.width != PAYLOAD_FULLTEXT_POSITIONS {
                     return Err(Error::Corruption("FULLTEXT term has wrong payload codec".into()));
                 }
-                let raw = self.read_payload(r)?;
+                let raw = self.sec_posting_raw(index_id, lane, &r)?;
                 textindex::decode_fulltext_posting(&raw, Some(r.raw_count))
                     .map_err(|e| Error::Corruption(format!("FULLTEXT term payload corrupt: {e}")))?
             }
         };
         let arc = Arc::new(out);
-        let mut c = self.cache();
-        let c = &mut *c;
-        super::blockcache::bounded_insert(&mut c.ft_postings, &mut c.used.ft_postings, ck, arc.clone(), |v| v.len(), super::blockcache::FT_POSTINGS_BUDGET, usize::MAX);
+        self.posting_cache_put(ck, PostVal::Ft(arc.clone()));
         Ok(arc)
     }
 
-    /// `fulltext_corpus(index_id, lane=…)`
-    pub fn fulltext_corpus(&self, index_id: u64, lane: Lane) -> Result<Arc<FtCorpus>> {
+    /// Document lengths of an index: `Paged` (0.28.2, summary + segments)
+    /// or `Whole` (0.28.0/0.28.1: one list, decoded through the posting
+    /// pool).
+    fn doclen_source(&self, index_id: u64, lane: Lane) -> Result<DocLenSource> {
+        let Some(e) = self.lookup_entry(index_id, lane, &Val::str(FULLTEXT_DOCLEN_KEY))? else {
+            return Ok(DocLenSource::Empty);
+        };
+        let raw = self.sec_posting_raw(index_id, lane, &e)?;
+        let bad = |x: Error| Error::Corruption(format!("FULLTEXT document lengths corrupt: {x}"));
+        match e.width {
+            PAYLOAD_FULLTEXT_DOCLEN_SUMMARY => {
+                let (docs, tokens, _segments) = textindex::decode_doclen_summary(&raw, Some(e.raw_count)).map_err(bad)?;
+                Ok(DocLenSource::Paged { docs, tokens })
+            }
+            PAYLOAD_FULLTEXT_DOCLENS => {
+                let ck = PostKey::DocLens(index_id, lane, Vec::new());
+                if let Some(PostVal::DocLens(s)) = self.cache().postings.get(&ck) {
+                    return Ok(DocLenSource::Whole(s));
+                }
+                let seg = Arc::new(textindex::decode_doclen_segment(&raw, Some(e.raw_count)).map_err(bad)?);
+                self.posting_cache_put(ck, PostVal::DocLens(seg.clone()));
+                Ok(DocLenSource::Whole(seg))
+            }
+            _ => Err(Error::Corruption("FULLTEXT document lengths have wrong payload codec".into())),
+        }
+    }
+
+    /// Decoded segment of an entry (through the posting pool unless
+    /// `keep` is false); its key must name its last document.
+    fn doclen_segment(&self, index_id: u64, lane: Lane, e: &SecEntry, last: &Nat, keep: bool) -> Result<Arc<textindex::DocLenSeg>> {
+        let ck = PostKey::DocLens(index_id, lane, e.key.clone());
+        if keep {
+            if let Some(PostVal::DocLens(s)) = self.cache().postings.get(&ck) {
+                return Ok(s);
+            }
+        }
+        if e.width != PAYLOAD_FULLTEXT_DOCLEN_SEGMENT {
+            return Err(Error::Corruption("FULLTEXT document length segment has wrong payload codec".into()));
+        }
+        let raw = self.sec_posting_raw(index_id, lane, e)?;
+        let seg = textindex::decode_doclen_segment(&raw, Some(e.raw_count))
+            .map_err(|x| Error::Corruption(format!("FULLTEXT document lengths corrupt: {x}")))?;
+        if seg.last() != Some(last) {
+            return Err(Error::Corruption("FULLTEXT document length segment does not match its key".into()));
+        }
+        let seg = Arc::new(seg);
+        if keep {
+            self.posting_cache_put(ck, PostVal::DocLens(seg.clone()));
+        }
+        Ok(seg)
+    }
+
+    /// Visits the document length segments with last u >= `from` (all with
+    /// `None`) in u order until `f` returns false.
+    fn doclen_scan(&self, index_id: u64, lane: Lane, from: Option<&Nat>, f: &mut dyn FnMut(&SecEntry, Nat) -> Result<bool>) -> Result<()> {
+        let start = match from {
+            Some(u) => textindex::doclen_segment_key(u),
+            None => format!("{FULLTEXT_DOCLEN_KEY}\u{1}"),
+        };
+        let q = secindex::encode_key_vec(&Val::Str(start))?;
+        self.sec_scan(index_id, lane, Some(&q), &mut |e| {
+            let key = match e.value()? {
+                Val::Str(k) => k,
+                _ => return Ok(false),
+            };
+            match textindex::doclen_segment_last(&key) {
+                Some(last) => f(e, last),
+                None if key.starts_with(FULLTEXT_DOCLEN_KEY) && key.len() > FULLTEXT_DOCLEN_KEY.len() => {
+                    Err(Error::Corruption("FULLTEXT document length segment key invalid".into()))
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
+    /// Corpus statistics plus the lengths of the documents `us` (sorted,
+    /// unique). Reads only the segments that hold them; memory
+    /// proportional to `us`, not to the corpus.
+    pub fn fulltext_doc_lengths(&self, index_id: u64, lane: Lane, us: &[Nat]) -> Result<FtCorpus> {
         self.check_open()?;
         self.require_fulltext(index_id)?;
-        if let Some(c) = self.cache().ft_corpus.get(&(index_id, lane)) {
-            return Ok(c.clone());
+        if let Some(ov) = self.ixm_ft_overlay(index_id, lane)? {
+            return self.ov_fulltext_doc_lengths(&ov, index_id, lane, us);
         }
-        let dir = self.secondary_dir(index_id, lane)?;
-        let corpus = match dir.by_key.get(&ValKey(Val::str(FULLTEXT_DOCLEN_KEY))) {
-            None => FtCorpus::default(),
-            Some(&i) => {
-                let r = &dir.entries[i];
-                if r.width != PAYLOAD_FULLTEXT_DOCLENS {
-                    return Err(Error::Corruption("FULLTEXT document lengths have wrong payload codec".into()));
-                }
-                let raw = self.read_payload(r)?;
-                textindex::decode_fulltext_doc_lengths(&raw, Some(r.raw_count))
-                    .map_err(|e| Error::Corruption(format!("FULLTEXT document lengths corrupt: {e}")))?
-            }
-        };
-        let arc = Arc::new(corpus);
-        self.cache().ft_corpus.insert((index_id, lane), arc.clone());
-        Ok(arc)
+        self.base_fulltext_doc_lengths(index_id, lane, us)
     }
 
-    /// `fulltext_payloads(index_id, terms)`: unique terms in order.
-    pub fn fulltext_payloads(&self, index_id: u64, terms: &[String], lane: Lane) -> Result<(TermPostingsOwned, Arc<FtCorpus>)> {
+    /// Document lengths of the key tree (no overlay).
+    pub(crate) fn base_fulltext_doc_lengths(&self, index_id: u64, lane: Lane, us: &[Nat]) -> Result<FtCorpus> {
+        let sorted;
+        let us = if us.windows(2).all(|w| w[0] < w[1]) {
+            us
+        } else {
+            let mut v = us.to_vec();
+            v.sort();
+            v.dedup();
+            sorted = v;
+            &sorted[..]
+        };
+        let mut out = FtCorpus::default();
+        match self.doclen_source(index_id, lane)? {
+            DocLenSource::Empty => {}
+            DocLenSource::Whole(seg) => {
+                out.total_docs = seg.us.len() as u64;
+                out.total_tokens = seg.tokens;
+                for u in us {
+                    if let Some(l) = seg.get(u) {
+                        out.lengths.insert(u.clone(), l);
+                    }
+                }
+            }
+            DocLenSource::Paged { docs, tokens } => {
+                out.total_docs = docs;
+                out.total_tokens = tokens;
+                let mut i = 0usize;
+                while i < us.len() {
+                    // walk the segments in u order; after a long run of
+                    // segments without a wanted u, descend again
+                    let mut restart = false;
+                    let mut skipped = 0u32;
+                    self.doclen_scan(index_id, lane, Some(&us[i]), &mut |e, last| {
+                        if last < us[i] {
+                            skipped += 1;
+                            if skipped > 64 {
+                                restart = true;
+                                return Ok(false);
+                            }
+                            return Ok(true);
+                        }
+                        skipped = 0;
+                        let seg = self.doclen_segment(index_id, lane, e, &last, true)?;
+                        while i < us.len() && us[i] <= last {
+                            if let Some(l) = seg.get(&us[i]) {
+                                out.lengths.insert(us[i].clone(), l);
+                            }
+                            i += 1;
+                        }
+                        Ok(i < us.len())
+                    })?;
+                    if !restart {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `fulltext_corpus(index_id, lane=…)`: all document lengths (an
+    /// explicit full view: memory proportional to the corpus, not cached).
+    pub fn fulltext_corpus(&self, index_id: u64, lane: Lane) -> Result<FtCorpus> {
+        self.check_open()?;
+        self.require_fulltext(index_id)?;
+        if let Some(ov) = self.ixm_ft_overlay(index_id, lane)? {
+            return self.ov_fulltext_corpus(&ov, index_id, lane);
+        }
+        self.base_fulltext_corpus(index_id, lane)
+    }
+
+    /// Whole corpus of the key tree (no overlay).
+    pub(crate) fn base_fulltext_corpus(&self, index_id: u64, lane: Lane) -> Result<FtCorpus> {
+        let mut out = FtCorpus::default();
+        match self.doclen_source(index_id, lane)? {
+            DocLenSource::Empty => {}
+            DocLenSource::Whole(seg) => {
+                out.total_docs = seg.us.len() as u64;
+                out.total_tokens = seg.tokens;
+                out.lengths = seg.us.iter().cloned().zip(seg.lens.iter().copied()).collect();
+            }
+            DocLenSource::Paged { docs, tokens } => {
+                out.total_docs = docs;
+                out.total_tokens = tokens;
+                self.doclen_scan(index_id, lane, None, &mut |e, last| {
+                    let seg = self.doclen_segment(index_id, lane, e, &last, false)?;
+                    out.lengths.extend(seg.us.iter().cloned().zip(seg.lens.iter().copied()));
+                    Ok(true)
+                })?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Entries of an index that are no keys: the document length summary
+    /// and segments of a FULLTEXT index.
+    /// Reads without filling any cache (statistics).
+    pub(crate) fn fulltext_internal_entries(&self, index_id: u64, lane: Lane) -> Result<u64> {
+        let q = secindex::encode_key_vec(&Val::str(FULLTEXT_DOCLEN_KEY))?;
+        let Some(e) = self.sec_lookup_uncached(index_id, lane, &q)? else {
+            return Ok(0);
+        };
+        Ok(match e.width {
+            PAYLOAD_FULLTEXT_DOCLEN_SUMMARY => {
+                let raw = self.sec_posting_raw(index_id, lane, &e)?;
+                let (_, _, segments) = textindex::decode_doclen_summary(&raw, Some(e.raw_count))
+                    .map_err(|x| Error::Corruption(format!("FULLTEXT document length summary corrupt: {x}")))?;
+                1 + segments
+            }
+            _ => 1,
+        })
+    }
+
+    /// `fulltext_payloads(index_id, terms)`: postings of the unique terms in order.
+    /// R4-A4: postings of the distinct `terms` (query order) for a
+    /// conjunction (mode `all` or phrase): a term with many more documents
+    /// than the rarest one is decoded only for the documents of the rarest
+    /// term (and not cached). Returns the postings and the document
+    /// frequency of every term (for BM25). Candidates and scores are the
+    /// same as with full postings.
+    pub fn fulltext_payloads_conj(&self, index_id: u64, terms: &[String], lane: Lane) -> Result<(TermPostingsOwned, Vec<u64>)> {
+        self.check_open()?;
+        self.require_fulltext(index_id)?;
+        // AP9: stale index – merged postings (no restricted decoding of the tree)
+        if self.ixm_ft_overlay(index_id, lane)?.is_some() {
+            let mut seen = HashSet::new();
+            let uniq: Vec<String> = terms.iter().filter(|t| seen.insert((*t).clone())).cloned().collect();
+            let p = self.fulltext_payloads(index_id, &uniq, lane)?;
+            let dfs = p.iter().map(|(_, x)| x.len() as u64).collect();
+            return Ok((p, dfs));
+        }
+        let mut seen = HashSet::new();
+        let uniq: Vec<String> = terms.iter().filter(|t| seen.insert((*t).clone())).cloned().collect();
+        if uniq.len() < 2 {
+            // nothing to restrict: no extra lookups
+            let p = self.fulltext_payloads(index_id, &uniq, lane)?;
+            let dfs = p.iter().map(|(_, x)| x.len() as u64).collect();
+            return Ok((p, dfs));
+        }
+        // document frequency from the cache or the leaf entry (no decoding)
+        // (document frequency, cached posting, leaf entry)
+        type TermInfo = (u64, Option<Arc<Vec<FtPosting>>>, Option<SecEntry>);
+        let mut info: Vec<TermInfo> = Vec::with_capacity(uniq.len());
+        for t in &uniq {
+            let ck = PostKey::Ft(index_id, lane, t.clone());
+            if let Some(PostVal::Ft(c)) = self.cache().postings.get(&ck) {
+                info.push((c.len() as u64, Some(c), None));
+                continue;
+            }
+            let e = self.lookup_entry(index_id, lane, &Val::str(t.as_str()))?;
+            info.push((e.as_ref().map(|e| e.raw_count).unwrap_or(0), None, e));
+        }
+        let min_df = info.iter().map(|x| x.0).min().unwrap_or(0);
+        let restrict = |df: u64| uniq.len() > 1 && min_df > 0 && df > min_df.saturating_mul(4);
+        if !info.iter().any(|x| x.1.is_none() && restrict(x.0)) {
+            let dfs = info.iter().map(|x| x.0).collect();
+            return Ok((self.fulltext_payloads(index_id, &uniq, lane)?, dfs));
+        }
+        let lead = info.iter().position(|x| x.0 == min_df).unwrap();
+        let lead_post = self.fulltext_term_posting(index_id, &uniq[lead], lane)?;
+        // RUN¹⁰: checkpoint of the RAM limiter per loaded posting list
+        let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::Postings);
+        meter.grow(posting_bytes(&lead_post))?;
+        let wanted: Vec<Nat> = lead_post.iter().map(|x| x.u.clone()).collect();
+        let mut out = Vec::with_capacity(uniq.len());
+        let mut dfs = Vec::with_capacity(uniq.len());
+        for (i, (t, (df, cached, entry))) in uniq.iter().zip(info).enumerate() {
+            let post = if i == lead {
+                lead_post.clone()
+            } else if let Some(c) = cached {
+                c
+            } else if restrict(df) {
+                let e = entry.unwrap();
+                if e.width != PAYLOAD_FULLTEXT_POSITIONS {
+                    return Err(Error::Corruption("FULLTEXT term has wrong payload codec".into()));
+                }
+                let raw = self.sec_posting_raw(index_id, lane, &e)?;
+                Arc::new(
+                    textindex::decode_fulltext_posting_within(&raw, Some(e.raw_count), &wanted)
+                        .map_err(|e| Error::Corruption(format!("FULLTEXT term payload corrupt: {e}")))?,
+                )
+            } else {
+                self.fulltext_term_posting(index_id, t, lane)?
+            };
+            if i != lead {
+                meter.grow(posting_bytes(&post))?;
+            }
+            out.push((t.clone(), post));
+            dfs.push(df);
+        }
+        Ok((out, dfs))
+    }
+
+    pub fn fulltext_payloads(&self, index_id: u64, terms: &[String], lane: Lane) -> Result<TermPostingsOwned> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::Postings);
         for t in terms {
             if seen.insert(t.clone()) {
-                out.push((t.clone(), self.fulltext_term_posting(index_id, t, lane)?));
+                let p = self.fulltext_term_posting(index_id, t, lane)?;
+                meter.grow(posting_bytes(&p))?;
+                out.push((t.clone(), p));
             }
         }
-        Ok((out, self.fulltext_corpus(index_id, lane)?))
+        Ok(out)
     }
 
-    /// Keys `k` with `lo <= k <= hi` under the scan semantics
+    /// Entries with key `k`, `lo <= k <= hi`, under the scan semantics
     /// (`match_raw(k, "between", lo, hi)`): incomparable values (None, NaN,
-    /// other types) never match and never raise (F025).
-    fn range_keys(&self, index_id: u64, lane: Lane, lo: &Val, hi: &Val) -> Result<Vec<Val>> {
-        let keys = self.secondary_keys_sorted(index_id, lane)?;
+    /// other types) never match and never raise (F025). Bounds of one of the
+    /// ordered classes (numbers, `str`, `bytes`) seek in the key tree and
+    /// walk the leaves up to `hi`; unusual bounds evaluate the predicate on
+    /// every key (streamed).
+    fn range_entries(&self, index_id: u64, lane: Lane, lo: &Val, hi: &Val, f: &mut dyn FnMut(&SecEntry) -> Result<()>) -> Result<()> {
         let c = range_class(lo);
         if c >= 3 || range_class(hi) != c {
-            // Unusual bounds (None, NaN, lists, mixed classes): evaluate the
-            // scan predicate on every key.
-            let mut out = Vec::new();
-            for k in keys.iter() {
-                if crate::query::match_raw(k, "between", lo, hi)? {
-                    out.push(k.clone());
+            return self.sec_scan(index_id, lane, None, &mut |e| {
+                if crate::query::match_raw(&e.value()?, "between", lo, hi)? {
+                    f(e)?;
                 }
-            }
-            return Ok(out);
+                Ok(true)
+            });
         }
-        let first = keys.partition_point(|k| range_class(k) < c);
-        let last = keys.partition_point(|k| range_class(k) <= c);
-        let seg = &keys[first..last];
-        let cmp = |a: &Val, b: &Val| crate::val::py_cmp(a, b).unwrap_or(Ordering::Equal);
-        let start = seg.partition_point(|k| cmp(k, lo) == Ordering::Less);
-        let end = seg.partition_point(|k| cmp(hi, k) != Ordering::Less);
-        Ok(if end > start { seg[start..end].to_vec() } else { Vec::new() })
+        let (elo, ehi) = (secindex::encode_key_vec(lo)?, secindex::encode_key_vec(hi)?);
+        if secindex::cmp_keys(&elo, &ehi) == Ordering::Greater {
+            return Ok(());
+        }
+        self.sec_scan(index_id, lane, Some(&elo), &mut |e| {
+            if secindex::range_class_of(&e.key) != c || secindex::cmp_keys(&e.key, &ehi) == Ordering::Greater {
+                return Ok(false);
+            }
+            f(e)?;
+            Ok(true)
+        })
     }
 
-    /// Keys equal to `value` under Python equality (F045: NaN never matches).
-    fn eq_keys(&self, dir: &SecondaryDir, value: &Val) -> Vec<Val> {
+    /// Entries equal to `value` under Python equality (F045: NaN never
+    /// matches). Lists and dicts compare by value against the container
+    /// keys (a walk over that part of the tree), everything else is a
+    /// lookup.
+    fn eq_entries(&self, index_id: u64, lane: Lane, value: &Val) -> Result<Vec<SecEntry>> {
         if contains_nan(value) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         match value {
-            Val::List(_) | Val::Map(_) => dir.entries.iter().filter(|e| &e.value == value).map(|e| e.value.clone()).collect(),
-            _ => dir.by_key.get(&ValKey(value.clone())).map(|&i| vec![dir.entries[i].value.clone()]).unwrap_or_default(),
+            Val::List(_) | Val::Map(_) => {
+                let mut out = Vec::new();
+                self.sec_scan(index_id, lane, Some(&[0x0F]), &mut |e| {
+                    if !secindex::is_container_key(&e.key) {
+                        return Ok(false);
+                    }
+                    if &e.value()? == value {
+                        out.push(e.clone());
+                    }
+                    Ok(true)
+                })?;
+                Ok(out)
+            }
+            _ => Ok(self.lookup_entry(index_id, lane, value)?.into_iter().collect()),
         }
     }
 
     /// `posting_count`: exact cardinality from directory metadata.
     pub fn posting_count(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<u64> {
         self.check_open()?;
-        let dir = self.secondary_dir(index_id, lane)?;
+        // AP9: exact for a stale index with overlay (the planner estimate
+        // keeps the counts of the base, `base_posting_count`)
+        if !self.index_is_fresh(index_id, lane) {
+            if let Some(ov) = self.ixm_overlay(index_id, lane)? {
+                return Ok(self.ov_posting_for_condition(&ov, index_id, cond, lane)?.len() as u64);
+            }
+        }
+        self.base_posting_count(index_id, cond, lane)
+    }
+
+    /// Posting count of the key tree (directory metadata, no overlay).
+    pub(crate) fn base_posting_count(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<u64> {
         Ok(match cond {
-            Cond::Range(lo, hi) => self
-                .range_keys(index_id, lane, lo, hi)?
-                .iter()
-                .map(|k| dir.by_key.get(&ValKey(k.clone())).map(|&i| dir.entries[i].raw_count).unwrap_or(0))
-                .sum(),
-            Cond::Eq(v) => self
-                .eq_keys(&dir, v)
-                .iter()
-                .map(|k| dir.by_key.get(&ValKey(k.clone())).map(|&i| dir.entries[i].raw_count).unwrap_or(0))
-                .sum(),
+            Cond::Range(lo, hi) => {
+                let mut n = 0u64;
+                self.range_entries(index_id, lane, lo, hi, &mut |e| {
+                    n += e.raw_count;
+                    Ok(())
+                })?;
+                n
+            }
+            Cond::Eq(v) => self.eq_entries(index_id, lane, v)?.iter().map(|e| e.raw_count).sum(),
         })
     }
 
     pub(crate) fn posting_for_condition(&self, index_id: u64, cond: &Cond, lane: Lane) -> Result<Arc<Vec<Nat>>> {
-        let matched = match cond {
-            Cond::Eq(v) => {
-                let dir = self.secondary_dir(index_id, lane)?;
-                self.eq_keys(&dir, v)
+        if let Cond::Eq(v) = cond {
+            if !matches!(v, Val::List(_) | Val::Map(_)) && !contains_nan(v) {
+                // point lookup: cached posting first, then the key tree
+                return self.load_posting(index_id, v, lane);
             }
-            Cond::Range(lo, hi) => self.range_keys(index_id, lane, lo, hi)?,
+        }
+        let matched = match cond {
+            Cond::Eq(v) => self.eq_entries(index_id, lane, v)?,
+            Cond::Range(lo, hi) => {
+                let mut out = Vec::new();
+                self.range_entries(index_id, lane, lo, hi, &mut |e| {
+                    out.push(e.clone());
+                    Ok(())
+                })?;
+                out
+            }
         };
         match matched.len() {
             0 => Ok(Arc::new(Vec::new())),
-            1 => self.load_posting(index_id, &matched[0], lane),
-            _ => {
-                let postings: Vec<Arc<Vec<Nat>>> = matched.iter().map(|v| self.load_posting(index_id, v, lane)).collect::<Result<_>>()?;
+            1 => self.entry_posting(index_id, lane, &matched[0]),
+            n => {
+                // a few keys go through the posting cache; many keys (a wide
+                // range) are decoded once without caching – the cache would
+                // otherwise fill with one entry per key
+                let postings: Vec<Arc<Vec<Nat>>> = if n <= RANGE_CACHED_KEYS {
+                    matched.iter().map(|e| self.entry_posting(index_id, lane, e)).collect::<Result<_>>()?
+                } else {
+                    matched.iter().map(|e| self.sec_posting_us(index_id, lane, e).map(Arc::new)).collect::<Result<_>>()?
+                };
                 Ok(Arc::new(union_postings(&postings)))
             }
         }
@@ -1252,9 +1946,8 @@ impl Db {
     pub fn index_candidate_estimate(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Val> {
         self.check_open()?;
         let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
-        let dir = self.secondary_dir(index_id, lane)?;
         let op = crate::unicode::lower(op);
-        let count_of = |k: &str| dir.by_key.get(&ValKey(Val::str(k))).map(|&i| dir.entries[i].raw_count).unwrap_or(0);
+        let count_of = |k: &str| self.key_count(index_id, lane, &Val::str(k));
         let none = || vmap! {"estimated_rows" => Val::None, "exact" => false, "key_count" => 0i64};
         Ok(match idx.kind {
             IndexKind::Value => {
@@ -1263,14 +1956,14 @@ impl Db {
                     "between" => Cond::Range(value.clone(), value2.clone()),
                     _ => return Ok(none()),
                 };
-                vmap! {"estimated_rows" => self.posting_count(index_id, &cond, lane)? as i64, "exact" => true, "key_count" => 1i64}
+                vmap! {"estimated_rows" => self.base_posting_count(index_id, &cond, lane)? as i64, "exact" => self.index_is_fresh(index_id, lane), "key_count" => 1i64}
             }
             IndexKind::Token => {
                 if !matches!(op.as_str(), "token" | "tokens_all" | "tokens_any") {
                     return Ok(none());
                 }
                 let keys = self.token_query_keys(&op, value, &idx.options)?;
-                let counts: Vec<u64> = keys.iter().map(|k| count_of(k)).collect();
+                let counts: Vec<u64> = keys.iter().map(|k| count_of(k)).collect::<Result<_>>()?;
                 let est = if counts.is_empty() {
                     0
                 } else if op == "tokens_any" {
@@ -1278,16 +1971,16 @@ impl Db {
                 } else {
                     *counts.iter().min().unwrap()
                 };
-                vmap! {"estimated_rows" => est as i64, "exact" => op == "token" && keys.len() == 1, "key_count" => keys.len() as i64}
+                vmap! {"estimated_rows" => est as i64, "exact" => op == "token" && keys.len() == 1 && self.index_is_fresh(index_id, lane), "key_count" => keys.len() as i64}
             }
             IndexKind::Trigram if op == "contains" || op == "icontains" => {
                 let keys = textindex::query_trigram_keys(value, &idx.options)?;
-                let est = keys.iter().map(|k| count_of(k)).min().unwrap_or(0);
+                let est = keys.iter().map(|k| count_of(k)).collect::<Result<Vec<u64>>>()?.into_iter().min().unwrap_or(0);
                 vmap! {"estimated_rows" => est as i64, "exact" => false, "key_count" => keys.len() as i64}
             }
             IndexKind::Fulltext if op == "fulltext" || op == "phrase" => {
                 let keys = textindex::query_fulltext_terms(value, &idx.options)?;
-                let counts: Vec<u64> = keys.iter().map(|k| count_of(k)).collect();
+                let counts: Vec<u64> = keys.iter().map(|k| count_of(k)).collect::<Result<_>>()?;
                 let mode = if op == "phrase" {
                     "all".to_string()
                 } else {
@@ -1297,15 +1990,15 @@ impl Db {
                     0
                 } else if mode == "any" {
                     let sum: u64 = counts.iter().sum();
-                    match dir.by_key.get(&ValKey(Val::str(FULLTEXT_DOCLEN_KEY))) {
-                        Some(&i) => sum.min(dir.entries[i].raw_count),
+                    match self.lookup_entry(index_id, lane, &Val::str(FULLTEXT_DOCLEN_KEY))? {
+                        Some(e) => sum.min(e.raw_count),
                         None => sum,
                     }
                 } else {
                     *counts.iter().min().unwrap()
                 };
                 vmap! {
-                    "estimated_rows" => est as i64, "exact" => op == "fulltext" && keys.len() == 1,
+                    "estimated_rows" => est as i64, "exact" => op == "fulltext" && keys.len() == 1 && self.index_is_fresh(index_id, lane),
                     "key_count" => keys.len() as i64, "mode" => mode, "positions" => true,
                 }
             }
@@ -1314,12 +2007,92 @@ impl Db {
     }
 
     /// `index_candidates`: sorted record u for an index predicate.
+    /// R4-A4: `index_candidates` of a VALUE `eq`/`between` predicate
+    /// restricted to the sorted u list `wanted` (an AND with a much smaller
+    /// set): the postings are probed for the wanted u instead of being
+    /// decoded and cached in full. Same checks of the posting payloads.
+    /// `None`: not applicable (other index kinds or operators, stale index,
+    /// cached posting) – the caller uses `index_candidates`.
+    pub fn index_candidates_within(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, wanted: &[Nat]) -> Result<Option<Vec<Nat>>> {
+        self.check_open()?;
+        let Some(idx) = self.index_defs.get(&index_id) else { return Ok(None) };
+        if idx.kind != IndexKind::Value || !self.index_is_fresh(index_id, lane) {
+            return Ok(None);
+        }
+        let entries = match crate::unicode::lower(op).as_str() {
+            "eq" => {
+                let plain = !matches!(value, Val::List(_) | Val::Map(_)) && !contains_nan(value);
+                if plain && self.cache().postings.get(&PostKey::Us(index_id, lane, ValKey(value.clone()))).is_some() {
+                    return Ok(None);
+                }
+                self.eq_entries(index_id, lane, value)?
+            }
+            "between" => {
+                let mut out = Vec::new();
+                self.range_entries(index_id, lane, value, value2, &mut |e| {
+                    out.push(e.clone());
+                    Ok(())
+                })?;
+                out
+            }
+            _ => return Ok(None),
+        };
+        let mut out: Vec<Nat> = Vec::new();
+        for e in &entries {
+            let hit = self.posting_within(index_id, lane, e, wanted)?;
+            out = if out.is_empty() { hit } else { crate::setops::union_sorted(&out, &hit) };
+        }
+        Ok(Some(out))
+    }
+
+    /// u of `wanted` (sorted) contained in the posting of entry `e`; fixed
+    /// width postings are searched in the raw bytes.
+    fn posting_within(&self, index_id: u64, lane: Lane, e: &SecEntry, wanted: &[Nat]) -> Result<Vec<Nat>> {
+        if e.width != 4 && e.width != 8 {
+            let p = self.sec_posting_us(index_id, lane, e)?;
+            return Ok(crate::setops::intersect_sorted(wanted, &p));
+        }
+        let raw = self.sec_posting_raw(index_id, lane, e)?;
+        let w = e.width as usize;
+        if raw.len() % w != 0 || (raw.len() / w) as u64 != e.raw_count {
+            return Err(Error::Corruption("Posting count mismatch".into()));
+        }
+        let at = |i: usize| -> u64 {
+            if w == 4 { u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap()) as u64 } else { u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap()) }
+        };
+        let n = raw.len() / w;
+        let mut out = Vec::new();
+        let mut lo = 0usize;
+        for u in wanted {
+            let Some(x) = u.as_u64() else { break };
+            // galloping from the last position (wanted is ascending)
+            let (mut a, mut step) = (lo, 1usize);
+            let mut b = lo;
+            while b < n && at(b) < x {
+                a = b + 1;
+                b += step;
+                step *= 2;
+            }
+            let b = b.min(n);
+            let (mut l, mut h) = (a, b);
+            while l < h {
+                let m = (l + h) / 2;
+                if at(m) < x { l = m + 1 } else { h = m }
+            }
+            lo = l;
+            if l < n && at(l) == x {
+                out.push(u.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn index_candidates(&self, index_id: u64, op: &str, value: &Val, value2: &Val, lane: Lane, predicate_options: &Val) -> Result<Vec<Nat>> {
         self.check_open()?;
         let idx = self.index_defs.get(&index_id).ok_or_else(|| Error::Schema(format!("Index {index_id} missing")))?;
-        if !self.index_is_fresh(index_id, lane) {
-            return Err(Error::StaleIndex(format!("Index {}/{} is not fresh", Val::str(idx.name.as_str()).py_repr(), lane_name(lane))));
-        }
+        // AP9: a stale index answers through its overlay (None = fresh)
+        let ov = self.ixm_for_query(index_id, lane, "is not fresh")?;
+        let ov = ov.as_deref();
         let op = crate::unicode::lower(op);
         let intersect_all = |mut postings: Vec<Arc<Vec<Nat>>>| -> Vec<Nat> {
             postings.sort_by_key(|p| p.len());
@@ -1334,8 +2107,8 @@ impl Db {
         };
         match idx.kind {
             IndexKind::Value => match op.as_str() {
-                "eq" => Ok(self.posting_for_condition(index_id, &Cond::Eq(value.clone()), lane)?.to_vec()),
-                "between" => Ok(self.posting_for_condition(index_id, &Cond::Range(value.clone(), value2.clone()), lane)?.to_vec()),
+                "eq" => Ok(self.ov_posting(ov, index_id, &Cond::Eq(value.clone()), lane)?.to_vec()),
+                "between" => Ok(self.ov_posting(ov, index_id, &Cond::Range(value.clone(), value2.clone()), lane)?.to_vec()),
                 _ => Err(Error::Schema(format!("VALUE index does not support operator {}", Val::str(op.as_str()).py_repr()))),
             },
             IndexKind::Token => {
@@ -1347,7 +2120,7 @@ impl Db {
                     return Ok(Vec::new());
                 }
                 let postings: Vec<Arc<Vec<Nat>>> =
-                    keys.iter().map(|k| self.load_posting(index_id, &Val::str(k.as_str()), lane)).collect::<Result<_>>()?;
+                    keys.iter().map(|k| self.ov_load_posting(ov, index_id, &Val::str(k.as_str()), lane)).collect::<Result<_>>()?;
                 if op != "tokens_any" && postings.iter().any(|p| p.is_empty()) {
                     return Ok(Vec::new());
                 }
@@ -1368,10 +2141,17 @@ impl Db {
             IndexKind::Trigram if op == "contains" || op == "icontains" => {
                 let keys = textindex::query_trigram_keys(value, &idx.options)?;
                 if keys.is_empty() {
-                    return Ok(Vec::new());
+                    // R9C-H1: a pattern shorter than the n-gram length has no
+                    // key – the index cannot restrict it (an empty result
+                    // would be wrong); SQL scans in this case
+                    return Err(Error::Value(format!(
+                        "index '{}': pattern {} is shorter than its n-gram length; the TRIGRAM index cannot answer it (use sql(), which scans)",
+                        idx.name,
+                        value.py_repr()
+                    )));
                 }
                 let postings: Vec<Arc<Vec<Nat>>> =
-                    keys.iter().map(|k| self.load_posting(index_id, &Val::str(k.as_str()), lane)).collect::<Result<_>>()?;
+                    keys.iter().map(|k| self.ov_load_posting(ov, index_id, &Val::str(k.as_str()), lane)).collect::<Result<_>>()?;
                 if postings.iter().any(|p| p.is_empty()) {
                     return Ok(Vec::new());
                 }
@@ -1382,9 +2162,13 @@ impl Db {
                 if seq.is_empty() {
                     return Ok(Vec::new());
                 }
-                let (owned, _corpus) = self.fulltext_payloads(index_id, &seq, lane)?;
-                let postings: Vec<(String, &[FtPosting])> = owned.iter().map(|(t, p)| (t.clone(), &p[..])).collect();
                 let mode = crate::unicode::lower(&predicate_options.get("mode").map(|m| m.py_str()).unwrap_or_else(|| "all".into()));
+                let owned = if op == "phrase" || mode == "all" {
+                    self.fulltext_payloads_conj(index_id, &seq, lane)?.0
+                } else {
+                    self.fulltext_payloads(index_id, &seq, lane)?
+                };
+                let postings: Vec<(String, &[FtPosting])> = owned.iter().map(|(t, p)| (t.clone(), &p[..])).collect();
                 if postings.iter().any(|(_, p)| p.is_empty()) && (op == "phrase" || mode != "any") {
                     return Ok(Vec::new());
                 }
@@ -1415,13 +2199,9 @@ impl Db {
                     idef.kind.name()
                 )));
             }
-            if !self.index_is_fresh(iid, lane) {
-                return Err(Error::StaleIndex(format!(
-                    "Index '{name}'/{} is missing or older than the data. Run build_indexes().",
-                    lane_name(lane)
-                )));
-            }
-            let p = self.posting_for_condition(iid, cond, lane)?;
+            // AP9: a stale index answers through its overlay
+            let ov = self.ixm_for_query(iid, lane, "is missing or older than the data. Run build_indexes().")?;
+            let p = self.ov_posting(ov.as_deref(), iid, cond, lane)?;
             if p.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1431,22 +2211,25 @@ impl Db {
             let mut r = Vec::new();
             if let Some(d) = self.dense.get(&key) {
                 if !self.overlay_keys.contains(&key) {
-                    for seg in d.sorted() {
+                    let mut it = d.idx.iter_by_start();
+                    while let Some(seg) = it.next(self)? {
+                        self.find_u_limit(r.len() as u64 + seg.count)?;
                         for i in 0..seg.count {
                             r.push(seg.u_start.add_u64(i));
                         }
                     }
                 } else {
                     let mut seen = HashSet::new();
-                    let mut segs: Vec<_> = d.segs.iter().collect();
-                    segs.sort_by_key(|x| std::cmp::Reverse(x.block_id));
-                    for seg in segs {
+                    let mut segs = d.idx.collect_block_order(self)?;
+                    segs.reverse();
+                    for seg in &segs {
+                        self.find_u_limit(seen.len() as u64 + seg.count)?;
                         for i in 0..seg.count {
                             let u = seg.u_start.add_u64(i);
                             if !seen.insert(u.clone()) {
                                 continue;
                             }
-                            if self.deletes.get(&(realm.clone(), lane, u.clone())).map(|d| *d > seg.block_id).unwrap_or(false) {
+                            if self.delete_block_id(&key, &u)?.is_some_and(|d| d > seg.block_id) {
                                 continue;
                             }
                             r.push(u);
@@ -1473,7 +2256,23 @@ impl Db {
         if let Some(t) = u_to {
             result.retain(|u| u <= t);
         }
+        self.find_u_limit(result.len() as u64)?;
         Ok(result)
+    }
+
+    /// U10 (RUN8): `find_u` (and the `find` iterator built on it) collects
+    /// every matching u; that list obeys `[query] max_result_bytes` like the
+    /// collected results of `sql()` (16 bytes per u, 0 = no limit).
+    fn find_u_limit(&self, n: u64) -> Result<()> {
+        let limit = self.config.query_max_result_bytes;
+        let bytes = n.saturating_mul(std::mem::size_of::<Nat>() as u64);
+        if limit == 0 || bytes <= limit {
+            return Ok(());
+        }
+        Err(Error::QueryLimit(format!(
+            "find_u()/find(): about {bytes} bytes for {n} matching u exceed [query] max_result_bytes = {limit}; \
+             narrow the filters or u_from/u_to, use db.sql_iter() for many records, or raise max_result_bytes (0 = no limit)"
+        )))
     }
 
     #[allow(clippy::too_many_arguments)] // mirrors the Python signature (keyword arguments)
@@ -1502,54 +2301,156 @@ impl Db {
 mod perf_tests {
     use super::*;
 
-    /// I001: under memory pressure the build splits into scan passes with
-    /// identical postings; an index that cannot fit is refused before
-    /// anything is written.
+    /// I001 / 0.28.2: under a tiny build budget the collected keys are
+    /// spilled as sorted runs and merged; every index (VALUE on dense and
+    /// sparse fields, TOKEN, TRIGRAM, FULLTEXT) gets exactly the keys,
+    /// counts and postings of an unbounded build, nothing is refused.
     #[test]
-    fn build_passes_follow_the_memory_budget_i001() {
+    fn spilled_build_equals_in_memory_build() {
         use crate::address::NL;
         use crate::codec::{FieldDef, TypeCode};
         use crate::db::dense::DenseRows;
+        use crate::db::sparse::CellInput;
         use crate::db::OpenOptions;
-        let d = std::env::temp_dir().join(format!("nhydb_i001_{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("nhydb_spill_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let r = Nat::S(1);
         let mut db = Db::create(d.join("i.nhydb"), true, OpenOptions::default()).unwrap();
         db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
-        let fields = ["a", "b", "c"].iter().enumerate().map(|(i, n)| FieldDef::new(Nat::S(i as u64 + 1), *n, TypeCode::VarUInt)).collect();
+        let fields = vec![FieldDef::new(Nat::S(1), "a", TypeCode::VarUInt), FieldDef::new(Nat::S(2), "t", TypeCode::Utf8)];
         db.create_shape(1, &r, "s", fields, "").unwrap();
         db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
-        for (id, v) in [(1u64, 1i64), (2, 2), (3, 3)] {
-            db.create_index(id, &r, ["a", "b", "c"][id as usize - 1], &Val::Int(v), "").unwrap();
+        db.define_extension(&r, &Nat::S(50), "utf8", "note", &Val::None, "", false).unwrap();
+        db.create_index(1, &r, "a", &Val::Int(1), "").unwrap();
+        db.create_index(2, &r, "note", &Val::Int(50), "").unwrap();
+        for (id, kind, name) in [(3u64, "TOKEN", "tok"), (4, "TRIGRAM", "tri"), (5, "FULLTEXT", "ft")] {
+            db.create_index_ext(id, &r, name, &Val::Int(2), &Val::str(kind), &Val::None, None, None, None, "").unwrap();
         }
-        let rows: Vec<Vec<Val>> = (1..=2000u64).map(|u| vec![Val::Int((u % 7) as i64), Val::Int((u % 13) as i64), Val::Int((u % 101) as i64)]).collect();
-        db.put_dense_batch(&r, &Nat::S(1), &DenseRows::Tuples(&rows), Some(1), &[], NL, true).unwrap();
-        // every index: 2000 references x 10 bytes
-        assert_eq!(db.index_build_estimate(&db.index_defs[&1].clone()), 20_000);
-        let finds = |db: &Db| -> Vec<Vec<Nat>> {
-            [("a", 3i64), ("b", 5), ("c", 42)]
-                .iter()
-                .map(|(f, v)| db.find_u(&r, &[(f.to_string(), Cond::Eq(Val::Int(*v)))], NL, None, None).unwrap())
+        let words = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let rows: Vec<Vec<Val>> = (1..=3000u64)
+            .map(|u| vec![Val::Int((u % 977) as i64), Val::str(format!("{} {} w{} {}", words[(u % 5) as usize], words[(u % 3) as usize], u % 401, words[(u % 5) as usize]))])
+            .collect();
+        for (i, chunk) in rows.chunks(300).enumerate() {
+            db.put_dense_batch(&r, &Nat::S(1 + 300 * i as u64), &DenseRows::Tuples(chunk), Some(1), &[], NL, true).unwrap();
+        }
+        let cells: Vec<CellInput> = (1..=600u64).map(|u| CellInput::new(Nat::S(u * 5), Nat::S(50), Val::str(format!("n{}", u % 37)))).collect();
+        db.put_points(&r, cells, NL, true, 64).unwrap();
+        type Dump = Vec<(u64, Vec<(Vec<u8>, u64, u8, Vec<u8>)>)>;
+        let dump = |db: &Db| -> Dump {
+            (1..=5u64)
+                .map(|iid| {
+                    let mut v = Vec::new();
+                    db.sec_scan(iid, NL, None, &mut |e| {
+                        v.push((e.key.clone(), e.raw_count, e.width, db.sec_posting_raw(iid, NL, e)?));
+                        Ok(true)
+                    })
+                    .unwrap();
+                    (iid, v)
+                })
                 .collect()
         };
         let one = db.build_indexes(None, true).unwrap();
-        assert_eq!(one.get("passes"), Some(&Val::Int(1)));
-        let want = finds(&db);
-        assert_eq!(want[0].len(), 286);
-        // half of 50 000 bytes holds one index per pass
-        db.index_build_memory_override = Some(50_000);
-        let three = db.build_indexes(None, true).unwrap();
-        assert_eq!(three.get("passes"), Some(&Val::Int(3)));
-        assert_eq!(three.get("records_scanned"), one.get("records_scanned"));
-        assert_eq!(finds(&db), want);
-        // one index alone needs more than the assumed memory: refused, nothing written
-        db.index_build_memory_override = Some(15_000);
-        let len = db.store.len();
-        assert!(matches!(db.build_indexes(None, true), Err(Error::Memory(_))));
-        assert_eq!(db.store.len(), len);
-        assert_eq!(finds(&db), want);
+        assert_eq!(one.get("spill_rounds"), Some(&Val::Int(0)));
+        let want = dump(&db);
+        assert!(want.iter().all(|(_, v)| v.len() > 20), "{:?}", want.iter().map(|(i, v)| (*i, v.len())).collect::<Vec<_>>());
+        db.index_build_memory_override = Some(20_000);
+        let small = db.build_indexes(None, true).unwrap();
+        let rounds = small.get("spill_rounds").unwrap().as_i64().unwrap();
+        assert!(rounds >= 3, "{}", small.py_repr());
+        assert_eq!(small.get("records_scanned"), one.get("records_scanned"));
+        assert_eq!(strip_physical(small.get("indexes").unwrap()), strip_physical(one.get("indexes").unwrap()));
+        assert_eq!(dump(&db), want);
+        let v = db.verify(true).unwrap();
+        assert!(v.get("ok").unwrap().is_truthy(), "{}", v.py_repr());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// RUN9 V4: keys spread over many runs (a word in every document, the
+    /// FULLTEXT document lengths over many segments, a VALUE with two
+    /// values, extension u above 2^32 and above 2^64) are merged straight
+    /// into the encoder; the posting bytes equal the in-memory build.
+    #[test]
+    fn spilled_merge_of_large_keys_is_byte_identical() {
+        use crate::address::NL;
+        use crate::codec::{FieldDef, TypeCode};
+        use crate::db::dense::DenseRows;
+        use crate::db::sparse::CellInput;
+        use crate::db::OpenOptions;
+        let d = std::env::temp_dir().join(format!("nhydb_v4merge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let r = Nat::S(1);
+        let mut db = Db::create(d.join("m.nhydb"), true, OpenOptions::default()).unwrap();
+        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
+        let fields = vec![FieldDef::new(Nat::S(1), "a", TypeCode::VarUInt), FieldDef::new(Nat::S(2), "t", TypeCode::Utf8)];
+        db.create_shape(1, &r, "s", fields, "").unwrap();
+        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
+        db.define_extension(&r, &Nat::S(50), "utf8", "note", &Val::None, "", false).unwrap();
+        db.create_index(1, &r, "a", &Val::Int(1), "").unwrap();
+        db.create_index(2, &r, "note", &Val::Int(50), "").unwrap();
+        for (id, kind, name) in [(3u64, "TRIGRAM", "tri"), (4, "FULLTEXT", "ft")] {
+            db.create_index_ext(id, &r, name, &Val::Int(2), &Val::str(kind), &Val::None, None, None, None, "").unwrap();
+        }
+        let rows: Vec<Vec<Val>> = (1..=12_000u64).map(|u| vec![Val::Int((u % 2) as i64), Val::str(format!("common w{} common x{}", u % 13, u % 7))]).collect();
+        for (i, chunk) in rows.chunks(1000).enumerate() {
+            db.put_dense_batch(&r, &Nat::S(1 + 1000 * i as u64), &DenseRows::Tuples(chunk), Some(1), &[], NL, true).unwrap();
+        }
+        let wide = Nat::S(5_000_000_000);
+        let huge = Nat::from(num_bigint::BigUint::from(1u8) << 70);
+        let mut cells: Vec<CellInput> = (1..=400u64).map(|u| CellInput::new(Nat::S(u * 7), Nat::S(50), Val::str("same"))).collect();
+        cells.push(CellInput::new(wide, Nat::S(50), Val::str("same")));
+        db.put_points(&r, cells, NL, true, 64).unwrap();
+        type Dump = Vec<(u64, Vec<(Vec<u8>, u64, u8, Vec<u8>)>)>;
+        let dump = |db: &Db, ids: &[u64]| -> Dump {
+            ids.iter()
+                .map(|&iid| {
+                    let mut v = Vec::new();
+                    db.sec_scan(iid, NL, None, &mut |e| {
+                        v.push((e.key.clone(), e.raw_count, e.width, db.sec_posting_raw(iid, NL, e)?));
+                        Ok(true)
+                    })
+                    .unwrap();
+                    (iid, v)
+                })
+                .collect()
+        };
+        let ids = [1u64, 2, 3, 4];
+        db.build_indexes(None, true).unwrap();
+        let want = dump(&db, &ids);
+        assert!(want[3].1.len() > 10, "document lengths and words in several keys");
+        db.index_build_memory_override = Some(30_000);
+        for min in [1, STREAM_MERGE_MIN, 2_000] {
+            STREAM_MERGE_MIN_TEST.store(min, std::sync::atomic::Ordering::Relaxed);
+            let small = db.build_indexes(None, true).unwrap();
+            assert!(small.get("spill_rounds").unwrap().as_i64().unwrap() >= 10, "{}", small.py_repr());
+            assert_eq!(dump(&db, &ids), want, "stream merge from {min} entries");
+        }
+        STREAM_MERGE_MIN_TEST.store(1, std::sync::atomic::Ordering::Relaxed);
+        // u above 2^64: the posting width is variable, merged as before
+        db.put_points(&r, vec![CellInput::new(huge, Nat::S(50), Val::str("same"))], NL, true, 64).unwrap();
+        db.index_build_memory_override = None;
+        db.build_indexes(Some(&[2]), true).unwrap();
+        let want2 = dump(&db, &[2]);
+        db.index_build_memory_override = Some(2_000);
+        db.build_indexes(Some(&[2]), true).unwrap();
+        assert_eq!(dump(&db, &[2]), want2);
+        STREAM_MERGE_MIN_TEST.store(STREAM_MERGE_MIN, std::sync::atomic::Ordering::Relaxed);
+        assert!(db.verify(true).unwrap().get("ok").unwrap().is_truthy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn strip_physical(v: &Val) -> Val {
+        Val::List(
+            v.as_list()
+                .unwrap()
+                .iter()
+                .map(|row| match row {
+                    Val::Map(m) => Val::Map(m.iter().filter(|(k, _)| !matches!(k.as_str(), "block_offset" | "block_id" | "payload_bytes")).cloned().collect()),
+                    other => other.clone(),
+                })
+                .collect(),
+        )
     }
 
     fn big(shift: u32, add: u64) -> Nat {
@@ -1606,3 +2507,157 @@ mod perf_tests {
         assert_eq!(s.to_nats(), vec![Nat::S(2), Nat::S(4), Nat::S(9)]);
     }
 }
+
+#[cfg(test)]
+mod doclen_tests {
+    //! Round 3: paged FULLTEXT document lengths.
+    use super::*;
+    use crate::address::NL;
+    use crate::codec::{FieldDef, TypeCode};
+    use crate::db::dense::DenseRows;
+    use crate::db::OpenOptions;
+    use std::collections::BTreeMap;
+
+    fn big(bits: u32, add: u64) -> Nat {
+        Nat::from(num_bigint::BigUint::from(1u8) << bits).add_u64(add)
+    }
+
+    fn text(u: u64) -> String {
+        let n = (u * 7919) % 13;
+        (0..n).map(|k| format!("w{}", (u * 31 + k * 17) % 97)).collect::<Vec<_>>().join(" ")
+    }
+
+    fn ft_db(d: &std::path::Path) -> (Db, BTreeMap<Nat, u64>) {
+        let _ = std::fs::remove_dir_all(d);
+        std::fs::create_dir_all(d).unwrap();
+        let r = Nat::S(1);
+        let mut db = Db::create(d.join("ft.nhydb"), true, OpenOptions::default()).unwrap();
+        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
+        db.create_shape(1, &r, "s", vec![FieldDef::new(Nat::S(1), "t", TypeCode::Utf8)], "").unwrap();
+        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
+        db.create_index_ext(5, &r, "ft", &Val::Int(1), &Val::str("FULLTEXT"), &Val::None, None, None, None, "").unwrap();
+        let mut want = BTreeMap::new();
+        let mut add = |db: &mut Db, start: Nat, n: u64| {
+            let rows: Vec<Vec<Val>> = (0..n).map(|k| vec![Val::str(text(k + 3))]).collect();
+            db.put_dense_batch(&r, &start, &DenseRows::Tuples(&rows), Some(1), &[], NL, true).unwrap();
+            for k in 0..n {
+                want.insert(start.add_u64(k), textindex::simple_tokens(&Val::str(text(k + 3)), true).len() as u64);
+            }
+        };
+        add(&mut db, Nat::S(1), 2500);
+        add(&mut db, Nat::S(u64::MAX - 20), 40); // across the u64 boundary
+        add(&mut db, big(70, 3), 60);
+        db.build_indexes(None, true).unwrap();
+        (db, want)
+    }
+
+    /// Many small segments (64-byte pages in this test thread): the full
+    /// corpus, the lengths of arbitrary u sets (far apart: new descent
+    /// after 64 skipped segments; big `Nat`; absent u) and the totals equal
+    /// a brute force over the inserted texts; `verify(deep)` checks them.
+    #[test]
+    fn paged_doc_lengths_equal_brute_force() {
+        secindex::set_page_bytes_for_tests(64);
+        let d = std::env::temp_dir().join(format!("nhydb_doclen_{}", std::process::id()));
+        let (db, want) = ft_db(&d);
+        let segs = db.fulltext_internal_entries(5, NL).unwrap() - 1;
+        assert!(segs > 70, "{segs} segments"); // the first set skips more than 64
+        let full = db.fulltext_corpus(5, NL).unwrap();
+        assert_eq!(full.lengths, want);
+        assert_eq!(full.total_docs, want.len() as u64);
+        assert_eq!(full.total_tokens, want.values().sum::<u64>());
+        let all: Vec<Nat> = want.keys().cloned().collect();
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut sets: Vec<Vec<Nat>> = vec![
+            vec![all[0].clone(), all[2499].clone()],
+            vec![all[3].clone(), all[all.len() - 1].clone()],
+            vec![Nat::S(0), Nat::S(2501), Nat::S(u64::MAX - 21), big(70, 2), big(80, 0)],
+            all.clone(),
+        ];
+        for _ in 0..30 {
+            let n = (next() % 40) as usize + 1;
+            let mut s: Vec<Nat> = (0..n).map(|_| all[(next() % all.len() as u64) as usize].clone()).collect();
+            s.push(Nat::S(next() % 5000));
+            s.sort();
+            s.dedup();
+            sets.push(s);
+        }
+        for s in &sets {
+            let c = db.fulltext_doc_lengths(5, NL, s).unwrap();
+            let exp: BTreeMap<Nat, u64> = s.iter().filter_map(|u| want.get(u).map(|l| (u.clone(), *l))).collect();
+            assert_eq!(c.lengths, exp);
+            assert_eq!((c.total_docs, c.total_tokens), (full.total_docs, full.total_tokens));
+        }
+        assert_eq!(db.sec_verify_tree(5, NL).unwrap(), db.secondary_blocks[&(5, NL)].entry_count);
+        // distinct keys without the segments (summary = the document length key)
+        let terms = db.secondary_entry_count(5, NL) as u64 - 1;
+        assert!(terms > 0 && terms <= 97, "{terms}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// RB3-06: a damaged tree does not leave a wrong segment count in the
+    /// statistics (the read error is not remembered).
+    #[test]
+    fn entry_count_does_not_remember_read_errors() {
+        let d = std::env::temp_dir().join(format!("nhydb_rb306_{}", std::process::id()));
+        let (mut db, _) = ft_db(&d);
+        let meta = db.secondary_blocks[&(5, NL)].clone();
+        let (off, len) = (meta.block_offset, db.read_header_at(meta.block_offset).unwrap().payload_len);
+        db.close(true).unwrap();
+        drop(db);
+        let p = d.join("ft.nhydb");
+        let mut raw = std::fs::read(&p).unwrap();
+        raw[(off + BLOCK_HEADER_SIZE as u64 + len - 1) as usize] ^= 0x40;
+        std::fs::write(&p, raw).unwrap();
+        let db = Db::open_with(&p, OpenOptions::default()).unwrap();
+        assert!(db.fulltext_internal_entries(5, NL).is_err());
+        let n = db.secondary_entry_count(5, NL);
+        assert_eq!(n as u64, db.secondary_blocks[&(5, NL)].entry_count);
+        assert!(db.secondary_blocks[&(5, NL)].doclen_segments.get().is_none(), "read error remembered");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `verify(deep)` rejects a tree whose summary does not match its
+    /// segments and segments that do not match their keys.
+    #[test]
+    fn deep_check_rejects_inconsistent_doc_lengths() {
+        let d = std::env::temp_dir().join(format!("nhydb_doclen_bad_{}", std::process::id()));
+        let (mut db, want) = ft_db(&d);
+        let entries: Vec<(Nat, u64)> = want.iter().take(100).map(|(u, l)| (u.clone(), *l)).collect();
+        let write = |db: &mut Db, summary_docs: u64, last_key: &Nat| {
+            let mut w = secindex::SecWriter::new(5, NL);
+            let doc_key = secindex::encode_key_vec(&Val::str(FULLTEXT_DOCLEN_KEY)).unwrap();
+            let tokens: u64 = entries.iter().map(|e| e.1).sum();
+            w.add(db, doc_key, summary_docs, PAYLOAD_FULLTEXT_DOCLEN_SUMMARY, &textindex::encode_doclen_summary(summary_docs, tokens, 1)).unwrap();
+            let k = secindex::encode_key_vec(&Val::Str(textindex::doclen_segment_key(last_key))).unwrap();
+            w.add(db, k, entries.len() as u64, PAYLOAD_FULLTEXT_DOCLEN_SEGMENT, &textindex::encode_fulltext_doc_lengths(&entries).unwrap()).unwrap();
+            let (root, _, _) = w.finish(db, 1).unwrap();
+            let (off, _) = db.append_block(BT_SECONDARY, &root, lane_flags(NL)).unwrap();
+            let info = db.read_header_at(off).unwrap();
+            db.parse_secondary_directory(&info).unwrap();
+        };
+        let last = entries.last().unwrap().0.clone();
+        write(&mut db, 100, &last);
+        assert!(db.sec_verify_tree(5, NL).is_ok());
+        write(&mut db, 99, &last);
+        let e = db.sec_verify_tree(5, NL).unwrap_err().to_string();
+        assert!(e.contains("count mismatch") || e.contains("does not match its segments"), "{e}");
+        write(&mut db, 100, &last.add_u64(1));
+        let e = db.sec_verify_tree(5, NL).unwrap_err().to_string();
+        assert!(e.contains("not matching their keys"), "{e}");
+        assert!(db.fulltext_doc_lengths(5, NL, std::slice::from_ref(&last)).is_err());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+// AP9: overlay and automatic maintenance of the indexes
+pub(crate) mod ixmaint;

@@ -34,4 +34,6 @@ create_exception!(nhydb, AllocationConflictError, LayoutError, "Proposed realm i
 create_exception!(nhydb, QueryError, NHyDBError, "Base class of the query layer errors.");
 create_exception!(nhydb, QueryPlanError, QueryError, "Invalid query plan/operator.");
 create_exception!(nhydb, QueryDomainError, QueryError, "Domain error (record/cell).");
+create_exception!(nhydb, QueryLimitError, QueryError, "Query rejected by the configured [query] max_result_rows.");
+create_exception!(nhydb, ResourceLimitError, NHyDBError, "A large job was cancelled (attribute reason: cancelled_by_app, cancelled_by_limiter or wait_timeout).");
 create_exception!(nhydb, SQLSyntaxError, QueryError, "Syntax/semantic error in NHySQL.");

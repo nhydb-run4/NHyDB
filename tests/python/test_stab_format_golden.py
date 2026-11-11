@@ -47,12 +47,13 @@ SIDECARS = ("", ".layout.enc", ".layout.key")
 DATA_START = 8192
 BT_SYSTEM = 13
 BT_SECONDARY = 7
-SEC_TAG = b"SI10"
+BT_SECONDARY_PAGE = 15
+SEC_TAG = b"SI28"
 BIG = 10**100
 HUGE_U = 2**70 + 3
 
 BLOCK_NAMES = {4: "DATA_DENSE", 5: "DELETE", 6: "CHECKPOINT", 7: "SECONDARY_INDEX",
-               10: "SPARSE_CELLS", 12: "DB_CONFIG", 13: "SYSTEM"}
+               10: "SPARSE_CELLS", 12: "DB_CONFIG", 13: "SYSTEM", 15: "SECONDARY_PAGE"}
 
 
 def build_scenario(path):
@@ -109,7 +110,7 @@ def build_scenario(path):
     db.create_math_layout(rm.MathMapLayoutSpec("grid", m, 4096), layout_id=7, payload_type="utf8")
     db.put_math_batch(7, [((x, y), f"{x},{y}") for x in range(1, 4) for y in (1, BIG + 1)], commit=True)
     # deletes of all kinds
-    db.delete(1, 5)
+    db.delete_record(1, 5)
     db.delete_cell(2, 2, 2)
     db.delete_record(2, 4)
     db.commit()
@@ -117,6 +118,15 @@ def build_scenario(path):
     db.build_indexes()
     db.checkpoint()
     db.put_points(2, [(8, 1, "after checkpoint", "utf8")], commit=True)
+    # realm 9: an index large enough for a key tree with inner pages and
+    # posting chunks (block type 15)
+    db.create_realm(9, "many")
+    db.create_shape(9, 9, "kv", [{"v": 1, "name": "k", "type": "varuint"}, {"v": 2, "name": "flag", "type": "utf8"}])
+    db.create_classic_layout(9, 9, "kv", shape_id=9)
+    db.create_index(40, 9, "k", 1)
+    db.create_index(41, 9, "flag", 2)
+    db.put_dense_batch(9, 1, [[u * 7, ("even", "odd")[u % 2]] for u in range(1, 3001)], shape_id=9, commit=True)
+    db.build_indexes([40, 41])
     db.close()
 
 
@@ -172,34 +182,81 @@ def _get_vu(buf, p):
         shift += 7
 
 
-def decode_secondary(payload):
-    """SECONDARY payload without its compressed bytes: header, directory
-    (key, count, codec per entry) and the decompressed posting lists."""
+def decode_secondary(payload, pages):
+    """SECONDARY key tree without its compressed bytes: root fields and all
+    leaf entries in key order (key, count, codec, decompressed postings).
+    ``pages``: block offset -> (block type, block id, payload)."""
     assert payload[:4] == SEC_TAG
     p = 4
     index_id, p = _get_vu(payload, p)
     source_block_id, p = _get_vu(payload, p)
     entry_count, p = _get_vu(payload, p)
-    dir_len, p = _get_vu(payload, p)
-    directory, postings = payload[p:p + dir_len], payload[p + dir_len:]
-    entries, q, next_rel = [], 0, 0
-    for _ in range(entry_count):
-        klen, q = _get_vu(directory, q)
-        key = directory[q:q + klen]
-        q += klen
-        rel, q = _get_vu(directory, q)
-        clen, q = _get_vu(directory, q)
-        count, q = _get_vu(directory, q)
-        width = directory[q]
-        q += 1
-        assert rel == next_rel, "posting lists not stored back to back"
-        comp = postings[rel:rel + clen]
-        assert len(comp) == clen, "posting list points beyond the block"
-        entries.append({"key": key, "count": count, "width": width, "postings": zlib.decompress(comp)})
-        next_rel += clen
-    assert q == len(directory), "SECONDARY directory trailing bytes"
-    assert next_rel == len(postings), "SECONDARY postings trailing bytes"
-    return {"index_id": index_id, "source_block_id": source_block_id, "entries": entries}
+    height, p = _get_vu(payload, p)
+    raw_len, p = _get_vu(payload, p)
+    top = zlib.decompress(payload[p:])
+    assert len(top) == raw_len
+    entries = []
+
+    def walk(level, body):
+        q = 0
+        chunks = []
+        if level == 0:
+            m, q = _get_vu(body, q)
+            for _ in range(m):
+                off, q = _get_vu(body, q)
+                bid, q = _get_vu(body, q)
+                bt, pbid, cp = pages[off]
+                assert (bt, pbid) == (BT_SECONDARY_PAGE, bid) and cp[:4] == b"SC28"
+                chunks.append(cp)
+        n, q = _get_vu(body, q)
+        for _ in range(n):
+            klen, q = _get_vu(body, q)
+            key = body[q:q + klen]
+            q += klen
+            if level == 0:
+                count, q = _get_vu(body, q)
+                width, kind = body[q], body[q + 1]
+                q += 2
+                if kind == 0:
+                    ln, q = _get_vu(body, q)
+                    raw = body[q:q + ln]
+                    q += ln
+                else:
+                    ci, q = _get_vu(body, q)
+                    rel, q = _get_vu(body, q)
+                    clen, q = _get_vu(body, q)
+                    raw = zlib.decompress(chunks[ci][rel:rel + clen])
+                entries.append({"key": key, "count": count, "width": width, "postings": raw})
+            else:
+                off, q = _get_vu(body, q)
+                bid, q = _get_vu(body, q)
+                bt, pbid, cp = pages[off]
+                assert (bt, pbid) == (BT_SECONDARY_PAGE, bid) and cp[:4] == b"SN28" if level > 1 else cp[:4] == b"SL28"
+                r = 4
+                iid, r = _get_vu(cp, r)
+                lvl, r = _get_vu(cp, r)
+                rl, r = _get_vu(cp, r)
+                assert (iid, lvl) == (index_id, level - 1)
+                child = zlib.decompress(cp[r:])
+                assert len(child) == rl
+                walk(level - 1, child)
+        assert q == len(body), "SECONDARY page trailing bytes"
+
+    walk(height, top)
+    assert len(entries) == entry_count
+    return {"index_id": index_id, "source_block_id": source_block_id, "height": height, "entries": entries}
+
+
+def pages_by_offset(path):
+    raw = Path(path).read_bytes()
+    out, off = {}, DATA_START
+    while off + 32 <= len(raw):
+        magic, _ver, bt, _flags, bid, plen, _pc, _hc = struct.unpack_from("<4sBBHQQII", raw, off)
+        if magic != b"NHBL":
+            break
+        out[off] = (bt, bid, raw[off + 32: off + 32 + plen])
+        off += (32 + plen + 7) & ~7
+    return out
 
 
 def contents(db):
@@ -217,6 +274,10 @@ def contents(db):
         "sql": db.sql("SELECT status, COUNT(*) AS n FROM records GROUP BY status ORDER BY status")["rows"],
         "fulltext": db.sql("SELECT id FROM records WHERE FULLTEXT(body, :q) ORDER BY id", {"q": "gamma"})["rows"],
     }
+    if 9 in db.realms:  # not in the 0.16 golden database
+        out["many_eq"] = db.find_u(9, {"k": 7 * 2345})
+        out["many_range"] = len(db.find_u(9, {"k": (7 * 100, 7 * 2900)}))
+        out["many_flag"] = len(db.find_u(9, {"flag": "odd"}))
     return json.loads(json.dumps(out, default=repr, sort_keys=True))
 
 
@@ -236,7 +297,8 @@ def _load_golden():
 
 def test_scenario_format_matches_golden(tmp_path):
     """The current engine writes byte-identical block payloads for the scenario
-    (SECONDARY_INDEX: identical structure and decompressed postings)."""
+    (SECONDARY key trees: identical structure and decompressed postings; the
+    zlib bytes of their pages may differ between zlib implementations)."""
     p = tmp_path / "golden.nhydb"
     build_scenario(p)
     got = describe_file(p)
@@ -245,16 +307,22 @@ def test_scenario_format_matches_golden(tmp_path):
     assert [(b["type"], b["block_id"], b["flags"]) for b in got["blocks"]] == \
            [(b["type"], b["block_id"], b["flags"]) for b in want["blocks"]], "block sequence changed"
     got_payloads, golden_payloads = block_payloads(p), block_payloads(GOLDEN_DB)
+    got_pages, golden_pages = pages_by_offset(p), pages_by_offset(GOLDEN_DB)
     for g, w in zip(got["blocks"], want["blocks"]):
         msg = f"block {w['block_id']} ({w['type']}) differs: format change? see module docstring"
-        if w["bt"] != BT_SECONDARY:
+        if w["bt"] not in (BT_SECONDARY, BT_SECONDARY_PAGE):
             assert g == w, msg
+            continue
+        if w["bt"] == BT_SECONDARY_PAGE:
+            # compared through the tree of their root
+            assert {k: g[k] for k in ("type", "bt", "version", "block_id", "flags")} == \
+                   {k: w[k] for k in ("type", "bt", "version", "block_id", "flags")}, msg
             continue
         ref = golden_payloads[w["block_id"]]
         assert hashlib.sha256(ref).hexdigest() == w["sha256"], "checked-in golden.nhydb and format_blocks.json diverge"
         assert {k: g[k] for k in ("type", "bt", "version", "block_id", "flags")} == \
                {k: w[k] for k in ("type", "bt", "version", "block_id", "flags")}, msg
-        assert decode_secondary(got_payloads[g["block_id"]]) == decode_secondary(ref), msg
+        assert decode_secondary(got_payloads[g["block_id"]], got_pages) == decode_secondary(ref, golden_pages), msg
     assert got["blocks_end"] == got["file_size"]
     if all(g == w for g, w in zip(got["blocks"], want["blocks"])):
         assert got == want
@@ -286,6 +354,22 @@ def test_checked_in_golden_db_opens_and_reads(tmp_path):
     assert rep
     with nhydb.NHyDB(p) as db:
         assert db.verify(deep=True)["ok"] and db.get_cell(2, 8, 1)["value"] == "after checkpoint"
+
+
+GOLDEN_016_DB = HERE / "golden_016" / "golden.nhydb"
+
+
+def test_format_016_golden_db_is_rejected(tmp_path):
+    """RUN7 (no backward compatibility): the golden database of file format
+    0.16 (NHyDB 0.28.0, before the block directory) is not opened; the
+    error names its format, and the file stays unchanged."""
+    p = _copy_triad(GOLDEN_016_DB, tmp_path / "copy016")
+    before = p.read_bytes()
+    assert before[:8] == b"NHYDB016"
+    for ro in (True, False):
+        with pytest.raises(nhydb.CorruptionError, match="NHYDB016"):
+            nhydb.NHyDB(p, readonly=ro)
+    assert p.read_bytes() == before
 
 
 def test_fresh_build_reads_like_golden_db(tmp_path):

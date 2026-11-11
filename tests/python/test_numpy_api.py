@@ -73,7 +73,7 @@ def test_numpy_roundtrip_read(tmp_path):
     db = _db(tmp_path / "a.nhydb")
     db.put_numpy_batch(1, 1, cols)
     db.put_points(1, [(5, 4, 12345)])          # overlay on a BASE field
-    db.delete(1, 7)                            # deleted record
+    db.delete_record(1, 7)                            # deleted record
     out = db.read_numpy(1, 1, n + 2)
     assert out["_present"].dtype == bool and out["_present"].sum() == n - 1
     assert not out["_present"][6] and not out["_present"][n] and not out["_present"][n + 1]

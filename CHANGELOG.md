@@ -5,6 +5,327 @@ The project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.2] – 2026-11-11
+
+**Engine 0.28.2, file format 0.28.2.** Files start with the signature
+`NHYDB` followed by the version bytes 0, 28, 2 (the historical numbering
+`NHYDB016` ends). New block types 14 `DIRECTORY` and 15 `SECONDARY_PAGE`,
+the superblock field `dir_root`, a prefix checksum in DATA_DENSE (`D28D`)
+and SPARSE_CELLS (`SP28`) payloads and SECONDARY indexes as key trees
+(`SI28`); all other blocks and payloads are unchanged. Only format 0.28.2 is
+read: files of NHyDB 0.28.0 and 0.27.1 (`NHYDB016`) and of an unreleased
+development format are rejected with `CorruptionError` naming the format
+(see *Removed*).
+
+### Highlights
+
+* **Block directory and file format 0.28.2:** opening a file with one
+  million single-cell blocks takes ~5 ms / ~7 MB instead of ~0.3 s /
+  ~230 MB; prefix checksums in the data payloads.
+* **SECONDARY indexes as persistent key trees** with an index build of
+  bounded memory (external sort): first lookup 0.2 ms instead of 200 ms,
+  indexes 5.5x smaller on disk.
+* **Automatic index maintenance:** indexes stay usable after writes and
+  renew themselves; `build_indexes()` is only needed for new indexes.
+* **Central RAM limiter** per process: large operations wait or spill
+  instead of exhausting memory; last resort `ResourceLimitError`.
+* **Large result sets:** faster query planning, streaming rows with
+  `db.sql_iter()`, result files (`db.sql_to_file()`), background queries
+  (`db.submit_sql()`) and bounded `ORDER BY` with sorted runs on disk.
+* **Delete API:** `delete_cell`, `delete_area` and `delete_record`, also
+  inside `db.batch()`.
+* **The newest write wins** across dense and sparse storage on every path.
+* **Fast queries on overwritten data:** `COUNT(*)`, field scans and `NOT`
+  after overwrites, deletes or sparse cells (KQ-10M field scan 17.7–23.6 s →
+  1.0–2.2 s).
+* **`read_numpy(..., masks=True)`** tells live cells apart from deleted or
+  missing ones.
+* **`cleanup_compaction()`** removes the staging file of an interrupted
+  in-place compaction.
+
+### Upgrade notes
+
+* **Files of NHyDB 0.28.0 and 0.27.x do not open** (`CorruptionError` naming
+  the format; the file stays unchanged). There is no migration path: rebuild
+  such databases from the source data or exports.
+* **Python 3.12–3.15 only** (`requires-python = ">=3.12"`); Python 3.9–3.11
+  are no longer supported.
+* **Delete API:** `delete(realm_id, u)` and `delete_point(realm_id, u, v)` are
+  removed without aliases. Use `delete_record` (whole record), `delete_area`
+  (by realm coordinates) or `delete_cell` (former `delete_point`). Return
+  values changed (see *Changed*).
+* **DENSE fields reject `None`** with `ValueError`; store a null cell with
+  `put_cell(..., None)`.
+* **`put` replaces the BASE record as a whole**; a tombstoned BASE field is
+  no longer reported as present.
+* **New default bound `[query] max_result_bytes` = 4 GiB:** calls that return
+  the whole result at once raise `QueryLimitError` beyond it (before: no
+  bound). Use `sql_iter()`/`sql_to_file()` for larger results or set 0.
+* `len(WriteBatch)` counts calls instead of distinct cells; a failed
+  `WriteBatch.flush()` ends the batch. Negative administrative IDs raise
+  `ValueError`.
+
+### Known limitations
+
+* `delete_area` costs time proportional to the live cells in the area (no
+  O(1) range delete; about 15 s for 40 million cells).
+* An index on a field missing from the current BASE shape of a realm reads
+  only SPARSE cells; dense values of older shapes are not in the index.
+* A `batch()` holds every collected call in RAM until `flush()` (about 105 B
+  per cell call, about 86 B per record delete): flush in between and use
+  `db.delete_area()` for mass deletes.
+* RAM limiter on Windows: with a limiter budget that cannot be reached, a
+  cache relief can keep the cache budget capped for several seconds up to
+  about two minutes (measured 4–131 s) until it is judged ineffective
+  (intentional policy).
+* A FULLTEXT conjunction on an index with pending changes is about 4× slower
+  until its rebuild; every index rebuild leaves the old trees as dead space
+  until a compaction.
+
+### Added
+
+* **Delete API.**
+  - `delete_area(realm_id, u_from, u_to, v_from, v_to, *, lane=None,
+    commit=False)` deletes every live cell of a rectangle of a realm (bounds
+    inclusive), independent of layout, BASE/extension and dense/sparse
+    storage, and returns the number of live cells deleted. The call is
+    atomic: a size limit, I/O error or RAM-limiter cancel leaves nothing of
+    it. Memory stays bounded (macOS M1 Max: peak RSS +41 MB for 3.2 million
+    deleted cells).
+  - `WriteBatch.delete_record(layout_id, object_id)` and
+    `WriteBatch.delete_area(...)` next to `put_cell`/`delete_cell`. The batch
+    keeps the call order and is written as one unit. `flush()` reports
+    `"deleted"` (the sum the single calls would return); `blocks` and
+    `bytes` are what the batch appended.
+* **`read_numpy(..., masks=True)`** adds `"_cells"`: field name → bool array,
+  `True` where the cell lives (a stored `None` included). Without `masks` the
+  output is unchanged.
+* **`cleanup_compaction()` and the health check `compaction_leftover`.** A
+  `<db>.compacting` staging file left by a killed in-place compaction is
+  reported by `health()` (path, size, `removable`) and removed by
+  `cleanup_compaction()` (own lock required) or when a writer opens the
+  database.
+* **Automatic index maintenance.** After writes an index answers from its
+  built part plus an in-memory overlay of the changed records (VALUE, TOKEN,
+  TRIGRAM, FULLTEXT incl. phrases and BM25 ranking); results equal a full
+  rebuild. After a commit the writer renews stale indexes by a merge rebuild
+  without a data scan (KQ-10M 1.4–2.3 s instead of 4.3–6.7 s; FULLTEXT over
+  10 million documents 12.6 s instead of 36 s), deferred during bulk commits
+  and while the RAM limiter is not green; an index that was never built is
+  built at the next commit. A failed rebuild never touches committed data.
+  - New `[index]` settings: `maintenance` (`"auto"`, or `"manual"` = only
+    `build_indexes()`), `rebuild_ratio` (0.02), `rebuild_min_changes`
+    (1024), `bulk_commit_ratio` (0.002), `crisis_ratio` (0.25),
+    `overlay_max_bytes` (256 MiB).
+* **Central RAM limiter.** One limiter per process compares the process
+  footprint (macOS `phys_footprint`, Linux RSS within the cgroup limit,
+  Windows commit) with `(100 − reserve_percent) %` of the RAM. Large
+  operations (queries, conversions, sorts, index builds, write calls,
+  deletes, batch flushes, `compact_file`) check it at chunk boundaries;
+  single operations are not affected. Yellow zone: caches are emptied,
+  sorts and index builds spill early, new large operations wait; red: all but
+  the oldest wait. As a last resort (`cancel_over_limit`, default on) the
+  operation that keeps the process above its limit is cancelled with the new
+  `ResourceLimitError` (`reason`; a write call is rolled back). The GIL is
+  never held while waiting.
+  - New: `nhydb.resource_status()`, `nhydb.cancel_job(id)`, section
+    `[limiter]` (`enabled`, `reserve_percent`, `warn_percent`, `tick_ms`,
+    `notify_wait_s`, `wait_timeout_s`, `cancel_over_limit`, `probe_bytes`,
+    `ram_bytes`, `dry_run`).
+  - Statistics file `limiter.txt` (`[limiter_log]`, default on): one JSON
+    line per interval (default 30 minutes; `interval_min` 1 … 527,040),
+    archived as ZIP from 60 MB; default location is the directory of the
+    first database of the process.
+* **Streaming rows:** `db.sql_iter()` yields the rows of a SELECT in chunks
+  (same rows and order as `sql()`); `sql_numpy()` builds its columns from
+  streamed rows (KQ 5 million rows x 11 fields: 21.8 s / 24.3 GB → 8.9 s /
+  0.95 GB; `sql_iter` 11.0 s / 0.35 GB, first row after 87 ms).
+* **Result files and background queries:** `db.sql_to_file()` streams a
+  SELECT into a CRC-protected result file (`.nhyc`, layout in the technical
+  documentation, section 14.5) and returns a `nhydb.ResultFile` (iterate,
+  `to_numpy()`, `fetchall()`, `pin()`/`unpin()`, `delete()`);
+  `db.submit_sql()` runs it in a background thread on a read-only snapshot
+  (`nhydb.ResultJob`). `nhydb.cleanup_results()` removes leftovers of ended
+  processes (no expiry by time). KQ 5 million rows x 11 fields: 8.9 s,
+  477 MB (82 MB with zlib).
+  - `[results]` settings: `temp_dir` (default `<system temp>/nhydb-results`),
+    `budget_bytes` (0 = none), `compress`, `sort_memory_bytes` (beyond it a
+    streaming `ORDER BY` sorts in runs on disk).
+* **`[query] max_result_rows`** (default 0 = no bound): queries whose
+  estimated result rows exceed it are rejected before they run with the new
+  `QueryLimitError` (subclass of `QueryError`); `explain()` and
+  `sql("EXPLAIN …")` report `hints` for large estimates.
+* **`[query] max_result_bytes`** (default 4 GiB, 0 = none): `sql()`,
+  `QueryEngine.execute()`/`search()`, `sql_numpy()`, `find_u()`, the `find()`
+  iterator and `ResultFile.fetchall()`/`to_numpy()` raise `QueryLimitError`
+  beyond it. Iterating a `ResultFile` stays unbounded.
+* **Process-wide cache budget** `[cache] total_bytes` (default 4 GiB) for all
+  open database objects of a process (defined by the first object opened;
+  a different later value is reported as a warning). New pools
+  `[cache] posting_cache_bytes` (256 MiB), `sparse_cache_bytes` (128 MiB)
+  and `index_page_cache_bytes` (32 MiB); `[cache] vindex_max_marks`
+  (4 000 000 ≈ 192 MB) and `vindex_max_indexes` (4 096) are now used.
+  `stats()["cache"]` reports the budget and every pool.
+* **SECONDARY indexes as persistent sorted key trees** (pages of about
+  4 KiB, read on demand): with 1 million keys per index the first lookup
+  takes 0.2 ms instead of 200 ms, memory after 15 000 mixed queries is 75 MB
+  instead of 722 MB, the index is 16.8 instead of 92 MB on disk. FULLTEXT
+  document lengths are paged as well (0.26 MB heap after a rare-word search
+  over 900 000 documents; 0.28.0 kept 49 bytes per document).
+  `stats()["block_cache"]` reports the `index_page_*` counters.
+* **Index build with bounded memory:** beyond `[index] build_memory_bytes`
+  (512 MiB) the keys are spilled to an anonymous temporary file and merged;
+  `build_indexes()` reports `spill_rounds` and `spill_bytes`, `passes` is
+  always 1. The refusal of indexes larger than the physical memory is gone.
+* **Persistent block directory:** written by `commit()` once
+  `[directory] flush_blocks` (65 536) blocks or `flush_bytes` (256 MiB) were
+  added; opening reads only the directory root and the blocks behind it;
+  `[directory] cache_entries` bounds its page cache. Reported in
+  `stats()["directory"]` (incl. `last_flush_error`, `failed_flushes`,
+  `damaged_blocks_skipped`, `degraded`); `verify(deep=True)` checks it,
+  `inspect_tail()` reports `damaged_directory_blocks` and
+  `directory_damaged_in_use`. A damaged directory falls back to a full scan;
+  `repair_file` drops it losslessly.
+* **RD-08: Prefix checksum** for DATA_DENSE and SPARSE_CELLS payloads: the
+  open checks the routing prefix instead of whole payloads; the full payload
+  CRC is checked before first use.
+* **Fast paths on overwritten data:** after overwrites, deletes or sparse
+  cells, `COUNT(*)`, `NOT`, field predicates without index and the ORDER-BY
+  index window no longer fall back to the slow cell cursor until the next
+  compaction (KQ-10M, macOS M1 Max: field scan 17.7–23.6 s → 1.0–2.2 s,
+  `COUNT(*)` 16.5–21.9 s → ≤ 0.22 s, `NOT` 34.7–45.4 s → 1.0–2.6 s). New
+  settings `[query] overlay_view` (default true) and
+  `[query] overlay_view_max_bytes` (256 MiB), `stats()["overlay_view"]`.
+* **`[write] max_block_bytes`** (default 8 MiB, 0 = one block per call):
+  `put_dense_batch`, `put_numpy_batch` and `compact_file` split large calls
+  into several blocks, atomic like one; calls above 4 GiB of record data are
+  now accepted.
+* Prebuilt wheels for CPython 3.15 (Linux, macOS, Windows).
+* Documentation: Windows paths in `nhydb_config.toml` belong in single
+  quotes or use `/`.
+
+### Changed
+
+* **Delete API: exactly three functions.** `delete_cell`, `delete_area` and
+  `delete_record` work on logical cells; BASE/extension, dense/sparse
+  storage and field names make no difference. `delete(realm_id, u)` (hid
+  only the dense record) and `delete_point` (now `delete_cell`) are removed.
+  `delete_cell` returns `bool` (the cell lived); `delete_area` and
+  `delete_record` return the number of distinct live cells deleted
+  (`delete_record` no longer counts the dense record as an extra element).
+  `delete_cell`/`delete_area` on an exclusive MATH realm raise
+  `SchemaError`; `delete_record` on a MATH layout says so in its error.
+* **`put` replaces the BASE record, `put_cell` changes one cell.** Fields a
+  new shape lacks are no longer part of the record, and an older hidden value
+  cannot show again. Cells outside the shape keep following their own writes.
+* **Cell existence.** A tombstoned BASE field is no cell (`get_cell(...)
+  ["present"]` is `False`; not listed by `get_internal`). A field of the
+  current shape written with `put_cell` on a record of an older shape reads
+  under its field name and is indexed. `get()` shows unnamed BASE cells also
+  with `include_extensions=False`.
+* **R9E-01: DENSE fields reject `None`** for every type in `put`,
+  `put_dense_batch`, `put_numpy_batch` and `put_record` (`ValueError`);
+  before, `utf8` stored `"None"` and `bool` stored `False`.
+* **R9D-02/R9B-01: a failed `WriteBatch.flush()` ends the batch:** nothing
+  of it is written, every further call raises `RuntimeError` (before, a
+  second `flush()` reported success with zero cells).
+* **R9E-05:** `len(WriteBatch)` counts the calls since the last flush.
+* **R9E-02:** `read_numpy` `_present`: a record whose cells are all deleted
+  is absent, a pure sparse record is present with its values.
+* **R9E-06:** negative administrative IDs raise `ValueError` (before,
+  `create_shape(-5, …)` created shape 0).
+* **R9E-07:** `put_math_batch` raises `TypeError` naming a malformed row.
+* **R9C-H1:** `index_candidates(TRIGRAM, "contains", p)` with `p` shorter
+  than `ngram` raises `ValueError` instead of returning `[]`.
+* **Indexes with pending changes** (`index_candidates`, `find_u`, `find`,
+  `posting_count` – now exact –, FULLTEXT functions, QueryEngine) answer
+  instead of raising `StaleIndexError`; it remains for indexes without a
+  built part and beyond `overlay_max_bytes`. `health()` lists them under
+  `indexes.details.overlay`, `verify()` warns.
+* **Bounded `ORDER BY`:** `sql_iter()`, `sql_numpy()`, `sql_to_file()` and
+  `submit_sql()` sort in memory up to `[results] sort_memory_bytes` and in
+  runs on disk beyond it, in every realm and layout; the order is always that
+  of `sql()`. NaN in a sort column beyond the budget raises `QueryLimitError`.
+* `verify(deep=True)` also walks every SECONDARY key tree and the block
+  directory; a CRC-valid block found at the wrong place is rejected as
+  corruption instead of being read.
+* Directory blocks count against `db_max_size_bytes`; opening and closing a
+  handle without changes writes nothing.
+* `checkpoint()`, `sync()` and `inspect_tail()` release the GIL like
+  `commit()`.
+* All iterators raise `NHyDBError` ("iterator invalidated") on the next step
+  after the same database object discarded data (`rollback()` with pending
+  changes, or a concurrent writer detected with `lock=False`); restart the
+  query.
+
+### Performance
+
+* Query planning: AND/OR/NOT of indexed predicates (OR of two 5-million
+  postings: COUNT 7.9 s → 0.25 s), `ORDER BY … LIMIT` with top-k windows and
+  MIN/MAX/COUNT/SUM/AVG/GROUP BY from a VALUE index (KQ-10M: `ORDER BY tq
+  DESC LIMIT 10` 12.3 s → 0.04 s, `GROUP BY lage` 11.9 s → 0.18 s), ranked
+  FULLTEXT top-k (7.5 s / 2.7 GB → 2.0 s / 1.15 GB), field predicates
+  without index (scan of 10 million records 17.7 s → 2.1 s).
+* Lower memory in `sql()` (`SELECT *` over 5 million rows: peak 12.2 →
+  8.6 GiB), TRIGRAM verification (460 → 55 MiB), NOT (372 → 220 MiB), index
+  builds with spilled runs and the first access to large blocks (+239 MB →
+  +1 MB).
+* Compaction and sparse iteration with bounded memory (~55–60 MB independent
+  of the data; 40 M cells: 57 MB, was ~1.4 GB for 5 M cells); a compaction
+  with backup checks the free disk space first.
+* Sparse cells: one million versions of one cell cost ~0 MB instead of
+  ~300 MB, point read ~0.3 µs instead of ~3 ms; out-of-order single-cell
+  writes no longer slow down quadratically (one million blocks: 269 s →
+  seconds); `COUNT(*)` over 600 000 blocks 0.9 s → 0.1 s.
+* RR6-08: block cache without thrashing under random access (sorted output
+  of 3 million rows on a 64 MiB cache: 157.8 s → 10.1 s).
+
+### Fixed
+
+* **F1: the newest write wins across dense and sparse.** An older
+  `put_cell`/`delete_cell` of a BASE field overrode a later `put` of the same
+  field (`put(x=10)`, `put_cell(x=11)`, `put(x=12)` read 11; also in Python
+  v0.14/v0.27 – a deliberate deviation from the reference). Now fixed on
+  every read path, in the index build and in compaction. No format change;
+  existing files read differently at the affected cells.
+* `delete_cell` on a cell with a stored `None` now deletes it (before:
+  returned `False` and wrote nothing, also inside a batch).
+* `build_indexes()` indexed an old value when a newer `put` used a shape
+  without the indexed field.
+* R9A-04: `get_n_cell`, `get_n(mode="cell"/"auto")`, `get_address` and
+  `describe_n` reported deleted or shape-less BASE values as present.
+* R9D-01: concurrent use of one handle from two threads raised
+  `PanicException` in iterators, `QueryEngine`, `WriteBatch` and a few other
+  places; now `RuntimeError` like every other method.
+* N2: writes that append several blocks (`put_points`, `put_dense_batch`
+  with `extensions_by_u`, `put_extensions(merge=False)`,
+  `put_objects_batch`, `put_objects_numpy`, `delete_record`) are undone
+  completely when a later block fails; before, a partial write could be
+  committed.
+* N1: `ORDER BY … LIMIT` in `sql()` outside the CLASSIC fast path keeps only
+  the top-k rows instead of collecting every candidate row.
+* N3: `python -m nhydb.query` opens the database read-only and no longer
+  blocks or is blocked by writers.
+* Iterators started before `rollback()` could return discarded or wrong
+  values, or raise a false `CorruptionError`; the file was never affected.
+* A module built from the sdist no longer warns about a different source
+  state.
+* Documentation: existence rule per read path, batch memory, `cancel_job`
+  return value, `ResourceLimitError`, `sql(..., lane=None)`, index
+  maintenance.
+
+### Removed
+
+* **Python 3.9, 3.10 and 3.11.** Supported are CPython 3.12–3.15
+  (`requires-python = ">=3.12"`). Existing releases stay installable on older
+  Python versions.
+* **Reading file format 0.16.** Files of NHyDB 0.28.0 and 0.27.1
+  (`NHYDB016`) fail with `CorruptionError` "unsupported file format NHYDB016
+  (expected NHYDB 0.28.2)"; the file stays unchanged. Blocks with the tags
+  `D10D`, `SP10` and `SI10` are rejected. There is no migration path: rebuild
+  such databases from the source data or exports.
+* `delete(realm_id, u)` and `delete_point(realm_id, u, v)` (see *Changed*).
+
 ## [0.28.0] – 2026-10-21
 
 **File format:** the block format is unchanged (`NHYDB016`, superblocks,

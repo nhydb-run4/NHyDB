@@ -12,16 +12,19 @@
 pub mod address;
 pub mod codec;
 pub mod config;
+pub mod container;
 pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod format;
+pub mod limiter;
 pub mod mathexpr;
 pub mod mathlayout;
 pub mod nat;
 pub mod platform;
 pub mod plugin;
 pub mod query;
+pub mod results;
 pub mod schema;
 pub mod setops;
 pub mod sql;
@@ -31,6 +34,7 @@ pub mod unicode;
 #[rustfmt::skip]
 mod unicode_tables;
 pub mod val;
+pub mod valcodec;
 pub mod zlib;
 
 pub use address::{Lane, NL, NR};
@@ -42,6 +46,7 @@ pub use db::layout::{EvolveSpec, LayoutRef, LayoutSpec};
 pub use db::maint::CompactOptions;
 pub use db::read::GetMode;
 pub use db::sparse::{CellInput, MaterializedPoint};
+pub use db::batch::{BatchCell, BatchPhase, BatchStats, BatchWide};
 pub use db::{Db, OpenOptions, SVal};
 pub use error::{Error, Result};
 pub use nat::Nat;

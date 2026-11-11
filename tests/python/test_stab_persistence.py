@@ -63,7 +63,7 @@ def _five_commits(p):
     for u in range(1, 6):
         db.put(1, u, [u, f"rec{u}"], commit=True)
     db.put_points(2, [(7, 3, "sparse", "utf8")], commit=True)
-    db.delete(1, 4)
+    db.delete_record(1, 4)
     db.commit()
     db.put(1, 6, [6, "rec6"], commit=True)
     db.close()

@@ -1,7 +1,7 @@
 # NHyDB Python Cookbook
 
 Practical, copy-and-paste recipes for the Python package
-[`nhydb`](https://pypi.org/project/nhydb/) (version 0.28.0). The recipes
+[`nhydb`](https://pypi.org/project/nhydb/) (version 0.28.2). The recipes
 need no knowledge of the Rust core.
 
 Every Python block in this cookbook is a complete program: it has its own
@@ -46,7 +46,7 @@ NumPy package.
 ## 1. Installation, import and version
 
 ```bash
-python -m pip install nhydb            # prebuilt wheels: CPython 3.9–3.14 on Linux, macOS, Windows
+python -m pip install nhydb            # prebuilt wheels: CPython 3.12–3.15 on Linux, macOS, Windows
 python -m pip install numpy            # optional, for the NumPy batch API (section 16)
 ```
 
@@ -55,19 +55,20 @@ import nhydb
 
 print(nhydb.ENGINE_VERSION)        # product version of the installed package
 print(nhydb.FILE_FORMAT_VERSION)   # identifier of the on-disk format
-assert nhydb.ENGINE_VERSION == "0.28.0"
-assert nhydb.FILE_FORMAT_VERSION == "0.16"
+assert nhydb.ENGINE_VERSION == "0.28.2"
+assert nhydb.FILE_FORMAT_VERSION == "0.28.2"
 ```
 
 ```text
-0.28.0
-0.16
+0.28.2
+0.28.2
 ```
 
-`FILE_FORMAT_VERSION` identifies the block format (file identifier
-`NHYDB016`); it is not a product version. NHyDB 0.28.0 keeps this
-identifier but protects the schema digest with the key: databases created
-with NHyDB 0.27.1 or earlier do not open (section 21).
+`FILE_FORMAT_VERSION` identifies the on-disk format: the engine release
+that defined it. The file starts with the signature `NHYDB` followed by the
+three version bytes 0, 28, 2. Databases of earlier releases – NHyDB 0.28.0
+(file identifier `NHYDB016`) and 0.27.1 or earlier – do not open; they raise
+`CorruptionError` and nothing is changed (section 21).
 
 ---
 
@@ -418,17 +419,15 @@ Carol
 none yet, and `set_realm_default_shape(realm_id, shape_id)` changes it.
 
 **Overwrite and delete.** Writing the same `u` again replaces the record
-(the newest write wins). `delete_record(layout_id, object_id)` is the
-standard way to delete a record completely: it hides the dense record and
-deletes all single cells stored for it (extension values and fields written
-as single cells with `put_cell`, `put_cells_numpy` or `batch()`). It
-returns the number of deleted items (the dense record counts as one, plus
-one per deleted cell). `delete(realm_id, u)` only hides the dense record as
-written by `put`/`put_dense_batch` and returns `True`/`False`; fields
-written afterwards as single cells and extension values stay visible
-through `get_value`/`get_cell`, queries and indexes (section 7). Deleted
-data stays in the append-only file until `compact_file()` removes it
-physically (section 20).
+(the newest write wins). `delete_record(layout_id, object_id)` deletes a
+record completely: every live cell of it – the fields written by `put`,
+fields changed later with `put_cell`, `put_cells_numpy` or `batch()`, and
+extensions. It returns the number of live cells deleted (0 if there was
+nothing to delete). `delete_area(realm_id, u_from, u_to, v_from, v_to)`
+deletes every live cell of a rectangle and returns their number; with a
+`v` range that covers all fields it deletes whole records (section 7).
+Deleted data stays in the append-only file until `compact_file()` removes
+it physically (section 20).
 
 ```python
 import os
@@ -449,16 +448,57 @@ with nhydb.create(path) as db:
     db.put_record(1, 2, {"name": "Ben", "age": 46}, commit=True)   # birthday: replace u=2
     print(db.get_record(1, 2)["age"])
 
-    print(db.delete_record(1, 1, commit=True))                      # number of deleted items
+    print(db.delete_record(1, 1, commit=True))                      # live cells deleted: name, age
     print(db.get_record(1, 1))
-    print(db.delete(1, 3, commit=True), db.get(1, 3))
+    print(db.delete_area(1, 3, 3, 1, 2, commit=True), db.get(1, 3))  # u=3, v1..v2
 ```
 
 ```text
 46
-1
+2
 None
-True None
+2 None
+```
+
+**`put` replaces the record, `put_cell` changes one cell.** `put` (and
+`put_dense_batch`, `put_numpy_batch`) writes the BASE record of the shape it
+uses as a whole; a later `put` with another shape replaces it, so fields the
+new shape lacks are no longer part of the record. `put_cell` changes exactly
+one cell and leaves the others. Whatever way a cell was written last, that
+state is read – a `put` after a `put_cell` reads the `put`. Cells outside the
+shape (extensions, reserved BASE positions, cells written with `put_cell`
+only) follow their own writes; a `put` leaves them alone.
+
+```python
+import os
+import tempfile
+
+import nhydb
+
+path = os.path.join(tempfile.mkdtemp(), "replace.nhydb")
+with nhydb.create(path) as db:
+    db.create_realm(1, "r")
+    db.create_shape(1, 1, "long", [{"v": 1, "name": "x", "type": "varint"}, {"v": 2, "name": "y", "type": "varint"}])
+    db.create_shape(2, 1, "short", [{"v": 1, "name": "x", "type": "varint"}])
+    db.create_classic_layout(1, 1, "c", shape_id=1)
+
+    db.put(1, 1, {"x": 10, "y": 20}, shape_id=1)
+    db.put(1, 1, {"x": 11}, shape_id=2)              # another shape: replaces the record
+    print(db.get_value(1, 1, 1), db.get_cell(1, 1, 2, dyn_address=False)["present"])
+
+    db.put(1, 2, {"x": 10, "y": 20}, shape_id=1)
+    db.put_cell(1, 2, 1, 11)                         # one cell: y stays
+    print(db.get_value(1, 2, 1), db.get_value(1, 2, 2))
+
+    db.put_cell(1, 2, 1, 12)
+    db.put(1, 2, {"x": 13, "y": 20}, shape_id=1)     # the newest write wins
+    print(db.get_value(1, 2, 1))
+```
+
+```text
+11 False
+11 20
+13
 ```
 
 **Enums.** A field can map labels to integer codes. You write and read
@@ -561,22 +601,26 @@ None
 None right
 ```
 
-`delete_cell` returns `True` if the cell had a value and `False` otherwise;
-for an empty cell it writes nothing. `delete(realm, u)` returns `True`/
-`False` in the same way, `delete_record` the number of deleted elements.
-Deleting a single field of a dense record with `delete_cell` makes it read
-as `None`; the other fields stay.
+A cell written with `None` exists: `present` is `True`, and it counts as a
+record cell in SQL. A cell that was never written or was deleted does not.
 
-**Which delete to use.** A record can consist of a dense part (written by
-`put`/`put_dense_batch`) and sparse cells on top of it (fields written
-later with `put_cell`, `put_cells_numpy` or `batch().put_cell`, and
-extensions). `delete_record(layout_id, object_id)` removes both and is the
-way to delete a record completely. `delete(realm, u)` hides only the dense
-part: the sparse cells stay visible to `get_value`, `get_cell`, queries and
-indexes, while `get(realm, u)` returns `None`. Use `delete_cell`/
-`delete_point` to remove individual cells, for example to drop one field
-but keep the extensions. `delete_point` always writes a tombstone and
-returns the write report of `put_points`.
+**The three deletes.** All of them work on logical cells: whether a cell
+is a BASE field or an extension, whether it is stored in the dense record
+or as a single cell, and whether it has a name makes no difference.
+
+* `delete_cell(realm_id, u, v)` deletes one cell and returns `True` if it
+  lived (a stored `None` included); otherwise it returns `False` and writes
+  nothing.
+* `delete_area(realm_id, u_from, u_to, v_from, v_to)` deletes every live
+  cell in the rectangle (bounds inclusive) and returns their number. It is
+  one unit: if it fails (size limit, I/O error), nothing of it is written.
+  Its cost grows with the number of live cells in the area.
+* `delete_record(layout_id, object_id)` deletes every live cell of a record
+  in any layout and returns their number.
+
+Deleting a single field of a dense record with `delete_cell` makes it read
+as `None` (`present` is `False`); the other fields stay. A later `put` or
+`put_cell` writes the cell again.
 Coordinates must be integers: `int`, NumPy integers and integral floats such
 as `3.0` are accepted, `2.7` raises `TypeError` (no silent truncation).
 
@@ -603,8 +647,8 @@ SchemaError: R1,u1,v1: cannot derive a data type; specify type=...
 ```
 
 **Many cells at once.** `put_points(realm_id, cells)` writes a list of
-tuples `(u, v, value)` or `(u, v, value, type)`. `delete_point` is the
-realm-level counterpart of `delete_cell`.
+tuples `(u, v, value)` or `(u, v, value, type)`; `delete_area` deletes a
+block of cells in one call.
 
 ```python
 import os
@@ -623,26 +667,30 @@ with nhydb.create(path) as db:
     ], commit=True)
     print(report["cells"], report["u_groups"])
     print(db.get_value(1, 1, 2), db.get_value(1, 10**30, 7))
-    db.delete_point(1, 2, 1, commit=True)
+    print(db.delete_area(1, 1, 2, 1, 2, commit=True))   # u1..u2, v1..v2: three cells
     print(db.get_value(1, 2, 1))
 ```
 
 ```text
 4 3
 21.0 b'\x00\x01'
+3
 None
 ```
 
-**Collecting single cells: `batch()`.** Many single `put_cell` calls each
-write a small block. `with db.batch(commit=False, u_window=10_000) as b:`
-collects `b.put_cell(...)` and `b.delete_cell(...)` (same arguments as on
-the database) and writes them when the block ends, with one `put_points`
-per realm and lane – fewer, larger blocks and a smaller file. Every call is
-checked immediately (same errors as `put_cell`/`delete_cell`); the last
-call per cell wins; reads inside the block do **not** see the collected
-cells; if the block ends with an exception, nothing is written.
-`commit=True` commits after writing. `b.flush()` writes early,
-`b.discard()` drops the collected cells, `len(b)` counts them.
+**Collecting writes and deletes: `batch()`.** Many single `put_cell` calls
+each write a small block. `with db.batch(commit=False, u_window=10_000) as b:`
+collects `b.put_cell(...)`, `b.delete_cell(...)`, `b.delete_record(...)` and
+`b.delete_area(...)` (same arguments as on the database, without `commit`)
+and writes them when the block ends as one unit – fewer, larger blocks and a
+smaller file. Every call is checked immediately (same errors as the single
+call); the final state is the one the single calls would leave in the same
+order (a cell written before a `delete_area` is deleted by it, one written
+after it stays); reads inside the block do **not** see the collected
+operations; if the block ends with an exception, nothing is written.
+`commit=True` commits after writing. `b.flush()` writes early and returns
+counters (`"deleted"`: live cells deleted by all deletes of the batch),
+`b.discard()` drops the collected operations, `len(b)` counts them.
 
 ```python
 import os
@@ -660,7 +708,7 @@ with nhydb.create(path) as db:
             b.put_cell(1, u, 1, u / 10, type="f64")
         b.put_cell(1, 7, 1, -1.0, type="f64")      # last call per cell wins
         b.delete_cell(1, 5, 1)                     # written as a tombstone at the end
-        print(len(b), db.get_value(1, 7, 1))       # no read-your-writes inside the block
+        print(len(b), db.get_value(1, 7, 1))       # collected calls; no read-your-writes inside the block
     print(db.get_value(1, 7, 1), db.get_value(1, 5, 1), db.get_value(1, 1000, 1))
 
     try:
@@ -673,7 +721,7 @@ with nhydb.create(path) as db:
 ```
 
 ```text
-1000 None
+1002 None
 -1.0 None 100.0
 ValueError
 None
@@ -1146,11 +1194,47 @@ False
 | TRIGRAM | `create_trigram_index(..., ngram=3, casefold=False)` | `utf8` | contains substring |
 | FULLTEXT | `create_fulltext_index(...)` | `utf8` | words, phrases, BM25 ranking |
 
-The field can be given by name or by `v`. Indexes are **not** maintained
-automatically: call `build_indexes()` after writing. An index that is older
-than the data is *stale*; the direct index APIs then raise
-`StaleIndexError`, the QueryEngine falls back to scanning, and `verify()`
-lists it under `warnings`.
+The field can be given by name or by `v`. Build a new index once with
+`build_indexes()`. After that NHyDB **maintains it itself**
+(`[index] maintenance = "auto"`, the default):
+
+* after writes an index answers from its built part plus an in-memory
+  overlay of the changed records – the results are always current;
+* a writer renews the index on its own after a commit once enough records
+  changed (`[index] rebuild_ratio`, default 2 %), when the RAM limiter
+  allows it; large import commits defer it to the next smaller commit.
+
+This holds for all index kinds, FULLTEXT included (terms, phrases, document
+lengths and the BM25 statistics of the ranked search). Only an index without
+a built part (defined, never built), or one whose overlay would exceed
+`[index] overlay_max_bytes`, is *stale*: the direct index APIs then raise
+`StaleIndexError` and the QueryEngine falls back to scanning. `verify()`
+lists built indexes with pending changes under `warnings` (an index that
+was defined but never built is not listed); with `maintenance = "manual"`
+nobody renews them.
+
+**Settings per workload** (`[index]` in `nhydb_config.toml`; the defaults
+suit a mixed workload). The settings depend on each other:
+`crisis_ratio` must not be smaller than `rebuild_ratio`, and the overlay
+never grows beyond `overlay_max_bytes` – it forces the rebuild before
+(≈ 170 bytes per changed record and index group; 256 MiB hold about
+1.5 million changed records of three VALUE indexes).
+
+| Workload | Suggestion | Effect |
+|---|---|---|
+| mostly writing, rare queries | `maintenance = "manual"` and `build_indexes()` in a maintenance window – or a large `rebuild_ratio` (e.g. 0.5) together with `crisis_ratio ≥ rebuild_ratio` and a larger `overlay_max_bytes` | few rebuilds, little dead space; until a rebuild, queries pay the overlay |
+| mixed (default) | `rebuild_ratio = 0.02`, `crisis_ratio = 0.25`, `overlay_max_bytes = 256 MiB` | about one rebuild per 2 % changed records |
+| mostly querying, rare writes | `rebuild_ratio` 0.005–0.01 | the indexes are fresh more often; below 1 % queries hardly get faster, but rebuilds and dead space grow |
+| bulk imports | defaults: commits of at least `bulk_commit_ratio` (0.2 %) of the records defer the rebuild to the next smaller commit | one rebuild after the import instead of one per commit |
+
+Every rebuild writes the whole index again; the old trees remain as dead
+space until `compact_file()` (KQ-10M: about 43 MB per rebuild of three VALUE
+indexes, a FULLTEXT index over 10 million documents about 230 MB). A rebuild
+runs inside the `commit()` that triggers it (KQ-10M about 2 s, FULLTEXT over
+10 million documents about 13 s); a failed rebuild never touches the
+committed data. `health()["checks"]` lists the state per index (`stale`,
+`overlay`) and the maintenance per realm lane (rebuilds, deferrals, last
+decision).
 
 An index returns exactly what a scan returns:
 
@@ -1158,10 +1242,9 @@ An index returns exactly what a scan returns:
   COLUMN, PACKED or CUSTOM layouts the QueryEngine scans instead.
 * `== NaN` never matches; ranges skip `None` and NaN; values that cannot be
   compared with the bounds (text against numbers) simply do not match.
-* `delete(realm, u)` hides the dense fields of a record; extensions and
-  single cells that survive it stay visible to `get_value`/`get_cell`, the
-  QueryEngine and the index (`delete_record` removes them as well,
-  section 7).
+* `delete_area` costs time proportional to the live cells in the area
+  (no constant-time range delete); the deleted data leaves the file only
+  with `compact_file()`.
 * **After updating NHyDB, rebuild existing indexes** with
   `build_indexes(commit=True)`.
 
@@ -1194,12 +1277,9 @@ with nhydb.create(path) as db:
     print(list(db.index_candidates(2, "between", 4000, 6000)))
     print(db.index_candidate_estimate(1, "eq", "IT"))
 
-    db.put(1, 5, ["Eve", "IT", 4800], commit=True)                     # index is now stale
-    try:
-        list(db.find_u(1, {"by_dept": "IT"}))
-    except nhydb.StaleIndexError:
-        print("stale -> rebuild")
-    db.build_indexes([1, 2], commit=True)
+    db.put(1, 5, ["Eve", "IT", 4800], commit=True)                     # built part + overlay
+    print(list(db.find_u(1, {"by_dept": "IT"})))
+    db.build_indexes([1, 2], commit=True)                              # explicit rebuild (optional)
     print(list(db.find_u(1, {"by_dept": "IT"})))
 ```
 
@@ -1211,7 +1291,7 @@ with nhydb.create(path) as db:
 2
 [1, 2]
 {'estimated_rows': 2, 'exact': True, 'key_count': 1}
-stale -> rebuild
+[1, 3, 5]
 [1, 3, 5]
 ```
 
@@ -1344,7 +1424,7 @@ with nhydb.create(path) as db:
 VALUE_INDEX by_region
 ```
 
-> **Tip:** In 0.28.0 `order_by` of `QueryEngine.execute` only takes
+> **Tip:** Since 0.28.0 `order_by` of `QueryEngine.execute` only takes
 > effect for fields that are also listed in `select`. Include the sort
 > fields in `select` (NHySQL `ORDER BY` works without this restriction).
 
@@ -1477,9 +1557,10 @@ with nhydb.create(path) as db:
     ])
     db.create_classic_layout(1, 1, "orders", shape_id=1)
     db.put_dense_batch(1, 1, [
-        [1, "paid", 19.9, "express delivery"], [2, "new", 5.5, None],
+        [1, "paid", 19.9, "express delivery"], [2, "new", 5.5, ""],
         [3, "paid", 120.0, "gift wrap"], [4, "shipped", 7.25, "express delivery requested"],
     ], commit=True)
+    db.delete_cell(1, 2, 4, commit=True)      # order 2 has no note (a DENSE field cannot hold None)
 
     r = db.sql("SELECT status, COUNT(*) AS n, SUM(amount) AS total FROM orders GROUP BY status ORDER BY n DESC")
     print(r["columns"], r["rows"])
@@ -2138,7 +2219,7 @@ size limit reached
 | `[lock] enabled`, `timeout_ms` | lock file and wait time |
 | `[paths] layout_path`, `key_path` | path templates, `{db}` = database file name, `{db_path_hash}` = hash of the absolute database path (for equally named databases sharing a key folder) |
 | `[cache] block_cache_bytes` | budget of the block cache per open object (default 64 MiB, LRU; `0` = no cache); blocks up to max(8 MiB, budget/8) are cached |
-| `[cache] vindex_max_marks`, `vindex_max_indexes` | accepted and checked, not used yet (fixed values) |
+| `[cache] vindex_max_marks`, `vindex_max_indexes` | budget of the cached v-indexes of large sparse u groups (in jump marks) and their number |
 
 Explicit arguments win over the file (`lock=`/`lock_timeout_ms=` override
 the `[lock]` keys one by one). Values stored in the database (the size
@@ -2234,7 +2315,7 @@ with nhydb.open(path) as db:
 ```
 
 ```text
-0.16 200 True
+0.28.2 200 True
 warning [('checkpoint', 'warning')]
 True healthy
 True 0
@@ -2360,12 +2441,12 @@ Rules:
   can access (for example below `%USERPROFILE%`) or point `key_path` there.
 * A backup copy on read-only media can be inspected with
   `nhydb.open(path, readonly=True)`.
-* **Databases of NHyDB 0.27.1 or earlier do not open** with 0.28.0, also
+* **Databases of NHyDB 0.28.0, 0.27.1 or earlier do not open** with 0.28.2, also
   not with `readonly=True`: opening fails closed with `CorruptionError`
-  (the message names 0.27.1) and changes nothing. There is no migration and
+  (the message names the format) and changes nothing. There is no migration and
   `repair_file` cannot convert such a file (its dry run reports
-  `action: "abort"`). Export the data with NHyDB 0.27.1 and re-import it
-  into a new database with 0.28.0.
+  `action: "abort"`). Export the data with the release that wrote it and re-import it
+  into a new database with 0.28.2.
 
 ```python
 import os
@@ -2443,7 +2524,7 @@ with nhydb.open(path, key_path=key) as db:
 ```
 
 ```text
-['secure.nhydb', 'secure.nhydb.layout.enc', 'secure.nhydb.lock'] ['secure.nhydb.layout.key']
+['limiter.txt', 'secure.nhydb', 'secure.nhydb.layout.enc', 'secure.nhydb.lock'] ['secure.nhydb.layout.key']
 key missing -> cannot open
 True
 ```
@@ -2461,6 +2542,7 @@ and the query layer (`QueryError`). Only `IndexConfigError` is a
 NHyDBError
 ├── CorruptionError, SchemaError, StaleIndexError, RealmLimitError, AddressError
 ├── DatabaseLockedError, DatabaseSizeLimitError
+├── ResourceLimitError (reason: cancelled_by_app, cancelled_by_limiter, wait_timeout)
 ├── MathLayoutError ── MathLayoutNotFound, MappingFrozenError, MathCellConflictError
 ├── MathError ── MathSyntaxError, MathDomainError
 ├── LayoutError ── LayoutStateError, RealmBudgetExceeded, StalePlanError, AllocationConflictError
@@ -2704,11 +2786,12 @@ creates its database in a temporary directory:
   opened; a lost key cannot be recovered. Only the schema is encrypted, not
   the data.
 * **Renamed database files** do not open (use `compact_file(output=...)`).
-* **No upgrade of older files.** Databases created with NHyDB 0.27.1 or
-  earlier raise `CorruptionError`; export them with 0.27.1 and re-import
-  the data (section 21).
-* **Indexes** are not maintained automatically (`build_indexes`), cover
-  CLASSIC records only and should be rebuilt after updating NHyDB.
+* **No upgrade of older files.** Databases created with NHyDB 0.28.0,
+  0.27.1 or earlier raise `CorruptionError`; export them with the release
+  that wrote them and re-import the data (section 21).
+* **Indexes** are built once with `build_indexes()` and then maintained
+  automatically (`[index] maintenance = "auto"`, section 13); they cover
+  CLASSIC records only.
 * **NHySQL** is read-only and works on CLASSIC layouts; no `DISTINCT`,
   `HAVING` or joins.
 * **QueryEngine `order_by`** only takes effect for fields listed in
@@ -2718,8 +2801,9 @@ creates its database in a temporary directory:
   accesses read only the needed bytes.
 * **CUSTOM layouts** need their plugin registered after every open;
   plugins must not write to the same database during a callback.
-* **`[cache]` configuration:** only `block_cache_bytes` is used; the
-  `vindex_*` keys are accepted but not used yet.
+* **`[cache]` configuration:** `block_cache_bytes` limits the block cache;
+  `vindex_max_marks`/`vindex_max_indexes` limit the v-indexes of large
+  sparse u groups (section 19).
 * **NumPy coordinate arrays** (`u`, `v`, object ids) are limited to
   `uint64`; use Python `int` lists for larger values.
 * **Durability `full`** raises an error on macOS file systems without
@@ -2802,11 +2886,11 @@ writing methods with a lane accept *`lane=None`* (`NL`).
 | `put_object(layout_id, object_id, values)`, `put_objects_batch(layout_id, objects)` | records of any layout | *u_window* | 17 |
 | `put_cell(realm_id, u, v, value)` | one cell | *type* | 7 |
 | `put_points(realm_id, cells)` | many cells `(u, v, value[, type])` | *u_window* | 7 |
-| `batch()` → `WriteBatch` | context manager collecting `put_cell`/`delete_cell`; `flush()`, `discard()`, `len()` | *commit=False, u_window=10000* | 7 |
+| `batch()` → `WriteBatch` | context manager collecting `put_cell`/`delete_cell`/`delete_record`/`delete_area`, written as one unit; `flush()` (counters incl. `deleted`), `discard()`, `len()` | *commit=False, u_window=10000* | 7 |
 | `put_extensions(realm_id, u, mapping)`, `put_extension_list(realm_id, u, vs, values)`, `put_extension_range(realm_id, u, start_v, values)` | extension values | *merge=True* | 8 |
-| `delete_record(layout_id, object_id)` | delete a record completely (dense record plus its single cells and extensions); returns the number of deleted items | | 6, 7 |
-| `delete(realm_id, u)` | hide only the dense record; later single cells and extensions stay visible; returns `True`/`False` | | 6, 7 |
-| `delete_cell(realm_id, u, v)`, `delete_point(realm_id, u, v)` | delete single cells; `delete_cell` returns `True`/`False`, `delete_point` the write report | | 7 |
+| `delete_record(layout_id, object_id)` | delete a record completely (every live cell: fields, single cells, extensions); returns the number of live cells deleted | | 6, 7 |
+| `delete_area(realm_id, u_from, u_to, v_from, v_to)` | delete every live cell of a rectangle (bounds inclusive), one unit; returns the number of live cells deleted | | 6, 7 |
+| `delete_cell(realm_id, u, v)` | delete one cell; `True` if it lived (a stored `None` included) | | 7 |
 
 ### 27.5 `NHyDB` – reading and addresses
 

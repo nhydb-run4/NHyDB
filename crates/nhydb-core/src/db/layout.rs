@@ -13,6 +13,14 @@ use crate::format::*;
 use crate::nat::Nat;
 use crate::plugin::{LayoutPlugin, PluginMethod};
 use crate::schema::{LayoutDef, LayoutKind};
+
+/// Entries of the field type cache before its older half is evicted. Kept
+/// at 3/8 of the 2^17 buckets the map reaches: the tombstones the eviction
+/// leaves then always allow an in-place rehash. Near the old bound of 65 536
+/// (more than half of the bucket capacity) the map sometimes doubled its
+/// table on a rehash and briefly held both (RUN8 QA: +38 MB in
+/// `memory_bounds`).
+const FIELD_META_MAX: usize = 49_152;
 use crate::val::Val;
 use crate::vmap;
 
@@ -321,7 +329,7 @@ impl Db {
         for lane in [0u8, 1] {
             let mut ranges: Vec<(Nat, Nat)> = Vec::new();
             if let Some(idx) = self.dense.get(&(realm.clone(), lane)) {
-                for seg in idx.sorted() {
+                for seg in &idx.idx.collect_by_start(self)? {
                     for ch in &risky {
                         let lo = seg.u_start.clone().max(ch.from.clone());
                         let hi = match &ch.to {
@@ -359,7 +367,7 @@ impl Db {
         let mut sparse_seen: std::collections::HashSet<(Lane, Nat)> = std::collections::HashSet::new();
         for lane in [0u8, 1] {
             if let Some(idx) = self.sparse.get(&(realm.clone(), lane)) {
-                for seg in &idx.segs {
+                for seg in &idx.idx.collect_block_order(self)? {
                     let touched = risky.iter().any(|ch| {
                         seg.u_end >= ch.from && ch.to.as_ref().map(|t| &seg.u_start <= t).unwrap_or(true)
                     });
@@ -382,7 +390,7 @@ impl Db {
         let mut groups: u64 = 0;
         for (lane, u) in &sparse_u {
             let m = self.sparse_updates_for_u(realm, u, *lane)?;
-            let live = m.values().filter(|s| !s.is_tomb()).count() as u64;
+            let live = m.values().filter(|(s, _)| !s.is_tomb()).count() as u64;
             sparse_cells += live;
             if live > 0 {
                 groups += 1;
@@ -1200,15 +1208,28 @@ impl Db {
     /// Declared field type of an address (`_field_meta_for_address`).
     pub fn field_meta_for_address(&self, realm: &Nat, u: &Nat, v: &Nat) -> Result<Option<FieldDef>> {
         let key = (realm.clone(), u.clone(), v.clone());
-        if let Some(c) = self.cache().field_meta.get(&key) {
-            return Ok(c.clone());
+        {
+            let mut c = self.cache();
+            c.field_meta_tick += 1;
+            let tick = c.field_meta_tick;
+            if let Some((f, used)) = c.field_meta.get_mut(&key) {
+                *used = tick;
+                return Ok(f.clone());
+            }
         }
         let result = self.compute_field_meta(realm, u, v)?;
         let mut c = self.cache();
-        if c.field_meta.len() > 65536 {
-            c.field_meta.clear();
+        if c.field_meta.len() > FIELD_META_MAX {
+            // RUN8: the least recently used half goes (no full reset that
+            // makes a working set above the bound start from scratch)
+            let mut used: Vec<u64> = c.field_meta.values().map(|(_, t)| *t).collect();
+            let mid = used.len() / 2;
+            let cutoff = *used.select_nth_unstable(mid).1;
+            c.field_meta.retain(|_, (_, t)| *t > cutoff);
         }
-        c.field_meta.insert(key, result.clone());
+        c.field_meta_tick += 1;
+        let tick = c.field_meta_tick;
+        c.field_meta.insert(key, (result.clone(), tick));
         Ok(result)
     }
 

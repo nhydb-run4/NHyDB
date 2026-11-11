@@ -268,6 +268,10 @@ pub struct ColumnsOut {
     pub names: Vec<String>,
     pub cols: Vec<OutCol>,
     pub present: Vec<u8>,
+    /// E3: per requested field, 1 where the cell lives (a stored `None`
+    /// included), 0 where it does not (never written, deleted, field missing
+    /// from the stored shape, record missing); only with `masks`
+    pub cell_masks: Option<Vec<Vec<u8>>>,
 }
 
 impl Db {
@@ -315,48 +319,52 @@ impl Db {
                 ordered.push(c);
             }
             let extra: Vec<&(String, ColData)> = cols.iter().filter(|(nm, _)| shape.by_name(nm).is_none()).collect();
-            let (mut blocks, mut bytes, mut cells) = (0i64, 0i64, 0i64);
-            let mut a = 0usize;
-            while a < n {
-                let mut b = a + 1;
-                while b < n && oids[b] == oids[b - 1].add_u64(1) {
-                    b += 1;
-                }
-                let run: Vec<ColData> = ordered.iter().map(|c| c.slice(a, b)).collect();
-                let mut ext: Vec<(Nat, Vec<(Val, Val)>)> = Vec::new();
-                if !extra.is_empty() {
-                    for (i, oid) in oids.iter().enumerate().take(b).skip(a) {
-                        let items: Vec<(Val, Val)> = extra
-                            .iter()
-                            .filter_map(|(nm, c)| {
-                                let v = c.get_val(i);
-                                if v.is_none() { None } else { Some((Val::str(nm), v)) }
-                            })
-                            .collect();
-                        if !items.is_empty() {
-                            ext.push((oid.clone(), items));
+            // N2 (RUN8): one DATA block per contiguous run, all or none
+            let (blocks, bytes, cells) = self.write_scope(|db| {
+                let (mut blocks, mut bytes, mut cells) = (0i64, 0i64, 0i64);
+                let mut a = 0usize;
+                while a < n {
+                    let mut b = a + 1;
+                    while b < n && oids[b] == oids[b - 1].add_u64(1) {
+                        b += 1;
+                    }
+                    let run: Vec<ColData> = ordered.iter().map(|c| c.slice(a, b)).collect();
+                    let mut ext: Vec<(Nat, Vec<(Val, Val)>)> = Vec::new();
+                    if !extra.is_empty() {
+                        for (i, oid) in oids.iter().enumerate().take(b).skip(a) {
+                            let items: Vec<(Val, Val)> = extra
+                                .iter()
+                                .filter_map(|(nm, c)| {
+                                    let v = c.get_val(i);
+                                    if v.is_none() { None } else { Some((Val::str(nm), v)) }
+                                })
+                                .collect();
+                            if !items.is_empty() {
+                                ext.push((oid.clone(), items));
+                            }
                         }
                     }
-                }
-                let res = self.put_dense_batch(
-                    &lay.realm_id,
-                    &oids[a],
-                    &DenseRows::Columns { cols: &run, count: b - a },
-                    Some(sid),
-                    &ext,
-                    lane,
-                    false,
-                )?;
-                blocks += 1;
-                bytes += res.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
-                cells += ((b - a) * shape.fields.len()) as i64;
-                if let Some(s) = res.get("sparse").filter(|s| s.is_truthy()) {
+                    let res = db.put_dense_batch(
+                        &lay.realm_id,
+                        &oids[a],
+                        &DenseRows::Columns { cols: &run, count: b - a },
+                        Some(sid),
+                        &ext,
+                        lane,
+                        false,
+                    )?;
                     blocks += 1;
-                    bytes += s.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
-                    cells += s.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
+                    bytes += res.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+                    cells += ((b - a) * shape.fields.len()) as i64;
+                    if let Some(s) = res.get("sparse").filter(|s| s.is_truthy()) {
+                        blocks += 1;
+                        bytes += s.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+                        cells += s.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
+                    }
+                    a = b;
                 }
-                a = b;
-            }
+                Ok((blocks, bytes, cells))
+            })?;
             if commit {
                 self.commit()?;
             }
@@ -444,6 +452,26 @@ impl Db {
         lane: Lane,
         allow_object: bool,
     ) -> Result<ColumnsOut> {
+        self.read_columns_ext(realm, u_start, count, fields, lane, allow_object, false)
+    }
+
+    /// `read_columns` with optional cell masks (E3, `read_numpy(masks=True)`).
+    ///
+    /// `present` (`_present`) follows the existence rule of the cell cursor
+    /// and SQL (R9E-02): a record exists when at least one of its cells
+    /// lives – a DENSE record whose cells are all tombstoned does not, a u
+    /// with live SPARSE cells only does (its values are read from them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_columns_ext(
+        &self,
+        realm: &Nat,
+        u_start: &Nat,
+        count: usize,
+        fields: Option<&[Val]>,
+        lane: Lane,
+        allow_object: bool,
+        masks: bool,
+    ) -> Result<ColumnsOut> {
         self.require_realm(realm)?;
         address::require_positive("u_start", u_start)?;
         let base = self.current_base_shape(realm);
@@ -495,10 +523,20 @@ impl Db {
         }
         let mut present: Vec<u8> = Vec::new();
         present.try_reserve_exact(count).map_err(|e| Error::Memory(format!("cannot allocate {count} result rows: {e}")))?;
+        let mut cmask: Vec<Vec<u8>> = Vec::new();
+        if masks {
+            for _ in 0..wanted.len() {
+                let mut m: Vec<u8> = Vec::new();
+                m.try_reserve_exact(count).map_err(|e| Error::Memory(format!("cannot allocate {count} result rows: {e}")))?;
+                cmask.push(m);
+            }
+        }
+        // per row: does the requested cell live (E3)
+        let mut live: Vec<bool> = vec![false; wanted.len()];
         let key = (realm.clone(), lane);
         let sparse_idx = self.sparse.get(&key);
         let overlay = self.dense_overlap_keys.contains(&key);
-        let check_deletes = !self.deletes.is_empty();
+        let check_deletes = self.has_deletes(&key);
         let ncols = wanted.len();
         let mut row: Vec<Option<Val>> = vec![None; ncols];
         let mut direct: Vec<bool> = vec![false; ncols];
@@ -509,13 +547,13 @@ impl Db {
         let mut gap_start: Option<Nat> = None;
         while done < count {
             // determine the run within one segment
-            let seg = self.resolve_segment(realm, &u, lane);
+            let seg = self.resolve_segment(realm, &u, lane)?;
             match seg {
                 None if gap_start.is_none() => gap_start = Some(u.clone()),
                 None => {}
                 Some(_) => gap_start = None,
             }
-            let run = match seg {
+            let run = match &seg {
                 Some(s) if !overlay => {
                     let left = s.u_end.checked_sub(&u).and_then(|d| d.as_u64()).unwrap_or(0) as usize + 1;
                     left.min(count - done)
@@ -530,7 +568,7 @@ impl Db {
                     // Only the offset table window and the records of the
                     // run are read (whole payload from the cache, or direct
                     // range reads of a block verified earlier, P001/P003).
-                    let acc = self.block_access(seg.block_offset)?;
+                    let acc = self.dense_block_access(&seg)?;
                     let plen = acc.payload_len() as usize;
                     let bad = || Error::Corruption("DATA segment offsets invalid".into());
                     let toff = seg.offsets_offset.checked_sub(seg.payload_offset).ok_or_else(bad)? as usize;
@@ -557,12 +595,11 @@ impl Db {
                         }
                         let uu = if k == 0 { u.clone() } else { u.add_u64(k as u64) };
                         if check_deletes {
-                            if let Some(d) = self.deletes.get(&(realm.clone(), lane, uu.clone())) {
-                                if *d > seg.block_id {
-                                    present.push(0);
-                                    for c in cols.iter_mut() {
-                                        c.push(None, true);
-                                    }
+                            if let Some(d) = self.delete_block_id(&key, &uu)? {
+                                if d > seg.block_id {
+                                    // the DENSE record is deleted; newer SPARSE
+                                    // cells of u may still live
+                                    self.read_sparse_only_row(realm, &uu, sparse_idx, &wanted, &mut cols, &mut present, &mut cmask, &mut hits, allow_object)?;
                                     continue;
                                 }
                             }
@@ -572,7 +609,7 @@ impl Db {
                         let has_sparse = match sparse_idx {
                             Some(si) => {
                                 hits.clear();
-                                si.iv.stab(&uu, &mut hits);
+                                si.idx.stab(self, &uu, &mut hits)?;
                                 !hits.is_empty()
                             }
                             None => false,
@@ -596,6 +633,9 @@ impl Db {
                             }
                             if p == raw.len() {
                                 present.push(1);
+                                for (ci, m) in cmask.iter_mut().enumerate() {
+                                    m.push(plan.contains(&Some(ci)) as u8);
+                                }
                                 for (ci, c) in cols.iter_mut().enumerate() {
                                     if !direct[ci] && !c.push(row[ci].as_ref(), allow_object) {
                                         return Err(Error::Value(format!(
@@ -619,34 +659,77 @@ impl Db {
                             row.iter_mut().for_each(|x| *x = None);
                         }
                         let mut p = 0usize;
+                        live.iter_mut().for_each(|x| *x = false);
                         for (f, ci) in shape.fields.iter().zip(plan.iter()) {
                             match ci {
-                                Some(ci) => row[*ci] = Some(decode_value(f, raw, &mut p)?),
+                                Some(ci) => {
+                                    row[*ci] = Some(decode_value(f, raw, &mut p)?);
+                                    live[*ci] = true;
+                                }
                                 None => skip_value(f, raw, &mut p)?,
                             }
                         }
+                        // live cells of the record (existence rule, R9E-02)
+                        let mut n_live = shape.fields.len();
+                        let mut ext_vs: Vec<Nat> = Vec::new();
                         if p < raw.len() {
                             let (ext, _) = self.decode_extensions(realm, raw, p)?;
                             for (v, x) in ext {
                                 if let Some(ci) = wanted.iter().position(|(_, w)| *w == v) {
                                     row[ci] = Some(x);
+                                    live[ci] = true;
                                 }
+                                ext_vs.push(v);
                             }
+                            n_live += ext_vs.len();
                         }
-                        if let (Some(si), true) = (sparse_idx, has_sparse) {
+                        if let (Some(_), true) = (sparse_idx, has_sparse) {
                             {
-                                hits.sort_unstable();
-                                let upd = self.sparse_states_direct(realm, &uu, si, &hits)?;
+                                hits.sort_unstable_by_key(|s| s.block_id);
+                                let upd = self.sparse_states_direct(realm, &uu, &hits)?;
                                 for (ci, (_, v)) in wanted.iter().enumerate() {
                                     match upd.get(v) {
-                                        Some(SVal::V(x)) => row[ci] = Some(x.clone()),
-                                        Some(SVal::Tomb) => row[ci] = None,
+                                        // F1: older than the record → the record's value
+                                        Some((_, bid)) if super::dense_hides(shape, seg.block_id, v, *bid) => {}
+                                        Some((SVal::V(x), _)) => {
+                                            row[ci] = Some(x.clone());
+                                            live[ci] = true;
+                                        }
+                                        Some((SVal::Tomb, _)) => {
+                                            row[ci] = None;
+                                            live[ci] = false;
+                                        }
                                         None => {}
+                                    }
+                                }
+                                for (v, (st, bid)) in upd.iter() {
+                                    if super::dense_hides(shape, seg.block_id, v, *bid) {
+                                        continue;
+                                    }
+                                    let in_record = shape.by_v(v).is_some() || ext_vs.contains(v);
+                                    match (st, in_record) {
+                                        (SVal::Tomb, true) => n_live -= 1,
+                                        (SVal::V(_), false) => n_live += 1,
+                                        _ => {}
                                     }
                                 }
                             }
                         }
+                        if n_live == 0 {
+                            // every cell of the record is deleted: no record
+                            present.push(0);
+                            for m in cmask.iter_mut() {
+                                m.push(0);
+                            }
+                            for c in cols.iter_mut() {
+                                c.push(None, true);
+                            }
+                            continue;
+                        }
                         present.push(1);
+                        for (ci, m) in cmask.iter_mut().enumerate() {
+                            m.push(live[ci] as u8);
+                        }
                         for (ci, c) in cols.iter_mut().enumerate() {
                             if !c.push(row[ci].as_ref(), allow_object) {
                                 return Err(Error::Value(format!(
@@ -662,10 +745,9 @@ impl Db {
                     }
                 }
                 None => {
-                    present.push(0);
-                    for c in cols.iter_mut() {
-                        c.push(None, true);
-                    }
+                    // no DENSE record: live SPARSE cells of u make a record
+                    // (R9E-02, as the cell cursor and SQL)
+                    self.read_sparse_only_row(realm, &u, sparse_idx, &wanted, &mut cols, &mut present, &mut cmask, &mut hits, allow_object)?;
                 }
             }
             u = u.add_u64(run as u64);
@@ -678,61 +760,156 @@ impl Db {
         if let Some(g) = gap_start {
             self.check_uncovered_u(realm, &g, lane)?;
         }
-        Ok(ColumnsOut { names: wanted.into_iter().map(|(n, _)| n).collect(), cols, present })
+        Ok(ColumnsOut { names: wanted.into_iter().map(|(n, _)| n).collect(), cols, present, cell_masks: masks.then_some(cmask) })
     }
 
-    /// Sparse state of a u group without merge/record cache (batch reads).
-    fn sparse_states_direct(
+    /// One row of `read_columns` for a u without a live DENSE record: the
+    /// newest SPARSE states of u decide (a record exists when one of them is
+    /// a value).
+    #[allow(clippy::too_many_arguments)]
+    fn read_sparse_only_row(
         &self,
         realm: &Nat,
         u: &Nat,
-        idx: &super::SparseKeyIndex,
-        hits: &[usize],
-    ) -> Result<super::SparseMap> {
+        sparse_idx: Option<&super::SparseKeyIndex>,
+        wanted: &[(String, Nat)],
+        cols: &mut [OutCol],
+        present: &mut Vec<u8>,
+        cmask: &mut [Vec<u8>],
+        hits: &mut Vec<super::SparseSegment>,
+        allow_object: bool,
+    ) -> Result<()> {
+        let mut upd = super::SparseMap::new();
+        if let Some(si) = sparse_idx {
+            hits.clear();
+            si.idx.stab(self, u, hits)?;
+            if !hits.is_empty() {
+                hits.sort_unstable_by_key(|s| s.block_id);
+                upd = self.sparse_states_direct(realm, u, hits)?;
+            }
+        }
+        let exists = upd.values().any(|(s, _)| !s.is_tomb());
+        if !exists {
+            present.push(0);
+            for m in cmask.iter_mut() {
+                m.push(0);
+            }
+            for c in cols.iter_mut() {
+                c.push(None, true);
+            }
+            return Ok(());
+        }
+        present.push(1);
+        for (ci, (name, v)) in wanted.iter().enumerate() {
+            let val = match upd.get(v) {
+                Some((SVal::V(x), _)) => Some(x),
+                _ => None,
+            };
+            if let Some(m) = cmask.get_mut(ci) {
+                m.push(val.is_some() as u8);
+            }
+            if !cols[ci].push(val, allow_object) {
+                return Err(Error::Value(format!(
+                    "read_numpy: value {} of field '{}' at u={} does not fit dtype {}; \
+                     use object_fallback=True (object column) or get()/range()",
+                    val.map(|x| x.py_repr()).unwrap_or_default(),
+                    name,
+                    u,
+                    cols[ci].dtype_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Sparse state of a u group without merge/record cache (batch reads).
+    fn sparse_states_direct(&self, realm: &Nat, u: &Nat, hits: &[super::SparseSegment]) -> Result<super::SparseMap> {
         let mut out = super::SparseMap::new();
-        for &i in hits {
-            let seg = &idx.segs[i];
+        for seg in hits {
             if let Some((raw, _)) = self.read_sparse_record_bytes(seg, u)? {
                 for (v, m) in self.decode_sparse_record(realm, u, &raw)? {
-                    out.insert(v, m.value);
+                    out.insert(v, (m.value, seg.block_id));
                 }
             }
         }
         Ok(out)
     }
 
-    /// Logical deletion of an object. CLASSIC: BASE record (DELETE block)
-    /// and live sparse cells of the u group; otherwise all occupied cells
-    /// via tombstone. Returns: number of deleted records + cells.
+    /// Logical deletion of an object (`delete_record`): every live cell of
+    /// it – BASE and extension, DENSE or SPARSE, named or not, a stored
+    /// `None` included. Returns the number of live cells deleted (0: there
+    /// was nothing to delete, nothing is written).
+    /// The layout of a `delete_record` (T-05): a MATH layout id is named as
+    /// such – its cells belong to the MATH layout, which has no delete.
+    pub fn delete_layout(&self, r: &LayoutRef) -> Result<&crate::schema::LayoutDef> {
+        match self.layout_by_ref(r) {
+            Err(Error::Schema(_)) if matches!(r, LayoutRef::Id(id) if self.math_layouts.contains_key(id)) => {
+                let LayoutRef::Id(id) = r else { unreachable!() };
+                Err(Error::Schema(format!("layout {id} is a MATH layout; delete_record does not apply to MATH layouts (their cells are written by the MATH layout only)")))
+            }
+            other => other,
+        }
+    }
+
     pub fn delete_object(&mut self, r: &LayoutRef, obj: &Nat, lane: Lane, commit: bool) -> Result<u64> {
-        let lay = self.layout_by_ref(r)?.clone();
+        let lay = self.delete_layout(r)?.clone();
         address::require_positive("object_id", obj)?;
-        let mut n = 0u64;
-        let mut tombs: Vec<CellInput> = Vec::new();
-        if lay.kind == LayoutKind::Classic {
-            if self.delete(&lay.realm_id, obj, lane, false)? {
-                n += 1;
+        // N2 (RUN8): the DELETE block and the tombstones are one unit
+        let n = self.write_scope(|db| {
+            let mut tombs: Vec<CellInput> = Vec::new();
+            let n = db.collect_object_delete(&lay, r, obj, lane, &mut tombs)?;
+            if !tombs.is_empty() {
+                db.put_points(&lay.realm_id, tombs, lane, false, 10_000)?;
             }
-            let upd = self.sparse_updates_for_u(&lay.realm_id, obj, lane)?;
-            for (v, s) in upd.iter() {
-                if !s.is_tomb() {
-                    tombs.push(CellInput::tombstone(obj.clone(), v.clone()));
-                }
-            }
-        } else {
-            for nn in self.occupied_n(r, obj, lane)? {
-                let a = address::n_to_address(&nn)?;
-                tombs.push(CellInput::tombstone(a.u().clone(), a.v_local().clone()));
-            }
-        }
-        n += tombs.len() as u64;
-        if !tombs.is_empty() {
-            self.put_points(&lay.realm_id, tombs, lane, false, 10_000)?;
-        }
+            Ok(n)
+        })?;
         if commit {
             self.commit()?;
         }
         Ok(n)
+    }
+
+    /// Deletion of one object without commit: CLASSIC writes the DELETE
+    /// block of a live DENSE record at once and adds the tombstones of the
+    /// u to `tombs`; other layouts add the tombstones of the occupied cells.
+    /// Returns the number of live cells. Must run inside a `write_scope`.
+    pub(crate) fn collect_object_delete(&mut self, lay: &crate::schema::LayoutDef, r: &LayoutRef, obj: &Nat, lane: Lane, tombs: &mut Vec<CellInput>) -> Result<u64> {
+        if lay.kind == LayoutKind::Classic {
+            let live = self.live_cells_of_u(&lay.realm_id, obj, lane)?.len() as u64;
+            if live > 0 {
+                self.delete_classic_u(&lay.realm_id, obj, lane, tombs)?;
+            }
+            return Ok(live);
+        }
+        // the layout names the cells of the object (a CUSTOM plugin may
+        // name empty ones too); deleted and counted is what lives
+        let mut n = 0u64;
+        for nn in self.occupied_n(r, obj, lane)? {
+            let a = address::n_to_address(&nn)?;
+            if self.live_cell_value(&lay.realm_id, a.u(), a.v_local(), lane)?.is_some() {
+                n += 1;
+                tombs.push(CellInput::tombstone(a.u().clone(), a.v_local().clone()));
+            }
+        }
+        Ok(n)
+    }
+
+    /// Full delete of a CLASSIC u group: the DELETE block hides the DENSE
+    /// record; every SPARSE state that is a value gets a tombstone – also
+    /// the states the record hides (F1), which a DELETE alone would let
+    /// show again. The tombstones go to `tombs` (written by the caller).
+    pub(crate) fn delete_classic_u(&mut self, realm: &Nat, u: &Nat, lane: Lane, tombs: &mut Vec<CellInput>) -> Result<()> {
+        if self.resolve_segment(realm, u, lane)?.is_some() {
+            self.delete_record_block(realm, u, lane)?;
+        }
+        if self.sparse.contains_key(&(realm.clone(), lane)) {
+            for (v, (s, _)) in self.sparse_updates_for_u(realm, u, lane)?.iter() {
+                if !s.is_tomb() {
+                    tombs.push(CellInput::tombstone(u.clone(), v.clone()));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

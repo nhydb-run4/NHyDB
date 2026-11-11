@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "nhydb-core"
-version = "0.28.0"
+version = "0.28.2"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "nhydb-py"
-version = "0.28.0"
+version = "0.28.2"
 dependencies = [
  "nhydb-core",
  "num-bigint",

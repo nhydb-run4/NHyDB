@@ -30,7 +30,7 @@ def _build(p, n, batch):
     db.put_cells_numpy(1, 7, np.arange(1000, 1000 + 5000, dtype=np.int64),
                        np.arange(5000, dtype=np.float64), type="f64")
     db.put_cell(1, 9, 3, 1.5, type="f64")
-    db.delete(1, 11)
+    db.delete_record(1, 11)
     db.commit()
     db.close()
 
@@ -153,7 +153,7 @@ def test_selective_cell_decoder_equals_full_record(tmp_path):
                               for u in range(1, 301)], shape_id=1)
     db.set_realm_default_shape(1, 2)
     db.put_dense_batch(1, 301, [(u, "", 0.5, b"", u, u * 7) for u in range(301, 351)], shape_id=2)
-    db.delete(1, 17)
+    db.delete_record(1, 17)
     db.commit()
     us = [1, 2, 3, 16, 17, 18, 150, 300, 301, 333, 350, 351]
     vs = [1, 2, 3, 4, 5, 6, 7, "s", "late"]

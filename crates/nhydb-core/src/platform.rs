@@ -253,6 +253,39 @@ pub fn atomic_replace(src: &Path, dst: &Path, mode: Durability) -> Result<()> {
     sync_renamed(dst, mode)
 }
 
+/// Renames `src` to `dst` only if `dst` does not exist, atomically (RD4-08:
+/// no check-then-rename race): a hard link `dst` is created (fails if it
+/// exists), then the name `src` is removed – the file, its open handles and
+/// their locks stay the same. Where hard links are not supported the
+/// existence check followed by a rename is the fallback.
+pub fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => std::fs::remove_file(src),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            if dst.exists() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(src, dst)
+        }
+    }
+}
+
+/// Whether a process with this id runs (Unix: `kill(pid, 0)`; elsewhere
+/// always assumed, so nothing of a foreign process is taken away).
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else { return true };
+    // SAFETY: signal 0 only checks for existence and permission
+    let r = unsafe { libc::kill(p, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+pub fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Makes a completed rename to `dst` durable. Unix: nothing to do here (the
 /// caller syncs the directory with [`sync_dir`]). Windows: flushes `dst`
 /// (see [`atomic_replace`]).
@@ -324,12 +357,106 @@ pub fn create_new(path: &Path, secret: bool) -> Result<File> {
     Ok(f)
 }
 
+/// Free bytes available to this user on the file system of `dir`
+/// (`None` where it cannot be determined).
+#[cfg(unix)]
+pub fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path, `st` a writable struct
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(windows)]
+pub fn free_space(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Creates an anonymous temporary file in `dir` (read/write, owner only):
+/// the name is removed right after creation (Unix: `unlink`; Windows: POSIX
+/// delete semantics, NTFS on Windows 10 1709+). Where Windows cannot do that,
+/// `FILE_FLAG_DELETE_ON_CLOSE` deletes the file when it is closed. Nothing is
+/// left behind after a crash or `kill -9`, and no other process can open it
+/// by name (RB-02/RB-03, RD4-01).
+pub fn anonymous_temp(dir: &Path, stem: &str) -> Result<File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..16 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let path = dir.join(format!(".{stem}_{}_{n}_{t:08x}.tmp", std::process::id()));
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_DELETE_ON_CLOSE; share read/write/delete
+            o.custom_flags(0x0400_0000).share_mode(0x7);
+        }
+        match o.open(&path) {
+            Ok(f) => {
+                #[cfg(unix)]
+                std::fs::remove_file(&path).map_err(|e| Error::IoPath(e, path.as_path().into()))?;
+                #[cfg(windows)]
+                unlink_open(&path);
+                return Ok(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(Error::IoPath(e, path.into_boxed_path())),
+            Err(e) => return Err(Error::IoPath(e, path.into_boxed_path())),
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Value("no temporary file name available".into())))
+}
+
+/// Windows: removes the name of an open file at once (POSIX delete
+/// semantics). Windows unlinks a POSIX-deleted file when the handle that
+/// set the disposition is closed, so a second handle (DELETE access only)
+/// sets it and is closed right away; the caller's handle stays usable and
+/// the name cannot be opened any more (measured on NTFS, Windows 11).
+/// Returns false where the file system or Windows version cannot (the file
+/// is then deleted when the caller's handle is closed).
+#[cfg(windows)]
+fn unlink_open(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfoEx, SetFileInformationByHandle, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX,
+    };
+    // DELETE access only; share read/write/delete with the caller's handle
+    let Ok(h) = std::fs::OpenOptions::new().access_mode(0x0001_0000).share_mode(0x7).open(path) else {
+        return false;
+    };
+    let info = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+    // SAFETY: valid handle `h`; `info` lives across the call, size matches
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            h.as_raw_handle() as _,
+            FileDispositionInfoEx,
+            (&info as *const FILE_DISPOSITION_INFO_EX).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        ) != 0
+    };
+    drop(h); // the name goes now
+    ok
+}
+
 /// Copies `src` to the new file `dst` and makes the copy durable (file and
 /// directory synchronized) – used for backups before in-place changes.
 /// OS errors name the affected file (`Error::IoPath`, F048): `src` for
 /// opening it, `dst` for everything else.
 pub fn durable_copy(src: &Path, dst: &Path, mode: Durability) -> Result<()> {
-    let mut input = File::open(src).map_err(|e| Error::IoPath(e, src.to_path_buf()))?;
+    let mut input = File::open(src).map_err(|e| Error::IoPath(e, src.into()))?;
     let mut out = create_new(dst, false).map_err(|e| e.at_path(dst))?;
     let res = (|| -> Result<()> {
         std::io::copy(&mut input, &mut out)?;
@@ -415,6 +542,106 @@ pub fn local_timestamp() -> String {
 // ----------------------------------------------------------------------
 // File locks
 // ----------------------------------------------------------------------
+
+// Owner locks of managed result files (RD4-02). Owners (writers, open
+// results) hold a shared lock, `cleanup_results` removes a file only while
+// it holds the exclusive lock. On Unix these are `flock` locks over the
+// whole file. Windows byte-range locks are mandatory: a shared lock over
+// the data forbids writes through every handle, the owner's own included
+// (ERROR_LOCK_VIOLATION, P-01). There the owner locks one byte far beyond
+// any real file size; writes never touch it, while the exclusive lock of
+// `cleanup_results` (whole range) still collides with it.
+
+/// Windows: offset of the owner's lock byte (beyond every real file size).
+#[cfg(windows)]
+pub const OWNER_LOCK_OFFSET: u64 = (1 << 63) - 1;
+
+/// Takes the owner's shared lock without waiting.
+#[cfg(not(windows))]
+pub fn lock_owner_shared(f: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    f.try_lock_shared()
+}
+
+#[cfg(windows)]
+pub fn lock_owner_shared(f: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    lock_range(f, false, OWNER_LOCK_OFFSET, 1)
+}
+
+/// Releases the owner's lock explicitly (errors ignored: no lock held, or
+/// a file system without locks).
+#[cfg(not(windows))]
+pub fn unlock_owner(f: &File) {
+    let _ = f.unlock();
+}
+
+#[cfg(windows)]
+pub fn unlock_owner(f: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    let mut ov = overlapped_at(OWNER_LOCK_OFFSET);
+    // SAFETY: valid handle of `f`, `ov` lives across the synchronous call
+    unsafe { UnlockFileEx(f.as_raw_handle() as _, 0, 1, 0, &mut ov) };
+}
+
+/// Exclusive lock over the whole file without waiting (`cleanup_results`);
+/// collides with every owner lock. Released when `f` is closed.
+#[cfg(not(windows))]
+pub fn try_lock_exclusive_all(f: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    f.try_lock()
+}
+
+#[cfg(windows)]
+pub fn try_lock_exclusive_all(f: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    lock_range(f, true, 0, u64::MAX)
+}
+
+#[cfg(windows)]
+fn overlapped_at(off: u64) -> windows_sys::Win32::System::IO::OVERLAPPED {
+    // SAFETY: OVERLAPPED is plain data, all-zero is its documented start state
+    let mut ov: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.Anonymous.Anonymous.Offset = off as u32;
+    ov.Anonymous.Anonymous.OffsetHigh = (off >> 32) as u32;
+    ov
+}
+
+#[cfg(windows)]
+fn lock_range(f: &File, exclusive: bool, off: u64, len: u64) -> std::result::Result<(), std::fs::TryLockError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+    let mut ov = overlapped_at(off);
+    let flags = LOCKFILE_FAIL_IMMEDIATELY | if exclusive { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+    // SAFETY: valid handle of `f` (synchronous), `ov` lives across the call
+    let ok = unsafe { LockFileEx(f.as_raw_handle() as _, flags, 0, len as u32, (len >> 32) as u32, &mut ov) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(c) if c == ERROR_LOCK_VIOLATION as i32 || c == ERROR_IO_PENDING as i32 => Err(std::fs::TryLockError::WouldBlock),
+        _ => Err(std::fs::TryLockError::Error(e)),
+    }
+}
+
+/// A file handle holding an owner lock; the lock is released explicitly
+/// when it is dropped (not left to closing the handle).
+#[derive(Debug)]
+pub struct OwnerLock(File);
+
+impl OwnerLock {
+    pub fn new(f: File) -> OwnerLock {
+        OwnerLock(f)
+    }
+    pub fn file(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        unlock_owner(&self.0);
+    }
+}
 
 /// Locking behaviour (from `nhydb_config.toml`, section `[lock]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,6 +792,74 @@ mod tests {
         assert!(b.is_held());
         let off = DbLock::acquire(&db, LockConfig { enabled: false, timeout_ms: 0 }).unwrap();
         assert!(!off.is_held());
+    }
+
+    /// P-01: the owner writes under its own lock (Windows refused this with
+    /// ERROR_LOCK_VIOLATION), the exclusive lock of `cleanup_results` waits
+    /// for every owner, and an explicit release frees the file while the
+    /// handle stays open.
+    #[test]
+    fn owner_lock_allows_own_writes_blocks_cleanup_and_is_released() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::fs::TryLockError::WouldBlock;
+        let d = tmpdir("ownerlock");
+        let p = d.join("r.nhyc.part");
+        let mut w = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&p).unwrap();
+        lock_owner_shared(&w).unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
+        w.write_all(&data).unwrap();
+        write_all_at(&w, b"head", 0).unwrap();
+        w.sync_all().unwrap();
+        // a reader of another handle sees the data, the cleaner must wait
+        let mut back = Vec::new();
+        File::open(&p).unwrap().read_to_end(&mut back).unwrap();
+        assert_eq!(back.len(), data.len());
+        assert_eq!(&back[..4], b"head");
+        let cleaner = File::open(&p).unwrap();
+        assert!(matches!(try_lock_exclusive_all(&cleaner), Err(WouldBlock)));
+        // a second owner (open result) shares the lock
+        let second = OwnerLock::new(File::open(&p).unwrap());
+        lock_owner_shared(second.file()).unwrap();
+        // explicit release of the writer, handle still open and writable
+        unlock_owner(&w);
+        w.seek(SeekFrom::End(0)).unwrap();
+        w.write_all(b"tail").unwrap();
+        assert!(matches!(try_lock_exclusive_all(&cleaner), Err(WouldBlock)), "second owner still holds");
+        drop(second);
+        try_lock_exclusive_all(&cleaner).expect("all owners released");
+        // while the cleaner holds it, no new owner gets in
+        let late = File::open(&p).unwrap();
+        assert!(matches!(lock_owner_shared(&late), Err(WouldBlock)));
+        drop(cleaner);
+        lock_owner_shared(&late).expect("cleaner released on close");
+        unlock_owner(&late);
+        // releasing twice or without a lock is harmless
+        unlock_owner(&late);
+        drop((w, late));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// RD4-01: an anonymous temporary file has no name in its directory while
+    /// it is open (Windows: POSIX delete on NTFS), and stays usable.
+    #[test]
+    fn anonymous_temp_has_no_name_and_stays_usable() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let d = tmpdir("anon");
+        let mut f = anonymous_temp(&d, "nhydb-sortrun").unwrap();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "no directory entry while open");
+        let mut f2 = anonymous_temp(&d, "nhydb-sortrun").unwrap();
+        f2.write_all(b"second").unwrap();
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "two open runs, still no entry");
+        drop(f2);
+        let data = vec![42u8; 1 << 20];
+        f.write_all(&data).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut back = Vec::new();
+        f.read_to_end(&mut back).unwrap();
+        assert_eq!(back, data);
+        drop(f);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

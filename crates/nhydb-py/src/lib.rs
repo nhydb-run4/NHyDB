@@ -18,6 +18,7 @@ mod iter;
 mod kernel;
 mod mathapi;
 mod queryapi;
+mod resultapi;
 mod numpy_io;
 mod pyplugin;
 mod textapi;
@@ -213,7 +214,7 @@ fn open_opts(
 ) -> PyResult<OpenOptions> {
     let sync_mode = durability.map(SyncMode::parse).transpose().py()?;
     let lock = nhydb_core::platform::LockOverride { enabled: lock, timeout_ms: lock_timeout_ms };
-    Ok(OpenOptions { readonly, sync_mode, layout_path, key_path, config: None, config_path: config, lock, internal_compaction: false })
+    Ok(OpenOptions { readonly, sync_mode, layout_path, key_path, config: None, config_path: config, lock, internal_compaction: false, ignore_directory: false })
 }
 
 /// F048: OS errors of open/create/maintenance carry errno and the file name
@@ -423,7 +424,7 @@ impl NHyDB {
             ..Default::default()
         };
         let r = queryapi::run_core(py, &self.db, |eng| eng.execute(&e, &opts))?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     /// `sql(text, parameters=None, *, lane=0)`: a read-only NHySQL SELECT.
@@ -431,7 +432,72 @@ impl NHyDB {
     fn sql(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
         let r = queryapi::run_core(py, &self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
-        from_val(py, &r)
+        from_val_owned(py, r)
+    }
+
+    /// `sql_iter(text, parameters=None, *, lane=0)` (R4-B): iterator over
+    /// the rows of a SELECT – the same dicts in the same order as
+    /// `sql(...)["rows"]`, built in chunks (memory independent of the result
+    /// size for field queries; COUNT, aggregates and ranked results are
+    /// complete on the first step). Iterator semantics as `select`/`find`:
+    /// lazy, errors on the first `next()` or with the chunk of the row
+    /// concerned, sees writes between steps, ends with `NHyDBError` after a
+    /// rollback of the same object.
+    #[pyo3(signature = (text, parameters=None, *, lane=None))]
+    fn sql_iter(slf: &Bound<'_, Self>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<iter::ResultIterator> {
+        let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
+        Ok(iter::ResultIterator::new(slf.clone().unbind(), iter::Pending::Sql { text: t, params: p, lane: l }))
+    }
+
+    /// `sql_to_file(text, parameters=None, *, path=None, lane=0,
+    /// compress=None)` (R4-C): streams the rows of a SELECT into a result
+    /// file and returns it as `ResultFile`. Without `path` the file is
+    /// managed in the result directory (`[results] temp_dir`, budget
+    /// `[results] budget_bytes`) and deleted on `close()` unless pinned;
+    /// with `path` it belongs to the caller. Memory independent of the
+    /// result size for field queries (`ORDER BY` sorts in runs beyond
+    /// `[results] sort_memory_bytes`).
+    #[pyo3(signature = (text, parameters=None, *, path=None, lane=None, compress=None))]
+    fn sql_to_file(
+        &self,
+        py: Python<'_>,
+        text: &Bound<'_, PyAny>,
+        parameters: Option<&Bound<'_, PyAny>>,
+        path: Option<PathBuf>,
+        lane: Option<&Bound<'_, PyAny>>,
+        compress: Option<bool>,
+    ) -> PyResult<resultapi::PyResultFile> {
+        let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
+        resultapi::write_now(py, &self.db, &t, &p, l, &resultapi::target(path, compress))
+    }
+
+    /// `submit_sql(text, parameters=None, *, path=None, lane=0,
+    /// compress=None)` (R4-C): like `sql_to_file`, but in a background
+    /// thread on a read-only snapshot (the state of the last commit; the
+    /// uncommitted changes of this object are not seen). Returns a
+    /// `ResultJob` (`done()`, `wait(timeout)`, `cancel()`, `rows_written`);
+    /// this object stays usable for reads and writes meanwhile.
+    #[pyo3(signature = (text, parameters=None, *, path=None, lane=None, compress=None))]
+    fn submit_sql(
+        &self,
+        py: Python<'_>,
+        text: &Bound<'_, PyAny>,
+        parameters: Option<&Bound<'_, PyAny>>,
+        path: Option<PathBuf>,
+        lane: Option<&Bound<'_, PyAny>>,
+        compress: Option<bool>,
+    ) -> PyResult<resultapi::PyResultJob> {
+        let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
+        let db = &self.db;
+        let tg = resultapi::target(path, compress);
+        let st = py.detach(|| nhydb_core::results::submit_sql(db, &t, &p, l, tg)).py()?;
+        Ok(resultapi::job(st, db.config.query_max_result_bytes))
+    }
+
+    /// Result directory of this object (`[results] temp_dir`).
+    #[getter]
+    fn result_dir(&self) -> PathBuf {
+        nhydb_core::results::result_dir(&self.db.config)
     }
 
     /// `sql_numpy(text, parameters=None, *, lane=0)`: result of a SELECT as
@@ -440,8 +506,7 @@ impl NHyDB {
     #[pyo3(signature = (text, parameters=None, *, lane=None))]
     fn sql_numpy(&self, py: Python<'_>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), queryapi::sql_params(parameters)?, to_lane(lane)?);
-        let r = queryapi::run_core(py, &self.db, |eng| nhydb_core::sql::execute_sql(eng, &t, &p, l))?;
-        queryapi::rows_to_numpy(py, &r)
+        queryapi::sql_to_numpy(py, &self.db, &t, &p, l)
     }
 
     /// `compile_sql(text, parameters=None, *, lane=0)` → `SQLCompiledQuery`
@@ -472,7 +537,7 @@ impl NHyDB {
         };
         let lane = to_lane(lane)?;
         let r = queryapi::run_core(py, &self.db, |eng| eng.explain(&e, realm, lane, &rm))?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     /// `describe_math(layout_id)`
@@ -554,8 +619,17 @@ impl NHyDB {
     #[pyo3(signature = (layout_id, rows, *, overwrite=false, commit=false))]
     fn put_math_batch(&mut self, py: Python<'_>, layout_id: u64, rows: &Bound<'_, PyAny>, overwrite: bool, commit: bool) -> PyResult<Py<PyAny>> {
         let mut rs = Vec::new();
-        for row in rows.try_iter()? {
+        for (i, row) in rows.try_iter()?.enumerate() {
             let row = row?;
+            // R9E-07: every row is an (inputs, payload) pair
+            let pair = row.cast::<pyo3::types::PySequence>().ok().filter(|_| !row.is_instance_of::<pyo3::types::PyString>() && !row.is_instance_of::<pyo3::types::PyBytes>());
+            let ok = pair.as_ref().is_some_and(|p| p.len().is_ok_and(|n| n == 2));
+            if !ok {
+                return Err(PyTypeError::new_err(format!(
+                    "put_math_batch: row {i} must be an (inputs, payload) pair, got {}",
+                    row.repr().map(|r| r.to_string()).unwrap_or_default()
+                )));
+            }
             let inputs = mathapi::inputs_of(&row.get_item(0)?)?;
             rs.push((inputs, to_val(&row.get_item(1)?)?));
         }
@@ -683,19 +757,21 @@ impl NHyDB {
     /// `fulltext_corpus(index_id, *, lane=0)`
     #[pyo3(signature = (index_id, *, lane=None))]
     fn fulltext_corpus(&self, index_id: u64, lane: Option<&Bound<'_, PyAny>>) -> PyResult<textapi::PyFtCorpus> {
-        Ok(textapi::PyFtCorpus { inner: (*self.db.fulltext_corpus(index_id, to_lane(lane)?).py()?).clone() })
+        Ok(textapi::PyFtCorpus { inner: self.db.fulltext_corpus(index_id, to_lane(lane)?).py()? })
     }
 
     /// `fulltext_payloads(index_id, terms, *, lane=0)` → (dict term→postings, corpus)
     #[pyo3(signature = (index_id, terms, *, lane=None))]
     fn fulltext_payloads<'py>(&self, py: Python<'py>, index_id: u64, terms: &Bound<'py, PyAny>, lane: Option<&Bound<'py, PyAny>>) -> PyResult<(Bound<'py, PyDict>, textapi::PyFtCorpus)> {
         let ts: Vec<String> = terms.try_iter()?.map(|x| x?.str().map(|s| s.to_string())).collect::<PyResult<_>>()?;
-        let (p, c) = self.db.fulltext_payloads(index_id, &ts, to_lane(lane)?).py()?;
+        let lane = to_lane(lane)?;
+        let p = self.db.fulltext_payloads(index_id, &ts, lane).py()?;
+        let c = self.db.fulltext_corpus(index_id, lane).py()?;
         let d = PyDict::new(py);
         for (t, list) in p {
             d.set_item(t, textapi::postings_tuple(py, &list[..])?)?;
         }
-        Ok((d, textapi::PyFtCorpus { inner: (*c).clone() }))
+        Ok((d, textapi::PyFtCorpus { inner: c }))
     }
 
     /// `posting_count(index_id, cond, *, lane=0)`; `cond` is a value or (lo, hi).
@@ -723,7 +799,7 @@ impl NHyDB {
     ) -> PyResult<Py<PyAny>> {
         let ov = |o: Option<&Bound<'_, PyAny>>| -> PyResult<Val> { o.map(to_val).transpose().map(|v| v.unwrap_or(Val::None)) };
         let r = self.db.index_candidate_estimate(index_id, op, &ov(value)?, &ov(value2)?, to_lane(lane)?, &ov(predicate_options)?).py()?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     /// `index_candidates(index_id, op, value=None, value2=None, *, lane=0, predicate_options=None)`
@@ -805,7 +881,7 @@ impl NHyDB {
     }
 
     fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
-        if slf.borrow(py).db.closed {
+        if slf.try_borrow(py)?.db.closed {
             return Err(NHyDBError::new_err("database is closed"));
         }
         Ok(slf)
@@ -885,8 +961,10 @@ impl NHyDB {
     }
 
     #[pyo3(signature = (*, hard=false))]
-    fn sync(&mut self, hard: bool) -> PyResult<()> {
-        self.db.sync(hard).py()
+    fn sync(&mut self, py: Python<'_>, hard: bool) -> PyResult<()> {
+        // A12 (RUN8): fsync without the GIL, like commit()
+        let db = &mut self.db;
+        py.detach(|| db.sync(hard)).py()
     }
 
     fn commit(&mut self, py: Python<'_>) -> PyResult<u64> {
@@ -903,11 +981,14 @@ impl NHyDB {
     }
 
     /// `batch(*, commit=False, u_window=10_000)` (P011): context manager that
-    /// collects `put_cell`/`delete_cell` calls (validated immediately) and
-    /// writes them on leaving the block with one `put_points` per realm and
-    /// lane; `commit=True` commits afterwards. No read-your-writes inside the
-    /// block; on an exception nothing is written, a failed write rolls the
-    /// whole batch back (G3-04).
+    /// collects `put_cell`/`delete_cell`/`delete_record`/`delete_area` calls
+    /// (validated immediately) and writes them on leaving the block in call
+    /// order as one unit; `commit=True` commits afterwards. No read-your-writes
+    /// inside the block; on an exception nothing is written, a failed write
+    /// rolls the whole batch back (G3-04) and consumes it (E2: further calls
+    /// raise `RuntimeError`, leaving the block commits nothing). Memory grows
+    /// with the collected calls (~105 B per cell call, ~86 B per record
+    /// delete) until written; large areas: `delete_area`.
     #[pyo3(signature = (*, commit=false, u_window=10_000))]
     fn batch(slf: &Bound<'_, Self>, commit: bool, u_window: i64) -> PyResult<batch::WriteBatch> {
         if u_window < 1 {
@@ -1173,7 +1254,7 @@ impl NHyDB {
     #[pyo3(signature = (mode="off", *, v=None))]
     fn set_dyn_address_output(slf: Bound<'_, Self>, mode: &str, v: Option<&Bound<'_, PyAny>>) -> PyResult<Py<Self>> {
         let v = opt_nat(v)?;
-        slf.borrow_mut().db.set_dyn_address_output(mode, v).py()?;
+        slf.try_borrow_mut()?.db.set_dyn_address_output(mode, v).py()?;
         Ok(slf.unbind())
     }
 
@@ -1353,7 +1434,7 @@ impl NHyDB {
     fn register_layout_plugin(slf: Bound<'_, Self>, name: String, plugin: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let weak = PyWeakrefReference::new(slf.as_any())?.unbind();
         let p = PyPlugin { obj: plugin.clone().unbind(), db: Some(weak) };
-        slf.borrow_mut().db.register_layout_plugin(&name, Arc::new(p)).py()?;
+        slf.try_borrow_mut()?.db.register_layout_plugin(&name, Arc::new(p)).py()?;
         Ok(plugin.unbind())
     }
 
@@ -1479,21 +1560,7 @@ impl NHyDB {
         let cells = cells_from_py(cells)?;
         let db = &mut self.db;
         let r = py.detach(|| db.put_points(&realm, cells, lane, commit, u_window.max(1) as u64)).py()?;
-        from_val(py, &r)
-    }
-
-    #[pyo3(signature = (realm_id, u, v, *, lane=None, commit=false))]
-    fn delete_point(
-        &mut self,
-        py: Python<'_>,
-        realm_id: &Bound<'_, PyAny>,
-        u: &Bound<'_, PyAny>,
-        v: &Bound<'_, PyAny>,
-        lane: Option<&Bound<'_, PyAny>>,
-        commit: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let lane = to_lane(lane)?;
-        from_val(py, &self.db.delete_point(&to_nat(realm_id)?, &to_nat(u)?, &to_nat(v)?, lane, commit).py()?)
+        from_val_owned(py, r)
     }
 
     #[pyo3(signature = (realm_id=None, lane=None))]
@@ -1579,7 +1646,7 @@ impl NHyDB {
             let db = &mut self.db;
             py.detach(|| db.put_dense_batch(&realm, &us, &DenseRows::Flat { vals: &flat, width }, sid, &ext, lane, commit)).py()?
         };
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     /// Writes one BASE record (`values`: list/tuple or dict).
@@ -1614,7 +1681,7 @@ impl NHyDB {
             _ => return Err(PyTypeError::new_err("values must be a list/tuple or dict")),
         };
         let r = self.db.put(&to_nat(realm_id)?, &to_nat(u)?, vals, sid, ext, lane, commit).py()?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     #[pyo3(signature = (realm_id, u, extensions, *, merge=true, lane=None, commit=false))]
@@ -1687,12 +1754,6 @@ impl NHyDB {
         }
         let lane = to_lane(lane)?;
         from_val(py, &self.db.put_extensions(&realm, &to_nat(u)?, &items, merge, lane, commit).py()?)
-    }
-
-    #[pyo3(signature = (realm_id, u, *, lane=None, commit=false))]
-    fn delete(&mut self, realm_id: &Bound<'_, PyAny>, u: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>, commit: bool) -> PyResult<bool> {
-        let lane = to_lane(lane)?;
-        self.db.delete(&to_nat(realm_id)?, &to_nat(u)?, lane, commit).py()
     }
 
     #[pyo3(signature = (layout_id, object_id, values, *, lane=None, commit=false))]
@@ -1918,7 +1979,7 @@ impl NHyDB {
         };
         let db = &mut self.db;
         let r = py.detach(|| db.build_indexes(ids.as_deref(), commit)).py()?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     #[pyo3(signature = (realm_id, filters, *, lane=None, u_from=None, u_to=None))]
@@ -1976,15 +2037,24 @@ impl NHyDB {
     // Maintenance
     // ------------------------------------------------------------------
 
-    fn checkpoint(&mut self) -> PyResult<u64> {
-        self.db.checkpoint().py()
+    fn checkpoint(&mut self, py: Python<'_>) -> PyResult<u64> {
+        // A12 (RUN8): block + commit (fsync) without the GIL, like commit()
+        let db = &mut self.db;
+        py.detach(|| db.checkpoint()).py()
     }
 
     #[pyo3(signature = (*, deep=false))]
     fn verify(&self, py: Python<'_>, deep: bool) -> PyResult<Py<PyAny>> {
         let db = &self.db;
         let r = py.detach(|| db.verify(deep)).py()?;
-        from_val(py, &r)
+        from_val_owned(py, r)
+    }
+
+    /// E6: removes a leftover `<db>.compacting` staging file of a killed
+    /// in-place compaction; returns the bytes removed (0: none). Needs a
+    /// writer holding the write lock (then no compaction can be running).
+    fn cleanup_compaction(&mut self) -> PyResult<u64> {
+        self.db.remove_compaction_leftover().py()
     }
 
     #[pyo3(signature = (*, deep=false))]
@@ -2018,12 +2088,14 @@ impl NHyDB {
         let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
         let opts = CompactOptions { output, make_backup, rebuild_indexes, batch_records, open };
         let r = with_path(py.detach(|| Db::compact_file(&path, &opts)), &path)?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     #[staticmethod]
     fn inspect_tail(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyAny>> {
-        from_val(py, &with_path(Db::inspect_tail(&path), &path)?)
+        // A12 (RUN8): the full file scan runs without the GIL
+        let r = py.detach(|| Db::inspect_tail(&path));
+        from_val(py, &with_path(r, &path)?)
     }
 
     /// Repairs a database file. Default is a dry run (`apply=False`).
@@ -2052,7 +2124,7 @@ impl NHyDB {
         let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
         let o = RepairOptions { apply, make_backup, rebuild_indexes, allow_data_loss, keep_uncommitted, open };
         let r = with_path(py.detach(|| Db::repair_file_opts(&path, &o)), &path)?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     /// Restores a backup of `repair_file`/`compact_file` (`backup` plus
@@ -2074,7 +2146,7 @@ impl NHyDB {
     ) -> PyResult<Py<PyAny>> {
         let open = open_opts(false, durability, layout_path, key_path, config, lock, lock_timeout_ms)?;
         let r = with_path(py.detach(|| Db::restore_backup(&backup, &path, &open)), &path)?;
-        from_val(py, &r)
+        from_val_owned(py, r)
     }
 
     // ------------------------------------------------------------------
@@ -2116,13 +2188,15 @@ impl NHyDB {
         opt_from_val(py, self.db.get_cell_value(&realm, &u, &to_nat(v)?, lane).py()?)
     }
 
-    /// Deletes a cell (tombstone). Returns `True` if the cell had a value,
-    /// `False` if it was empty – then nothing is written (F047; same
-    /// convention as `delete`, `delete_record` returns the number of
-    /// deleted elements). `commit=True` commits in both cases.
+    /// Deletes one logical cell (BASE or extension, DENSE or SPARSE, named
+    /// or not). Returns `True` if the cell lived – a stored `None` included –
+    /// and is now deleted, `False` if there was no live cell (tombstoned or
+    /// never written); then nothing is written. `commit=True` commits in
+    /// both cases.
     #[pyo3(signature = (realm_id, u, v, *, lane=None, commit=false))]
     fn delete_cell(
         &mut self,
+        py: Python<'_>,
         realm_id: &Bound<'_, PyAny>,
         u: &Bound<'_, PyAny>,
         v: &Bound<'_, PyAny>,
@@ -2134,17 +2208,36 @@ impl NHyDB {
         if !self.db.has_realm(&realm) {
             return Err(SchemaError::new_err("realm missing"));
         }
-        address::require_positive("u", &u).py()?;
-        address::validate_local_v(&v, Some(&realm)).py()?;
-        let exists = !matches!(self.db.get_cell_value(&realm, &u, &v, lane).py()?, None | Some(Val::None));
-        if exists {
-            self.db.delete_point(&realm, &u, &v, lane, commit).py()?;
-        } else {
-            if commit {
-                self.db.commit().py()?;
-            }
+        let db = &mut self.db;
+        py.detach(|| db.delete_cell(&realm, &u, &v, lane, commit)).py()
+    }
+
+    /// Deletes every live cell of the rectangle `u_from..=u_to` ×
+    /// `v_from..=v_to` (bounds inclusive) of a realm – independent of the
+    /// layout, of BASE/extension and of DENSE/SPARSE storage. Returns the
+    /// number of live cells deleted (a stored `None` counts, cells that do
+    /// not exist do not). One unit: on an error nothing of the call stays.
+    #[pyo3(signature = (realm_id, u_from, u_to, v_from, v_to, *, lane=None, commit=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn delete_area(
+        &mut self,
+        py: Python<'_>,
+        realm_id: &Bound<'_, PyAny>,
+        u_from: &Bound<'_, PyAny>,
+        u_to: &Bound<'_, PyAny>,
+        v_from: &Bound<'_, PyAny>,
+        v_to: &Bound<'_, PyAny>,
+        lane: Option<&Bound<'_, PyAny>>,
+        commit: bool,
+    ) -> PyResult<u64> {
+        let lane = to_lane(lane)?;
+        let realm = to_nat(realm_id)?;
+        if !self.db.has_realm(&realm) {
+            return Err(SchemaError::new_err("realm missing"));
         }
-        Ok(exists)
+        let (uf, ut, vf, vt) = (to_nat(u_from)?, to_nat(u_to)?, to_nat(v_from)?, to_nat(v_to)?);
+        let db = &mut self.db;
+        py.detach(|| db.delete_area(&realm, &uf, &ut, &vf, &vt, lane, commit)).py()
     }
 
     /// Writes a logical record via a layout.
@@ -2166,8 +2259,9 @@ impl NHyDB {
         self.get_object(py, layout_id, object_id, lane, false)
     }
 
-    /// Deletes a logical record (CLASSIC: BASE record + sparse cells;
-    /// otherwise all occupied cells via tombstone). Returns deleted cells/records.
+    /// Deletes a logical record completely: every live cell of it (BASE and
+    /// extension, DENSE or SPARSE, named or not, a stored `None` included).
+    /// Returns the number of live cells deleted (0: nothing to delete).
     #[pyo3(signature = (layout_id, object_id, *, lane=None, commit=false))]
     fn delete_record(&mut self, layout_id: &Bound<'_, PyAny>, object_id: &Bound<'_, PyAny>, lane: Option<&Bound<'_, PyAny>>, commit: bool) -> PyResult<u64> {
         let r = self.rlookup(layout_id)?;
@@ -2330,12 +2424,15 @@ impl NHyDB {
     }
 
     /// Reads `count` CLASSIC records starting at `u_start` as dict field name → NumPy array
-    /// plus `"_present"` (bool array). Missing values: 0, NaN or None respectively.
+    /// plus `"_present"` (bool array: the record exists, i.e. at least one of its cells
+    /// lives). Missing values: 0, NaN or None respectively. `masks=True` adds `"_cells"`:
+    /// dict field name → bool array, `True` where that cell lives (a stored `None`
+    /// included), so real values such as `0`/`False` are told apart from missing ones.
     /// The result has exactly `count` rows; each dtype depends only on the field
     /// type. A stored value that does not fit it raises `ValueError` unless
     /// `object_fallback=True` (then that column has dtype object). A `count`
     /// whose result exceeds the physical memory raises `MemoryError`.
-    #[pyo3(signature = (realm_id, u_start, count, fields=None, *, lane=None, object_fallback=false))]
+    #[pyo3(signature = (realm_id, u_start, count, fields=None, *, lane=None, object_fallback=false, masks=false))]
     #[allow(clippy::too_many_arguments)]
     fn read_numpy(
         &self,
@@ -2346,6 +2443,7 @@ impl NHyDB {
         fields: Option<&Bound<'_, PyAny>>,
         lane: Option<&Bound<'_, PyAny>>,
         object_fallback: bool,
+        masks: bool,
     ) -> PyResult<Py<PyAny>> {
         let count = conv::to_count(count, "count")?;
         let lane = to_lane(lane)?;
@@ -2356,12 +2454,19 @@ impl NHyDB {
         let realm = to_nat(realm_id)?;
         let us = to_nat(u_start)?;
         let db = &self.db;
-        let out = py.detach(|| db.read_columns(&realm, &us, count, fs.as_deref(), lane, object_fallback)).py()?;
+        let out = py.detach(|| db.read_columns_ext(&realm, &us, count, fs.as_deref(), lane, object_fallback, masks)).py()?;
         let d = PyDict::new(py);
         for (name, col) in out.names.iter().zip(out.cols) {
             d.set_item(name, numpy_io::out_to_numpy(py, col)?)?;
         }
         d.set_item("_present", numpy_io::out_to_numpy(py, nhydb_core::db::columns::OutCol::Bool(out.present))?)?;
+        if let Some(ms) = out.cell_masks {
+            let cm = PyDict::new(py);
+            for (name, m) in out.names.iter().zip(ms) {
+                cm.set_item(name, numpy_io::out_to_numpy(py, nhydb_core::db::columns::OutCol::Bool(m))?)?;
+            }
+            d.set_item("_cells", cm)?;
+        }
         Ok(d.into_any().unbind())
     }
 }
@@ -2403,6 +2508,22 @@ fn ue_spec(py: Python<'_>, u_end: Option<UEnd>) -> PyResult<Option<Option<Nat>>>
 // ----------------------------------------------------------------------
 // Module functions (address mathematics, codec)
 // ----------------------------------------------------------------------
+
+/// RUN¹⁰: state of the central RAM limiter of the process.
+#[pyfunction]
+fn resource_status(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let s = py.detach(|| nhydb_core::limiter::global().status());
+    from_val(py, &s)
+}
+
+/// RUN¹⁰: cancels a large job of the process (id from
+/// `resource_status()["jobs"]`) at its next checkpoint, also a waiting one;
+/// it ends with `ResourceLimitError` (reason `cancelled_by_app`). Returns
+/// whether the job exists.
+#[pyfunction]
+fn cancel_job(job_id: u64) -> bool {
+    nhydb_core::limiter::global().cancel_job(job_id)
+}
 
 #[pyfunction]
 #[pyo3(signature = (lane=None))]
@@ -2603,14 +2724,23 @@ impl FileView {
     }
 }
 
+/// RUN¹⁰ (R4): a checkpoint may only block a thread that does not hold the
+/// GIL; otherwise the wait is owed and sat out by the binding without it.
+fn may_wait_without_gil() -> bool {
+    // SAFETY: plain query of the interpreter state of this thread
+    unsafe { pyo3::ffi::PyGILState_Check() == 0 }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
+    nhydb_core::limiter::job::set_may_wait(may_wait_without_gil);
     m.add_class::<NHyDB>()?;
     m.add_class::<batch::WriteBatch>()?;
     m.add_class::<PyLayoutDef>()?;
     m.add_class::<PyIndexDef>()?;
     m.add_class::<iter::ResultIterator>()?;
+    resultapi::register(m)?;
     m.add("NHyDBError", py.get_type::<NHyDBError>())?;
     m.add("CorruptionError", py.get_type::<CorruptionError>())?;
     m.add("SchemaError", py.get_type::<SchemaError>())?;
@@ -2635,6 +2765,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("QueryError", py.get_type::<QueryError>())?;
     m.add("QueryPlanError", py.get_type::<QueryPlanError>())?;
     m.add("QueryDomainError", py.get_type::<QueryDomainError>())?;
+    m.add("QueryLimitError", py.get_type::<QueryLimitError>())?;
+    m.add("ResourceLimitError", py.get_type::<ResourceLimitError>())?;
     m.add("SQLSyntaxError", py.get_type::<SQLSyntaxError>())?;
     m.add("REALM_SPAN", nat_py(py, address::realm_span())?)?;
     m.add("ENGINE_VERSION", nhydb_core::format::ENGINE_VERSION)?;
@@ -2648,6 +2780,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         }
         d
     })?;
+    m.add_function(wrap_pyfunction!(resource_status, m)?)?;
+    m.add_function(wrap_pyfunction!(cancel_job, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_lane, m)?)?;
     m.add_function(wrap_pyfunction!(lane_name, m)?)?;
     m.add_function(wrap_pyfunction!(validate_local_v, m)?)?;

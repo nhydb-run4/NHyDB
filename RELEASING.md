@@ -14,9 +14,11 @@ There is **one** product version. It is set in exactly one place – the
 automatically by the Rust crates, the Python package (wheel name and
 metadata) and `nhydb.ENGINE_VERSION`.
 
-The file identifier `NHYDB016` written into every database file is **not**
-a product version. It identifies the on-disk format and only changes when
-the format changes (`crates/nhydb-core/src/format.rs`).
+The file format has a version of its own (`nhydb.FILE_FORMAT_VERSION`,
+currently `0.28.2`; files start with `NHYDB` followed by the version bytes).
+It is the release that defined the format and only changes when the format
+changes (`crates/nhydb-core/src/format.rs`); a release without a format
+change keeps it.
 
 ## Release procedure
 
@@ -44,13 +46,13 @@ the format changes (`crates/nhydb-core/src/format.rs`).
    * checks that tag, `Cargo.toml` version and `CHANGELOG.md` section match,
    * runs the Rust tests (`cargo test --workspace --release`) on Linux,
      macOS and Windows,
-   * builds wheels for CPython 3.9–3.14 on Linux (x86_64, aarch64;
+   * builds wheels for CPython 3.12–3.15 on Linux (x86_64, aarch64;
      manylinux_2_28), macOS (x86_64, arm64) and Windows (x64) plus the
      source distribution,
    * checks the complete file set (`tools/check_dist.py`) and the package
      metadata (`twine check`),
    * installs the wheels and runs the Python tests on every platform with
-     every supported Python version (3.9–3.14, 30 jobs),
+     every supported Python version (3.12–3.15, 20 jobs),
    * creates a **draft** GitHub release with all files. If a release for
      the tag already exists, the job fails and changes nothing.
 7. Check the draft release on GitHub and publish it.
@@ -76,9 +78,10 @@ password or token is stored anywhere). The job only runs if
 
 One-time setup:
 
-1. On pypi.org (account settings → Publishing), add a *pending publisher*
-   for the project `nhydb`: owner `nhydb`, repository `NHyDB`, workflow
-   `release.yml`, environment `pypi`.
+1. On pypi.org (project `nhydb` → Settings → Publishing), add a trusted
+   publisher of type GitHub: owner `nhydb-run4`, repository `NHyDB`,
+   workflow `release.yml`, environment `pypi`. Remove publishers that
+   point to repositories no longer used.
 2. In the GitHub repository settings → Environments, create `pypi` with a
    required reviewer and restrict deployments to tags `v*`.
 3. Create the repository variable `PUBLISH_PYPI` = `true` only when PyPI
@@ -89,5 +92,6 @@ version number.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs the Rust tests and the Python tests
-(against the built wheel) on every push to `main` and on pull requests.
+`.github/workflows/ci.yml` runs Clippy, the Rust tests and the Python tests
+(against the built wheel, CPython 3.12–3.15) on Linux, macOS and Windows on
+every push to `main` and on pull requests. CI never publishes anything.

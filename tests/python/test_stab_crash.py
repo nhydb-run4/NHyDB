@@ -177,7 +177,7 @@ def _record_history(d):
     db.put_points(2, [(u, v, f"c{u}.{v}", "utf8") for u in range(1, 8) for v in (1, 2)])
     db.commit()
     snap("schema+sparse")
-    db.delete(1, 5)
+    db.delete_record(1, 5)
     db.put(1, 7, [70, "overlay"])
     db.commit()
     snap("delete+overlay")

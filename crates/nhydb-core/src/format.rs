@@ -1,23 +1,31 @@
 //! Physical container format.
 //!
-//! File format 0.16 (`NHYDB016`): two alternating 4 KiB superblocks with
-//! CRC32, append-only blocks with a 32-byte header, 8-byte alignment, commit
-//! boundary `last_valid_end`; block types 1–13. Schema/layout metadata
-//! (types 1, 2, 3, 8, 9, 11) is not stored in the DB but encrypted in the
-//! external layout plan.
+//! File format 0.28.2 (signature `NHYDB` + version bytes 0, 28, 2): two
+//! alternating 4 KiB superblocks with CRC32, append-only blocks with a
+//! 32-byte header, 8-byte alignment, commit boundary `last_valid_end`;
+//! block types 1–14. Schema/layout metadata (types 1, 2, 3, 8, 9, 11) is not
+//! stored in the DB but encrypted in the external layout plan. The format
+//! version is the engine release that defined it; this one adds the
+//! persistent block directory (type 14, `db/directory.rs`) and the
+//! superblock field `dir_root`. Files of older formats are not read
+//! (no backward compatibility in the development phase).
 
 use crate::error::{Error, Result};
 
 pub const SUPERBLOCK_SIZE: usize = 4096;
 pub const SUPERBLOCK_COUNT: usize = 2;
 pub const DATA_START: u64 = (SUPERBLOCK_SIZE * SUPERBLOCK_COUNT) as u64;
-pub const SUPER_MAGIC: &[u8; 8] = b"NHYDB016";
-pub const FORMAT_MAJOR: u16 = 0;
-pub const FORMAT_MINOR: u16 = 16;
+/// Format version (major, minor, patch).
+pub const FORMAT_VERSION: [u8; 3] = [0, 28, 2];
+/// Superblock signature: `NHYDB` followed by the three version bytes.
+pub const SUPER_MAGIC: &[u8; 8] = &[b'N', b'H', b'Y', b'D', b'B', FORMAT_VERSION[0], FORMAT_VERSION[1], FORMAT_VERSION[2]];
+/// Superblock version fields (u16 each); the patch level is in the signature.
+pub const FORMAT_MAJOR: u16 = FORMAT_VERSION[0] as u16;
+pub const FORMAT_MINOR: u16 = FORMAT_VERSION[1] as u16;
 pub const BLOCK_MAGIC: &[u8; 4] = b"NHBL";
 pub const BLOCK_VERSION: u8 = 16;
-/// `<8sHHIQQQQQQI` = 8+2+2+4+6*8+4
-pub const SUPER_STRUCT_SIZE: usize = 68;
+/// `<8sHHIQQQQQQIQ` = 8+2+2+4+6*8+4+8
+pub const SUPER_STRUCT_SIZE: usize = 76;
 pub const SUPER_CRC_OFFSET: usize = SUPERBLOCK_SIZE - 4;
 /// `<4sBBHQQII`
 pub const BLOCK_HEADER_SIZE: usize = 32;
@@ -36,6 +44,10 @@ pub const BT_MATH_LAYOUT_STATE: u8 = 11;
 pub const BT_DB_CONFIG: u8 = 12;
 /// R0,u1: DB-internal bootstrap/generation records.
 pub const BT_SYSTEM: u8 = 13;
+/// Persistent block directory (page, run or root, see `db/directory.rs`).
+pub const BT_DIRECTORY: u8 = 14;
+/// Pages and posting chunks of the SECONDARY key trees (0.28.2).
+pub const BT_SECONDARY_PAGE: u8 = 15;
 
 /// Block types stored exclusively in the external layout plan.
 pub const LAYOUT_META_TYPES: [u8; 6] = [BT_REALM, BT_SHAPE, BT_EXTENSION_DEF, BT_LAYOUT_DEF, BT_INDEX_DEF, BT_MATH_LAYOUT_STATE];
@@ -45,14 +57,58 @@ pub fn is_layout_meta(bt: u8) -> bool {
     LAYOUT_META_TYPES.contains(&bt)
 }
 
-pub const DATA_TAG: &[u8; 4] = b"D10D";
-pub const SEC_TAG: &[u8; 4] = b"SI10";
+/// DATA payload with prefix checksum (0.28.2): `D28D vu(realm) vu(shape)
+/// vu(u_start) vu(count) u32(prefix_crc of the bytes before it)` …
+pub const DATA_TAG: &[u8; 4] = b"D28D";
+/// Root of a SECONDARY key tree (0.28.2, `db/secindex.rs`).
+pub const SEC_TAG: &[u8; 4] = b"SI28";
 pub const CHECKPOINT_TAG: &[u8; 4] = b"CP10";
-pub const SPARSE_TAG: &[u8; 4] = b"SP10";
+/// SPARSE payload with prefix checksum (0.28.2): `SP28 vu(realm)
+/// vu(u_start) vu(u_end) vu(groups) vu(cells) u32(prefix_crc of the bytes before it)` …
+pub const SPARSE_TAG: &[u8; 4] = b"SP28";
+
+/// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78) of a block prefix.
+/// Deliberately not the CRC32 of the payload: a CRC32 appended to the bytes
+/// it covers makes the CRC32 over both a constant, so the payload CRC would
+/// no longer depend on the prefix. With a different polynomial the payload
+/// CRC keeps checking the prefix independently: a block whose prefix and
+/// prefix checksum were rewritten still fails the payload CRC when the block
+/// is read. Both are unkeyed checksums against accidental damage; a
+/// deliberately forged block with all checksums recomputed is not detected
+/// (RA2-04, and a moved range may never be read for its real u).
+pub fn prefix_crc(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0x82F6_3B78 & (c & 1).wrapping_neg());
+        }
+    }
+    !c
+}
+
+/// Checks the prefix checksum behind the prefix fields that end at `*p`
+/// (`prefix_crc` of `raw[..*p]`, little endian) and moves `*p` behind it.
+/// RD-08: the routing prefix of a block is protected on open without
+/// reading the whole payload.
+pub fn check_prefix_crc(raw: &[u8], p: &mut usize) -> Result<()> {
+    let got = raw.get(*p..*p + 4).ok_or_else(|| Error::Corruption("block prefix checksum incomplete".into()))?;
+    if u32::from_le_bytes(got.try_into().unwrap()) != prefix_crc(&raw[..*p]) {
+        return Err(Error::Corruption("block prefix checksum mismatch".into()));
+    }
+    *p += 4;
+    Ok(())
+}
+
+/// Appends the prefix checksum to a prefix being written.
+pub fn seal_prefix(prefix: &mut Vec<u8>) {
+    let c = prefix_crc(prefix);
+    prefix.extend_from_slice(&c.to_le_bytes());
+}
 pub const EXT_TAG: u8 = 0xEA;
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const FILE_FORMAT_VERSION: &str = "0.16";
+pub const FILE_FORMAT_VERSION: &str = "0.28.2";
 pub const DEFAULT_BATCH_RECORDS: usize = 10_000;
 
 pub fn block_name(bt: u8) -> Option<&'static str> {
@@ -70,6 +126,8 @@ pub fn block_name(bt: u8) -> Option<&'static str> {
         BT_MATH_LAYOUT_STATE => "MATH_LAYOUT_STATE",
         BT_DB_CONFIG => "DB_CONFIG",
         BT_SYSTEM => "SYSTEM_R0_U1",
+        BT_DIRECTORY => "DIRECTORY",
+        BT_SECONDARY_PAGE => "SECONDARY_PAGE",
         _ => return None,
     })
 }
@@ -99,6 +157,16 @@ pub struct SuperState {
     pub created_ns: u64,
     pub updated_ns: u64,
     pub flags: u32,
+    /// Offset of the committed block directory root (0 = none).
+    pub dir_root: u64,
+}
+
+/// Readable name of a superblock signature (`NHYDB 0.28.2`, `NHYDB016`, …).
+pub fn format_name(sig: &[u8]) -> String {
+    match sig {
+        [b'N', b'H', b'Y', b'D', b'B', a, b, c] if !(a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit()) => format!("NHYDB {a}.{b}.{c}"),
+        _ => String::from_utf8_lossy(sig).into_owned(),
+    }
 }
 
 pub fn pack_super(s: &SuperState) -> Vec<u8> {
@@ -112,6 +180,7 @@ pub fn pack_super(s: &SuperState) -> Vec<u8> {
         raw[16 + i * 8..24 + i * 8].copy_from_slice(&v.to_le_bytes());
     }
     raw[64..68].copy_from_slice(&s.flags.to_le_bytes());
+    raw[68..76].copy_from_slice(&s.dir_root.to_le_bytes());
     let crc = crc32(&raw[..SUPER_CRC_OFFSET]);
     raw[SUPER_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
     raw
@@ -127,8 +196,8 @@ pub fn unpack_super(raw: &[u8]) -> Result<SuperState> {
     }
     let major = u16::from_le_bytes([raw[8], raw[9]]);
     let minor = u16::from_le_bytes([raw[10], raw[11]]);
-    if &raw[0..8] != SUPER_MAGIC || major != FORMAT_MAJOR || minor != FORMAT_MINOR {
-        return Err(Error::Corruption("wrong NHyDB format, expected 0.16".into()));
+    if !(&raw[0..8] == SUPER_MAGIC && major == FORMAT_MAJOR && minor == FORMAT_MINOR) {
+        return Err(Error::Corruption(format!("wrong NHyDB format {}, expected {FILE_FORMAT_VERSION}", format_name(&raw[0..8]))));
     }
     let sbsize = u32::from_le_bytes(raw[12..16].try_into().unwrap());
     if sbsize as usize != SUPERBLOCK_SIZE {
@@ -143,6 +212,7 @@ pub fn unpack_super(raw: &[u8]) -> Result<SuperState> {
         created_ns: q(4),
         updated_ns: q(5),
         flags: u32::from_le_bytes(raw[64..68].try_into().unwrap()),
+        dir_root: u64::from_le_bytes(raw[68..76].try_into().unwrap()),
     })
 }
 
@@ -202,7 +272,7 @@ mod tests {
 
     #[test]
     fn super_roundtrip() {
-        let s = SuperState { generation: 7, checkpoint_offset: 9, last_valid_end: 8192, next_block_id: 3, created_ns: 1, updated_ns: 2, flags: 0 };
+        let s = SuperState { generation: 7, checkpoint_offset: 9, last_valid_end: 8192, next_block_id: 3, created_ns: 1, updated_ns: 2, flags: 0, dir_root: 8192 };
         let raw = pack_super(&s);
         assert_eq!(unpack_super(&raw).unwrap(), s);
         let mut bad = raw.clone();
@@ -219,5 +289,25 @@ mod tests {
         let mut bad = h;
         bad[9] ^= 1;
         assert!(unpack_block_header(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod prefix_crc_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_crc_is_crc32c_and_independent_of_the_payload_crc() {
+        assert_eq!(prefix_crc(b"123456789"), 0xE306_9283); // CRC-32C check value
+        let mut a = b"D28D\x01\x01\x0b\x0d".to_vec();
+        let mut b = b"D28D\x01\x01\x29\x0d".to_vec();
+        seal_prefix(&mut a);
+        seal_prefix(&mut b);
+        a.extend_from_slice(b"records");
+        b.extend_from_slice(b"records");
+        assert_ne!(crc32(&a), crc32(&b), "the payload CRC must still see a forged prefix");
+        let mut p = 8;
+        check_prefix_crc(&a, &mut p).unwrap();
+        assert_eq!(p, 12);
     }
 }

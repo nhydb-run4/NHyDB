@@ -65,7 +65,7 @@ def test_delete_record_all_geometries(tmpdb):
     for lid in (1, 2, 3):
         db.put_record(lid, 7, {"N": 7, "tp": 7})
     db.put_extensions(1, 7, {"note": "n"})
-    assert db.delete_record(1, 7, commit=True) == 2  # BASE record + extension cell
+    assert db.delete_record(1, 7, commit=True) == 3  # live cells: N, tp and the extension
     assert db.get_record(1, 7) is None
     assert db.get_value(1, 7, 50) is None
     for lid in (2, 3):

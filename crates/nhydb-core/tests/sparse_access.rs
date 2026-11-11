@@ -75,7 +75,7 @@ fn check_all(db: &Db, zones: &[Zone], model: &BTreeMap<Key, Option<Val>>, rng: &
                     };
                     assert_eq!(got, want, "point R{} u{} v{} lane{} (u index {ui})", z.realm, u, v, lane);
                     let from_merge = match merged.get(&v) {
-                        Some(SVal::V(x)) => Some(x.clone()),
+                        Some((SVal::V(x), _)) => Some(x.clone()),
                         _ => None,
                     };
                     assert_eq!(got, from_merge, "merge oracle R{} u{} v{}", z.realm, u, v);
@@ -85,7 +85,7 @@ fn check_all(db: &Db, zones: &[Zone], model: &BTreeMap<Key, Option<Val>>, rng: &
                     let a = z.v_base.add_u64(rng.below(z.v_width + 2));
                     let b = a.add_u64(rng.below(z.v_width / 3 + 1));
                     let got = db.sparse_updates_for_u_range(&z.realm, u, &a, &b, lane).unwrap();
-                    let want: Vec<(Nat, SVal)> = merged.range(a.clone()..=b.clone()).map(|(k, s)| (k.clone(), s.clone())).collect();
+                    let want: Vec<(Nat, SVal)> = merged.range(a.clone()..=b.clone()).map(|(k, (s, _))| (k.clone(), s.clone())).collect();
                     assert_eq!(got, want, "range R{} u{} [{a},{b}]", z.realm, u);
                 }
             }

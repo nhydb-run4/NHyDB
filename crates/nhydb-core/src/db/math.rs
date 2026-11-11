@@ -394,7 +394,7 @@ impl Db {
         let mut cells = 0i64;
         for ((rid, _lane), idx) in &self.sparse {
             if exts.iter().any(|(a, b)| a <= rid && rid <= b) {
-                cells += idx.segs.iter().map(|s| s.cell_count as i64).sum::<i64>();
+                cells += idx.cells as i64;
             }
         }
         Ok(vmap! {
@@ -584,7 +584,7 @@ impl Db {
         self.invalidate_blocks_from(file_len);
         self.reset_in_memory_state();
         self.next_block_id = next_block_id;
-        let record = self.open_scan(last_valid_end)?;
+        let record = self.load_storage_state(last_valid_end)?;
         self.sys.record = record;
         self.import_schema(prior_schema)?;
         self.sys.layout_dirty = prior_dirty;

@@ -2,22 +2,54 @@
 P022): every new shortcut must return exactly what the general path returns.
 
 * P007 (ALL from segment metadata, COUNT/ORDER BY/GROUP BY/NOT): every
-  scenario is built twice; the second copy additionally writes and deletes
-  one record far outside the data. That record is invisible, but the DELETE
-  marks the (realm, lane) as overlaid, which forces the general scan path.
-  Results (without ``fastpath``/``plan``) and errors must be identical.
+  scenario is built three times; the second and third copy additionally
+  write and delete one record far outside the data. That record is
+  invisible, but the DELETE marks the (realm, lane) as overlaid. Since
+  0.28.2/scan the second copy answers through the winner view
+  (``db/winners.rs``); the third is opened with ``[query] overlay_view =
+  false``, which forces the general scan path. Results (without
+  ``fastpath``/``plan``) and errors of all three must be identical.
 * P006 (STRUCT_RANGE over more than 4096 u): compared with the union of
   direct ranges of at most 4096 u (the reference path that visits every u).
 * P004 (range/select skip gaps): compared with per-u ``get``/``get_record``.
 """
 import math
+import os
+from pathlib import Path
 
 import pytest
 
 import nhydb
 from nhydb.query import Q, QueryEngine
 
-FAR = 10**30  # u of the invisible write+delete that forces the general path
+FAR = 10**30  # u of the invisible write+delete that marks the lane as overlaid
+
+_ENV0 = os.environ.get("NHYDB_CONFIG")
+
+
+def open_cfg(path, extra=None, readonly=True):
+    """Opens ``path``; ``extra``: TOML lines for this handle. A configuration
+    given by NHYDB_CONFIG (dir3 runs of the QA) takes precedence over a file
+    next to the database, so its contents are kept and the lines appended in
+    a combined file that NHYDB_CONFIG points to while the handle opens."""
+    if not extra:
+        return nhydb.NHyDB(str(path), readonly=readonly)
+    d = Path(path).parent / ("_cfg_%d" % abs(hash(extra)))
+    d.mkdir(exist_ok=True)
+    f = d / "nhydb_config.toml"
+    base = Path(_ENV0).read_text() + "\n" if _ENV0 else ""
+    f.write_text(base + extra + "\n")
+    os.environ["NHYDB_CONFIG"] = str(f)
+    try:
+        return nhydb.NHyDB(str(path), readonly=readonly)
+    finally:
+        if _ENV0 is None:
+            os.environ.pop("NHYDB_CONFIG", None)
+        else:
+            os.environ["NHYDB_CONFIG"] = _ENV0
+
+
+GENERAL = "[query]\noverlay_view = false"
 
 
 def _strip(res):
@@ -119,7 +151,7 @@ def _force_general(db):
             db.put(1, FAR, [1, 1, "z", 1.0], shape_id=1, lane=lane)
         except nhydb.SchemaError:
             db.put(1, FAR, [1, 1], shape_id=1, lane=lane)
-        db.delete(1, FAR, lane=lane)
+        db.delete_record(1, FAR, lane=lane)
     db.commit()
 
 
@@ -128,14 +160,18 @@ def pairs(tmp_path_factory):
     root = tmp_path_factory.mktemp("perf_paths")
     out = {}
     for name, (setup, _lanes) in SCENARIOS.items():
-        pair = []
-        for general in (False, True):
-            db = nhydb.NHyDB.create(str(root / ("%s_%d.nhydb" % (name, general))))
+        trio = []
+        for kind in range(3):           # 0 fast, 1 general (view off), 2 winner view
+            path = root / ("%s_%d.nhydb" % (name, kind))
+            db = nhydb.NHyDB.create(str(path))
             setup(db)
-            if general:
+            if kind:
                 _force_general(db)
-            pair.append(db)
-        out[name] = pair
+            if kind == 1:
+                db.close()
+                db = open_cfg(path, GENERAL, readonly=False)
+            trio.append(db)
+        out[name] = trio
     yield out
     for pair in out.values():
         for db in pair:
@@ -184,27 +220,31 @@ SQL = [
 
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_all_fast_path_equals_general_path(pairs, scenario):
-    fast, general = pairs[scenario]
+    fast, general, view = pairs[scenario]
+    assert general.stats()["overlay_view"]["enabled"] is False
     for lane in SCENARIOS[scenario][1]:
-        qf, qg = QueryEngine(fast), QueryEngine(general)
+        qf, qg, qv = QueryEngine(fast), QueryEngine(general), QueryEngine(view)
         for expr in EXPRS:
             for kw in _engine_cases():
                 a = _call(lambda: qf.execute(expr, realm=1, lane=lane, **kw))
                 b = _call(lambda: qg.execute(expr, realm=1, lane=lane, **kw))
+                c = _call(lambda: qv.execute(expr, realm=1, lane=lane, **kw))
                 assert a == b, (scenario, lane, expr, kw, a, b)
+                assert c == b, ("view", scenario, lane, expr, kw, c, b)
         if lane == 0:
             for sql in SQL:
-                a, b = _call(lambda: fast.sql(sql)), _call(lambda: general.sql(sql))
+                a, b, c = _call(lambda: fast.sql(sql)), _call(lambda: general.sql(sql)), _call(lambda: view.sql(sql))
                 assert a == b, (scenario, sql, a, b)
+                assert c == b, ("view", scenario, sql, c, b)
 
 
 def test_count_matches_records(pairs):
-    fast, _ = pairs["plain"]
+    fast, _, _ = pairs["plain"]
     n = sum(1 for _ in fast.range(1, 1, 10**21))
     assert fast.sql("SELECT COUNT(*) FROM main")["rows"] == [{"COUNT(*)": n}] or \
         list(fast.sql("SELECT COUNT(*) FROM main")["rows"][0].values()) == [n]
     assert QueryEngine(fast).execute(Q.all(), realm=1, return_mode="count")["count"] == n
-    bounded, _ = pairs["bounded"]
+    bounded, _, _ = pairs["bounded"]
     assert QueryEngine(bounded).execute(Q.all(), realm=1, return_mode="count")["count"] == 61
 
 
@@ -223,7 +263,7 @@ def test_order_by_mixed_types_raises_like_general(tmp_path):
         db.commit()
         if general:
             db.put(1, FAR, [1], shape_id=1)
-            db.delete(1, FAR)
+            db.delete_record(1, FAR)
             db.commit()
         q = QueryEngine(db)
         out.append(_call(lambda: q.execute(Q.all(), realm=1, return_mode="fields", select=["id", "e"], order_by=["e"], limit=2)))
@@ -242,7 +282,7 @@ def _struct_db(path):
     db.put_dense_batch(1, 2500, [_row(u) for u in range(2500, 2600)], shape_id=1)   # overlapping rewrite
     db.put_dense_batch(1, 9000, [_row(u) for u in range(9000, 9100)], shape_id=1, lane="NR")
     db.commit()
-    db.delete(1, 17)
+    db.delete_record(1, 17)
     db.delete_record(1, 18)
     for u in (4500, 6100, 6101):
         db.put_cell(1, u, 2, 5)                    # pure sparse records
@@ -309,8 +349,8 @@ def test_range_select_equal_per_u_reads(tmp_path):
         db.put(1, u, _row(5), shape_id=1)
         written.add(u)
     db.commit()
-    db.delete(1, 4)
-    db.delete(1, 2**40)
+    db.delete_record(1, 4)
+    db.delete_record(1, 2**40)
     db.put_cell(1, 7, 2, 99)                        # overlay on a dense record
     db.put_cell(1, 8, 2, 1)                         # pure sparse u (not part of range)
     db.commit()

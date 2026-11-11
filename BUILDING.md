@@ -9,7 +9,7 @@ macOS, Linux and Windows.
   [rustup](https://rustup.rs):
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
   Windows additionally needs the *Microsoft C++ Build Tools* (installed by rustup's setup when asked).
-* **Python 3.9 or newer** with `pip` and `venv`.
+* **Python 3.12–3.15** (CPython) with `pip` and `venv`.
 * On macOS: Xcode Command Line Tools (`xcode-select --install`).
 
 Rust dependencies are downloaded from crates.io on the first build.
@@ -27,6 +27,11 @@ The wheel is written to `dist/`, e.g.
 `nhydb-<version>-cp313-cp313-macosx_11_0_arm64.whl`. It is specific to the
 operating system, the CPU architecture and the Python version it was built
 with.
+
+`.cargo/config.toml` in the source tree aligns function starts to 64 bytes
+(`-C llvm-args=-align-all-functions=6`); the published performance figures
+were measured with it. Build from the repository root and do not set the
+`RUSTFLAGS` environment variable, which would replace this setting.
 
 ## Install
 

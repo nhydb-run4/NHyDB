@@ -13,7 +13,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-PYTHONS = ["39", "310", "311", "312", "313", "314"]
+PYTHONS = ["312", "313", "314", "315"]
 PLATFORMS = {
     "linux-x86_64": r"manylinux_2_\d+_x86_64",
     "linux-aarch64": r"manylinux_2_\d+_aarch64",

@@ -13,7 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
-REPO_URL = "https://github.com/nhydb/NHyDB/"
+REPO_URL = "https://github.com/nhydb-run4/NHyDB/"
 FENCE = re.compile(r"^```([A-Za-z0-9_-]*)[ \t]*\n(.*?)^```[ \t]*$", re.S | re.M)
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 

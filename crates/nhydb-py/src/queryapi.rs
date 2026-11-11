@@ -16,7 +16,7 @@ use nhydb_core::query::{self as q, Expr, ExecOptions, ExternalProvider, Provider
 use nhydb_core::sql::{self, Params};
 use nhydb_core::{Lane, Val};
 
-use crate::conv::{from_pyerr, from_val, to_lane, to_val, IntoPy};
+use crate::conv::{from_pyerr, from_val, from_val_owned, to_lane, to_val, IntoPy};
 use crate::NHyDB;
 
 fn query_mod(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
@@ -249,9 +249,9 @@ pub struct PyQueryEngine {
 impl PyQueryEngine {
     fn run<T: Send>(slf: &Bound<'_, Self>, f: impl FnOnce(&QueryEngine<'_>) -> nhydb_core::Result<T> + Send) -> PyResult<T> {
         let py = slf.py();
-        let this = slf.borrow();
+        let this = slf.try_borrow()?;
         let dbb = this.db.bind(py).cast::<NHyDB>()?.clone();
-        let dbr = dbb.borrow();
+        let dbr = dbb.try_borrow()?;
         let host: Py<PyAny> = slf.clone().into_any().unbind();
         let (db, providers) = (&dbr.db, &this.providers);
         // P009: GIL released during the evaluation; runtime providers
@@ -369,7 +369,7 @@ impl PyQueryEngine {
             layout_id: None,
         };
         let r = Self::run(slf, |eng| eng.execute(&e, &opts))?;
-        from_val(slf.py(), &r)
+        from_val_owned(slf.py(), r)
     }
 
     /// `explain(expr, *, realm=None, lane=0, return_mode="record")`
@@ -388,7 +388,7 @@ impl PyQueryEngine {
         };
         let (realm, lane) = (realm_arg(realm)?, lane_arg(lane)?);
         let r = Self::run(slf, |eng| eng.explain(&e, realm, lane, &rm))?;
-        from_val(slf.py(), &r)
+        from_val_owned(slf.py(), r)
     }
 
     /// `search(expr, *, realm=None, lane=0, select=None, limit=20, offset=0,
@@ -415,7 +415,7 @@ impl PyQueryEngine {
         let off = opt_val(offset)?.unwrap_or(Val::Int(0));
         let ex = explain.map(|x| x.is_truthy()).transpose()?.unwrap_or(false);
         let r = Self::run(slf, |eng| eng.search(&e, realm, lane, sel.as_ref(), &lim, &off, ex, k1, b))?;
-        from_val(slf.py(), &r)
+        from_val_owned(slf.py(), r)
     }
 
     /// `compile_sql(text, parameters=None, *, lane=0)` → `SQLCompiledQuery`
@@ -423,9 +423,9 @@ impl PyQueryEngine {
     fn compile_sql(slf: &Bound<'_, Self>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), sql_params(parameters)?, lane_arg(lane)?);
         let py = slf.py();
-        let this = slf.borrow();
+        let this = slf.try_borrow()?;
         let dbb = this.db.bind(py).cast::<NHyDB>()?.clone();
-        let dbr = dbb.borrow();
+        let dbr = dbb.try_borrow()?;
         compile_sql_py(py, &dbr.db, &t, &p, l)
     }
 
@@ -434,7 +434,7 @@ impl PyQueryEngine {
     fn execute_sql(slf: &Bound<'_, Self>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), sql_params(parameters)?, lane_arg(lane)?);
         let r = Self::run(slf, |eng| sql::execute_sql(eng, &t, &p, l))?;
-        from_val(slf.py(), &r)
+        from_val_owned(slf.py(), r)
     }
 
     /// `execute_sql_numpy(text, parameters=None, *, lane=0)` → `{column: ndarray}`
@@ -442,7 +442,7 @@ impl PyQueryEngine {
     fn execute_sql_numpy(slf: &Bound<'_, Self>, text: &Bound<'_, PyAny>, parameters: Option<&Bound<'_, PyAny>>, lane: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let (t, p, l) = (text.str()?.to_string(), sql_params(parameters)?, lane_arg(lane)?);
         let r = Self::run(slf, |eng| sql::execute_sql(eng, &t, &p, l))?;
-        rows_to_numpy(slf.py(), &r)
+        rows_to_numpy(slf.py(), r)
     }
 
     /// `execute_numpy(expr, *, realm=None, lane=0, select, order_by=None, limit=None,
@@ -471,7 +471,7 @@ impl PyQueryEngine {
             ..Default::default()
         };
         let r = Self::run(slf, |eng| eng.execute(&e, &opts))?;
-        rows_to_numpy(slf.py(), &r)
+        rows_to_numpy(slf.py(), r)
     }
 
     /// `execute_spec(spec)`
@@ -490,7 +490,7 @@ impl PyQueryEngine {
         }
         let opts = q::exec_options_from_spec(&to_val(rest.as_any())?).py()?;
         let r = Self::run(slf, |eng| eng.execute(&expr, &opts))?;
-        from_val(slf.py(), &r)
+        from_val_owned(slf.py(), r)
     }
 }
 
@@ -615,7 +615,7 @@ pub fn compile_sql_py(py: Python<'_>, db: &nhydb_core::db::Db, text: &str, param
 }
 
 /// Result rows (`rows`, columns from `columns` or `select`) → `{column: ndarray}`.
-pub fn rows_to_numpy(py: Python<'_>, result: &Val) -> PyResult<Py<PyAny>> {
+pub fn rows_to_numpy(py: Python<'_>, mut result: Val) -> PyResult<Py<PyAny>> {
     let names: Vec<String> = match result.get("columns") {
         Some(Val::List(c)) => c.iter().map(|x| x.py_str()).collect(),
         _ => {
@@ -626,11 +626,77 @@ pub fn rows_to_numpy(py: Python<'_>, result: &Val) -> PyResult<Py<PyAny>> {
             v
         }
     };
-    let rows = result.get("rows").and_then(|r| r.as_list()).cloned().unwrap_or_default();
+    // U10 (RUN8): the values are moved out of the rows column by column
+    // (a copy only for a name selected twice) instead of copying all rows
+    // and then every column
+    let mut rows = match result.get_mut("rows").map(std::mem::take) {
+        Some(Val::List(l)) => l,
+        _ => Vec::new(),
+    };
+    drop(result);
     let d = PyDict::new(py);
-    for name in &names {
-        let col: Vec<Val> = rows.iter().map(|r| r.get(name).cloned().unwrap_or(Val::None)).collect();
+    for (j, name) in names.iter().enumerate() {
+        let last = !names[j + 1..].contains(name);
+        let col: Vec<Val> = rows
+            .iter_mut()
+            .map(|r| match r.get_mut(name) {
+                Some(v) if last => std::mem::take(v),
+                Some(v) => v.clone(),
+                None => Val::None,
+            })
+            .collect();
         d.set_item(name, crate::numpy_io::out_to_numpy(py, crate::numpy_io::vals_to_out(col))?)?;
+    }
+    Ok(d.into_any().unbind())
+}
+
+/// R4-B: `sql_numpy` from streamed rows: the rows are consumed chunk by
+/// chunk into one column builder per output column (same dtypes as
+/// `rows_to_numpy`: `vals_to_out`). Same errors as `sql` (anchor errors after
+/// all read errors, `[query] max_result_rows` applies).
+pub fn sql_to_numpy(py: Python<'_>, db: &nhydb_core::db::Db, text: &str, params: &sql::Params, lane: nhydb_core::Lane) -> PyResult<Py<PyAny>> {
+    use crate::numpy_io::ColBuilder;
+    let (names, cols) = run_core(py, db, |eng| {
+        let mut c = sql::open_sql(eng, text, params, lane, true)?;
+        let names: Vec<String> = c.columns().to_vec();
+        // a value is moved at the last column with its name, cloned before
+        let last: Vec<bool> = (0..names.len()).map(|j| !names[j + 1..].contains(&names[j])).collect();
+        let mut cols: Vec<ColBuilder> = names.iter().map(|_| ColBuilder::default()).collect();
+        let mut sink: Option<nhydb_core::Error> = None;
+        // RUN6: the columns hold the whole result: [query] max_result_bytes
+        let mut guard = nhydb_core::query::ResultGuard::new(eng.db);
+        loop {
+            let batch = c.next_batch(eng, 4096, Some(&mut sink))?;
+            if batch.is_empty() {
+                break;
+            }
+            for mut row in batch {
+                // RR6-02: the columns keep about 8 bytes per value (plus the
+                // heap of str/bytes/object values), not the row map
+                if let Val::Map(items) = &row {
+                    guard.add_bytes(items.iter().map(|(_, v)| 8 + nhydb_core::db::val_heap(v) as u64).sum())?;
+                }
+                for (j, name) in names.iter().enumerate() {
+                    let v = match &mut row {
+                        Val::Map(items) => match items.iter_mut().find(|(k, _)| k == name) {
+                            Some((_, v)) if last[j] => std::mem::take(v),
+                            Some((_, v)) => v.clone(),
+                            None => Val::None,
+                        },
+                        _ => Val::None,
+                    };
+                    cols[j].push(v);
+                }
+            }
+        }
+        if let Some(e) = sink {
+            return Err(e);
+        }
+        Ok((names, cols))
+    })?;
+    let d = PyDict::new(py);
+    for (name, col) in names.iter().zip(cols) {
+        d.set_item(name, crate::numpy_io::out_to_numpy(py, col.finish())?)?;
     }
     Ok(d.into_any().unbind())
 }

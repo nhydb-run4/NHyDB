@@ -122,7 +122,7 @@ def test_select_us_overlay_tombstone_sparse_only(tmp_path):
     db.put_cell(1, 2, 2, 99)          # overlay
     db.delete_cell(1, 3, 2)           # tombstone
     db.put_cell(1, 50, 2, 7)          # sparse-only record
-    db.delete(1, 4)
+    db.delete_record(1, 4)
     db.commit()
     rows = db.select_us(1, [1, 2, 3, 4, 50, 60], ["id", "x"])
     got = {r["_u"]: (r["id"], r["x"]) for r in rows}

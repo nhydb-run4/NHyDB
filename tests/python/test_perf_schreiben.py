@@ -42,14 +42,14 @@ def _rich_db(path):
     db.put_cell(1, 5, 20, 555)  # sparse overrides dense EXT
     db.delete_cell(1, 6, 20)  # tombstone hides dense EXT -> must survive
     db.delete_cell(1, 7, 2)  # tombstone hides a BASE field -> must survive
-    db.delete_cell(1, 8, 99)  # tombstone without dense value -> dropped
-    db.delete_cell(1, 500, 3)  # tombstone without record -> dropped
+    assert db.delete_cell(1, 8, 99) is False  # no live cell: nothing is written
+    assert db.delete_cell(1, 500, 3) is False  # no record: nothing is written
     db.put_cell(1, 9, 1, 999)  # overlay of a BASE field
     db.put_cell(1, 700, 3, "free", type="utf8")
     db.put_cell(1, 701, 3, 1.5, type="f64")
     db.put_cell(1, 701, 3, 2.5, type="f64")  # newest sparse state wins
-    db.delete(1, 12)  # deleted dense record
-    db.delete(1, 1002)
+    db.delete_record(1, 12)  # deleted dense record
+    db.delete_record(1, 1002)
     # NR lane
     db.put_dense_batch(1, 3, [[100 + i, f"nr{i}"] for i in range(10)], lane=1)
     db.delete_cell(1, 4, 1, lane=1)
@@ -84,6 +84,40 @@ def test_p002_compaction_keeps_logical_state(tmp_path, export):
         # the tombstones that hide dense values survive, the others are dropped
         assert db2.get_cell(1, 6, 20, dyn_address=False) is None
         assert db2.get(1, 7)["b"] is None and db2.get(1, 5)["e"] == 555
+
+
+def _compacted_blocks(path, build):
+    db = nhydb.NHyDB.create(str(path))
+    db.create_realm(1, "r")
+    db.create_shape(1, 1, "s", [{"v": 1, "name": "a", "type": "varint"}, {"v": 2, "name": "b", "type": "utf8"}])
+    db.create_classic_layout(1, 1, "c", shape_id=1)
+    build(db)
+    db.commit()
+    db.close()
+    res = nhydb.NHyDB.compact_file(path, make_backup=False)
+    with nhydb.NHyDB(path, readonly=True) as db2:
+        return res["verify"]["scanned_blocks"], db2.get(1, 8), db2.get_cell(1, 8, 99, dyn_address=False)
+
+
+def test_p002_orphan_tombstones_are_dropped(tmp_path):
+    """T-04: tombstones whose cell no longer needs hiding are not carried
+    into the compacted file: one over a SPARSE value that is gone with it,
+    one over a BASE field that a newer `put` rewrote (F1: the record wins)."""
+    def with_orphans(db):
+        db.put(1, 8, [8, "x"])
+        db.put_cell(1, 8, 99, 1, type="varint")
+        assert db.delete_cell(1, 8, 99) is True      # tombstone over a sparse value
+        db.put_cell(1, 8, 2, "tmp")
+        assert db.delete_cell(1, 8, 2) is True       # tombstone over a BASE field ...
+        db.put(1, 8, [8, "new"])                     # ... that the newer record rewrites
+
+    def plain(db):
+        db.put(1, 8, [8, "new"])
+
+    got = _compacted_blocks(tmp_path / "orphans.nhydb", with_orphans)
+    want = _compacted_blocks(tmp_path / "plain.nhydb", plain)
+    assert got[1]["b"] == "new" and got[2] is None
+    assert got == want  # same block count: no SPARSE block with tombstones left
 
 
 def test_p002_compaction_chunked_sparse_and_ext(tmp_path):
@@ -389,7 +423,7 @@ def test_p018_read_numpy_matches_get_all_types(tmp_path):
     db.put(1, 60, rows[0], extensions={40: 5})  # extension -> generic path
     db.put_cell(1, 70, 3, 99, type="u16")  # sparse overlay
     db.delete_cell(1, 71, 1)  # tombstone over BASE
-    db.delete(1, 80)  # deleted record
+    db.delete_record(1, 80)  # deleted record
     db.put_cell(1, 90, 9, 2**70, type="varuint")  # does not fit uint64
     db.commit()
     names = [f["name"] for f in fields] + ["e"]
@@ -540,7 +574,7 @@ def test_p024_rollback_restores_committed_state(tmp_path):
     # uncommitted: data, overlays, deletes, new realm/shape/layout, MATH realms, size limit
     db.put_dense_batch(1, 30, [[i] for i in range(50)])
     db.put_cell(2, 1, 1, 5, type="varint")
-    db.delete(1, 3)
+    db.delete_record(1, 3)
     db.create_realm(50, "neu")
     db.create_shape(5, 50, "s5", [{"v": 1, "name": "y", "type": "varint"}])
     db.put_math(9, (2, 3), 7)  # new MATH realm

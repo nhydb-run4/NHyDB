@@ -28,16 +28,161 @@ timeout_ms = 0                    # 0 = fail immediately, otherwise wait time in
 # first 16 hex digits of the SHA-256 of the absolute database path (use it when
 # several databases with the same file name share one key directory).
 # Relative paths are resolved against the directory of the database.
+# Windows: write paths in single quotes ('C:\data\keys') or with "/" –
+# inside double quotes a backslash starts a TOML escape sequence.
 # layout_path = "{db}.layout.enc"
 # key_path    = "/secure/location/{db}.{db_path_hash}.layout.key"
 
 [cache]
-# block_cache_bytes is the budget of the block cache of each open database
-# object (LRU eviction; 0 = no cache, verified blocks are then read in parts).
-# The largest cached block is max(8 MiB, budget/8), at most the budget.
-# Every block is CRC-checked completely once per object before its first use;
-# stats()["block_cache"] shows budget, occupancy and counters.
-# The vindex_* keys are accepted and validated but not yet used (fixed values).
+# Memory of the caches (0.28.2). Every value is a budget in bytes, read once
+# when a database object is opened; to change it, close the objects, edit
+# this file and open again. stats()["cache"] shows the pot, every pool
+# (budget, bytes, entries, evictions) and the bytes of the object.
+#
+# total_bytes is the budget of the whole process: all open database objects
+# together (any number of databases, read-only objects included) hold at most
+# about this much in their caches; when it is reached, the least recently
+# used entries of the objects are evicted (results never change, evicted
+# data is read and CRC-checked again). The first object opened while no
+# other one is open defines it; an object opened with another value keeps
+# the value in force and reports a warning (verify()["warnings"],
+# stats()["cache"]["process"]["warnings"]). Separate processes do not share
+# it: N processes may hold N x total_bytes. There is no built-in maximum.
+#
+# The pools below are budgets of each database object (upper bounds within
+# the pot):
+# block_cache_bytes: block cache (LRU; 0 = no cache, verified blocks are
+#   then read in parts). The largest cached block is max(8 MiB, budget/8), at
+#   most the budget. Every block is CRC-checked completely once per object
+#   before its first use.
+# index_page_cache_bytes: decoded pages of the SECONDARY key trees; a lookup
+#   reads one page per tree level.
+# posting_cache_bytes: decoded index payloads: document postings, FULLTEXT
+#   term postings and FULLTEXT document length segments (a ranked search
+#   reads only the segments of its hits).
+# sparse_cache_bytes: decoded sparse data (group directories, cell states,
+#   merged u groups).
+# vindex_max_marks bounds the cached sparse v indexes (one per read u group)
+#   in units of one jump mark (48 bytes; 4000000 = about 192 MB), and
+#   vindex_max_indexes their number.
+# Sizing (starting points; leave the rest of the RAM to the operating system,
+# whose file cache keeps the database file in memory for free):
+#   16 GB machine:  total_bytes = 2 GiB
+#   64 GB machine:  total_bytes = 8-16 GiB, posting_cache_bytes = 1-4 GiB
+#   256 GB server:  total_bytes = 64-128 GiB, posting_cache_bytes = 16-32 GiB,
+#                   index_page_cache_bytes = 4-16 GiB, block_cache_bytes = 4-16 GiB
+total_bytes = 4294967296          # process pot (4 GiB; 0 = evict everything at once)
 block_cache_bytes = 67108864      # block cache (64 MiB)
-vindex_max_marks = 4000000        # budget of the v-index (COLUMN/PACKED)
+index_page_cache_bytes = 33554432 # decoded index pages (32 MiB)
+posting_cache_bytes = 268435456   # decoded postings and document lengths (256 MiB)
+sparse_cache_bytes = 134217728    # decoded sparse data (128 MiB)
+vindex_max_marks = 4000000        # budget of the cached v indexes (x 48 bytes)
 vindex_max_indexes = 4096
+
+[index]
+# build_memory_bytes: estimated memory of build_indexes() for the collected
+# keys and posting lists; beyond it they are written as sorted runs to an
+# anonymous temporary file and merged when the key trees are written.
+build_memory_bytes = 536870912    # 512 MiB
+# Automatic index maintenance. After writes an index answers from its
+# built part plus an in-memory overlay of the changed records (always
+# current). A writer renews it itself after a commit (merge of the old tree
+# and the overlay, no data scan) once it is economical, when the RAM limiter
+# is green and no other large job runs:
+# maintenance: "auto" (default) or "manual" (only build_indexes()).
+# rebuild_ratio: share of the records of the realm lane that must have
+#   changed since the build (rebuild_min_changes at least).
+# bulk_commit_ratio: a commit that alone brings this share is a bulk commit;
+#   the rebuild then waits for the next smaller commit (imports).
+# crisis_ratio: beyond this share the rebuild is forced even during bulk
+#   commits, other jobs or a yellow limiter (never in red). It is also forced
+#   when the overlay would reach 90 % of overlay_max_bytes.
+# overlay_max_bytes: memory of the overlay per handle; beyond it a query
+#   scans until the index is renewed.
+maintenance = "auto"
+rebuild_ratio = 0.02              # 2 %
+rebuild_min_changes = 1024
+bulk_commit_ratio = 0.002         # 0.2 %
+crisis_ratio = 0.25               # 25 %
+overlay_max_bytes = 268435456     # 256 MiB
+
+[write]
+# max_block_bytes: largest DATA block a dense write (put_dense_batch,
+# put_numpy_batch, compaction) creates; larger calls are split into
+# consecutive blocks, all of them one atomic unit. 8 MiB is the smallest
+# largest cacheable block of the block cache, so the first access to a block
+# never reads more. 0 = one block per call; otherwise at least 65536.
+max_block_bytes = 8388608         # 8 MiB
+
+[directory]
+# Persistent block directory (file format 0.28.2). A directory run is written
+# once this many data/DELETE blocks or payload bytes were added since the
+# previous one (after a write call or in commit); the open then reads the
+# directory instead of scanning every
+# block, and only the blocks behind it are held in memory. Directory pages
+# are read on demand; cache_entries bounds the decoded pages kept in memory
+# (LRU, about 130 bytes per entry). stats()["directory"] shows the state.
+flush_blocks = 65536              # blocks since the last directory run
+flush_bytes = 268435456           # payload bytes since the last directory run (256 MiB)
+cache_entries = 262144            # decoded directory entries held in memory
+
+[query]
+# max_result_rows: optional upper bound of the estimated result rows of a
+# query (bounded by its LIMIT). 0 = no bound (default). Larger queries are
+# rejected with QueryLimitError before they run; COUNT and aggregates are
+# not affected, nothing is redirected or cut automatically.
+max_result_rows = 0
+# max_result_bytes: memory bound of the calls that return the whole result at
+# once – sql(), QueryEngine.execute()/search(), sql_numpy() (estimated bytes of
+# the collected rows, sort keys and groups; for sql_numpy() the column values;
+# the Python objects of sql() need about 2-3 times more). Beyond it the
+# call ends with QueryLimitError while collecting; use sql_iter(),
+# sql_to_file() or submit_sql() for large results. 0 = no bound.
+max_result_bytes = 4294967296     # 4 GiB
+
+[results]
+# Result files of sql_to_file()/submit_sql() and the sort runs of a streaming
+# ORDER BY (anonymous temporary files: no name, nothing left after a crash).
+# Every ORDER BY of sql_iter()/sql_numpy()/sql_to_file()/submit_sql() sorts
+# in memory up to sort_memory_bytes and in sorted runs beyond it, in every
+# realm and layout; nothing is sorted in memory beyond it. With runs the
+# query needs a writable temp_dir within budget_bytes, otherwise it ends with
+# a clear error. NaN in a sort column beyond sort_memory_bytes is an error
+# (no total order for runs). temp_dir is independent of the database location
+# (e.g. a fast local SSD for databases on a NAS or read-only media); default
+# <system temp>/nhydb-results:
+# temp_dir = "/fast/ssd/nhydb-results"
+budget_bytes = 0                  # bytes of managed result files per process (0 = no budget)
+compress = false                  # zlib-compressed result chunks by default
+sort_memory_bytes = 268435456     # sort keys in memory before sorted runs are written (256 MiB, at least 64 KiB)
+
+[limiter]
+# Central RAM limiter of the process (one per process, defined by the first
+# handle opened). It watches the footprint of the whole process and, under
+# memory pressure, lets large operations wait, asks sorts and index builds to
+# spill early and empties caches; as last resort it cancels the single
+# operation that keeps the process above its limit (ResourceLimitError).
+# nhydb.resource_status() shows its state, nhydb.cancel_job(id) cancels.
+enabled = true                    # false = only measure and count, never steer
+reserve_percent = 10              # share of the RAM kept free (limit = 90 % of the RAM)
+warn_percent = 5                  # width of the yellow zone below the limit, % of the RAM
+tick_ms = 20                      # tick of the monitor thread while operations run
+notify_wait_s = 300               # an operation waiting this long is marked "waiting_long"
+wait_timeout_s = 0                # > 0: cancel after this waiting time; 0 = never
+cancel_over_limit = true          # last resort above the limit (false = only report)
+probe_bytes = 268435456           # TEST_IT probe of a waiting operation (256 MiB, 0 = off)
+ram_bytes = 0                     # RAM the limiter assumes (0 = physical RAM, Linux: cgroup limit)
+dry_run = false                   # diagnosis: decisions are counted, never sent
+
+[limiter_log]
+# Operating statistics of the RAM limiter: every interval_min minutes one
+# JSON line (UTC time stamp, counters of the interval, peaks) is appended to
+# limiter.txt by a helper thread (the limiter never waits for it). After a
+# write that reached max_bytes (a threshold, not a hard limit) the file is
+# archived as limiter_<UTC time>.zip and begun anew. Default location: the
+# directory of the database whose handle defined the limiter of the process.
+enabled = true
+# path = "/var/log/nhydb"         # directory or *.txt file
+interval_min = 30
+max_bytes = 60000000              # 60 MB
+buffer_records = 16               # records held in memory until written

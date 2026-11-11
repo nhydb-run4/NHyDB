@@ -269,6 +269,10 @@ fn pack_super<'py>(py: Python<'py>, state: &Bound<'py, PyAny>) -> PyResult<Bound
         Ok(v) => v.extract()?,
         Err(_) => 0,
     };
+    let dir_root: u64 = match state.call_method1("get", ("dir_root", 0)) {
+        Ok(v) => v.extract()?,
+        Err(_) => 0,
+    };
     let s = format::SuperState {
         generation: g("generation")?,
         checkpoint_offset: g("checkpoint_offset")?,
@@ -277,6 +281,7 @@ fn pack_super<'py>(py: Python<'py>, state: &Bound<'py, PyAny>) -> PyResult<Bound
         created_ns: g("created_ns")?,
         updated_ns: g("updated_ns")?,
         flags,
+        dir_root,
     };
     Ok(PyBytes::new(py, &format::pack_super(&s)))
 }
@@ -292,6 +297,7 @@ fn unpack_super<'py>(py: Python<'py>, raw: &[u8]) -> PyResult<Bound<'py, PyDict>
     d.set_item("created_ns", s.created_ns)?;
     d.set_item("updated_ns", s.updated_ns)?;
     d.set_item("flags", s.flags)?;
+    d.set_item("dir_root", s.dir_root)?;
     Ok(d)
 }
 

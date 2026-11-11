@@ -10,14 +10,14 @@ structure itself provides order, and each cell has an exact natural number
 used from Python.
 
 [![PyPI](https://img.shields.io/pypi/v/nhydb)](https://pypi.org/project/nhydb/)
-· Python 3.9–3.14 · Linux, macOS, Windows ·
+· Python 3.12–3.15 · Linux, macOS, Windows ·
 [License: source-available, non-production](#license)
 
-**→ [Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
+**→ [Python Cookbook](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
 task-oriented guide with tested examples for the complete Python API.
 
-**→ Interactive Jupyter Notebooks — [English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md) | [Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md)** –
-22 runnable notebooks per language, including all 57 Python Cookbook examples.
+**→ Interactive Jupyter Notebooks — [English](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/en/README_v1.md) | [Deutsch](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/de/README_v1.md)** –
+22 runnable notebooks per language, including all 61 Python Cookbook examples.
 
 ## The addressing idea
 
@@ -40,10 +40,10 @@ python -m pip install nhydb
 python -m pip install numpy        # optional, for the NumPy batch API
 ```
 
-Prebuilt wheels are available for CPython 3.9–3.14 on Linux (x86_64,
+Prebuilt wheels are available for CPython 3.12–3.15 on Linux (x86_64,
 aarch64), macOS (x86_64, arm64) and Windows (x64). No Rust toolchain is
 needed; building from source is described in
-[`BUILDING.md`](https://github.com/nhydb/NHyDB/blob/main/BUILDING.md).
+[`BUILDING.md`](https://github.com/nhydb-run4/NHyDB/blob/main/BUILDING.md).
 
 ## A first example
 
@@ -75,15 +75,17 @@ print(sorted(os.listdir(os.path.dirname(path))))
 ```text
 {'_realm': 1, '_u': 2, '_lane': 0, '_lane_name': 'NL', '_shape': 1, 'name': 'Hamburg', 'population': 1862000}
 [{'name': 'Berlin'}]
-['cities.nhydb', 'cities.nhydb.layout.enc', 'cities.nhydb.layout.key', 'cities.nhydb.lock']
+['cities.nhydb', 'cities.nhydb.layout.enc', 'cities.nhydb.layout.key', 'cities.nhydb.lock', 'limiter.txt']
 ```
 
 A database consists of **three files that belong together**: the data file
 (`.nhydb`), the encrypted layout plan (`.layout.enc`) and its key
 (`.layout.key`). Back them up and move them together, and protect the key
 file – without it the database cannot be opened. The `.lock` file is only
-the writer lock. Details:
-[Cookbook, section 21](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md#21-database-files-backup-restore-and-moving).
+the writer lock; `limiter.txt` is the statistics file of the RAM limiter
+(one JSON line per 30 minutes, `[limiter_log]` in `nhydb_config.toml`).
+Details:
+[Cookbook, section 21](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md#21-database-files-backup-restore-and-moving).
 
 ## What NHyDB offers
 
@@ -108,12 +110,12 @@ the writer lock. Details:
 
 Measured throughput figures and their exact test conditions are documented
 in the
-[technical documentation, section 18.5](https://github.com/nhydb/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md#185-benchmarks).
+[technical documentation, section 18.5](https://github.com/nhydb-run4/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md#185-benchmarks).
 
 ## Learn NHyDB interactively — Jupyter Notebooks
 
 NHyDB comes with a complete interactive notebook series in
-**[English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md)** and **[Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md)**.
+**[English](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/en/README_v1.md)** and **[Deutsch](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/de/README_v1.md)**.
 Each language contains 15 guided notebooks and 7 reference notebooks.
 
 The guided notebooks connect the mathematics of the Dynadron with real
@@ -125,21 +127,21 @@ the encrypted layout plan and its key (ENC/KEY), benchmarks on your own
 machine and a complete small application. You can execute every example,
 change its parameters and run your own experiments.
 
-The seven reference notebooks contain the 57 tested examples of the
-0.27.1 [Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)
+The seven reference notebooks contain the 61 tested examples of the
+[Python Cookbook](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)
 as runnable cells, each followed by the output documented in the cookbook.
 The cookbook remains the authoritative reference; the notebooks let you run
 and explore its examples step by step.
 
-The notebooks were written for NHyDB 0.27.1 and are stored with their outputs,
+The notebooks are written for NHyDB 0.28.2 and are stored with their outputs,
 so they can also be read directly on GitHub. To run them locally, clone the
 repository and start JupyterLab in its `notebooks/` folder; it opens in your
 browser:
 
 ```bash
-git clone https://github.com/nhydb/NHyDB.git
+git clone https://github.com/nhydb-run4/NHyDB.git
 cd NHyDB/notebooks
-python -m pip install "nhydb==0.27.1" numpy pandas matplotlib jupyterlab ipykernel
+python -m pip install "nhydb==0.28.2" numpy pandas matplotlib jupyterlab ipykernel
 python -m jupyterlab
 ```
 
@@ -147,21 +149,21 @@ Step-by-step instructions are in the notebook READMEs.
 
 ## Documentation
 
-* **[Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
+* **[Python Cookbook](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md)** –
   installation, records and cells, addresses, types, indexes, QueryEngine,
   NHySQL, NumPy, layouts, MATH_MAP, configuration, maintenance, backups,
   errors and locking, complete application examples and an API reference.
   All examples are executed by the test suite.
-* **Jupyter notebooks:** [English](https://github.com/nhydb/NHyDB/blob/main/notebooks/en/README_v1.md) ·
-  [Deutsch](https://github.com/nhydb/NHyDB/blob/main/notebooks/de/README_v1.md) – 15 guided notebooks
+* **Jupyter notebooks:** [English](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/en/README_v1.md) ·
+  [Deutsch](https://github.com/nhydb-run4/NHyDB/blob/main/notebooks/de/README_v1.md) – 15 guided notebooks
   and 7 reference notebooks per language. The reference notebooks present the
-  57 cookbook examples as runnable cells with the cookbook's expected output.
-* [Technical documentation (English)](https://github.com/nhydb/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md) ·
-  [Technische Dokumentation (Deutsch)](https://github.com/nhydb/NHyDB/blob/main/docs/de/NHyDB_Technische_Dokumentation.md) –
+  61 cookbook examples as runnable cells with the cookbook's expected output.
+* [Technical documentation (English)](https://github.com/nhydb-run4/NHyDB/blob/main/docs/en/NHyDB_Technical_Documentation.md) ·
+  [Technische Dokumentation (Deutsch)](https://github.com/nhydb-run4/NHyDB/blob/main/docs/de/NHyDB_Technische_Dokumentation.md) –
   mathematics, architecture, file format, guarantees.
-* [Example programs](https://github.com/nhydb/NHyDB/tree/main/examples/python) ·
-  [example configuration](https://github.com/nhydb/NHyDB/blob/main/config/nhydb_config.example.toml) ·
-  [`CHANGELOG.md`](https://github.com/nhydb/NHyDB/blob/main/CHANGELOG.md)
+* [Example programs](https://github.com/nhydb-run4/NHyDB/tree/main/examples/python) ·
+  [example configuration](https://github.com/nhydb-run4/NHyDB/blob/main/config/nhydb_config.example.toml) ·
+  [`CHANGELOG.md`](https://github.com/nhydb-run4/NHyDB/blob/main/CHANGELOG.md)
 * Command line: `nhydb --help` (or `python -m nhydb`); query CLI:
   `python -m nhydb.query --help`.
 
@@ -201,16 +203,23 @@ The mathematical foundations (in German):
   is open, key material is kept in process memory and not every internal
   copy is guaranteed to be erased.
 * **NHySQL is read-only** (`SELECT`); data is written through the API.
-* **File format:** only files with the identifier `NHYDB016` are read; there
-  is no converter for older format revisions. Databases created with NHyDB
-  0.27.1 or earlier carry the same identifier but an unkeyed schema digest
-  and do not open (`CorruptionError` naming 0.27.1): export the data with
-  0.27.1 and re-import it with 0.28.0.
+* **File format:** the format version is the engine release that defined
+  it (0.28.2; files start with `NHYDB` followed by the version bytes
+  0, 28, 2). Only this format is read (no backward compatibility in the
+  development phase): files of NHyDB 0.28.0 and 0.27.1 (format 0.16,
+  `NHYDB016`), the unreleased development format `NHYDB017` and older format
+  revisions fail to open with `CorruptionError` naming the format; the file
+  stays unchanged. There is no migration path: rebuild the database from the
+  source data or exports.
 * **Durability `full`:** macOS uses `F_FULLFSYNC` and reports an error if the
   file system does not support it; Linux uses `fsync(2)`, Windows
   `FlushFileBuffers`.
-* **Configuration:** of the `[cache]` keys only `block_cache_bytes` is used
-  yet.
+* **Unconsolidated sparse anchors:** reading a sparse u whose cells were
+  written in many separate blocks builds an in-memory v index of that u
+  (≈ 60 bytes per live single-cell record, ≈ 140 bytes per multi-cell
+  record); compaction or writing in batches bundles the cells (one million
+  cells of one u: ≈ 0.4 MB). The cached indexes are bounded by
+  `[cache] vindex_max_marks`.
 * **Indexes** cover CLASSIC records and are rebuilt explicitly with
   `build_indexes()`; rebuild existing indexes after updating NHyDB.
 * **Status:** alpha – the API may still change between minor versions.
@@ -218,7 +227,7 @@ The mathematical foundations (in German):
 ## License
 
 NHyDB is licensed under the **NHyDB / dNHyDB Experimental Software License
-1.0** ([`LICENSE.md`](https://github.com/nhydb/NHyDB/blob/main/LICENSE.md)).
+1.0** ([`LICENSE.md`](https://github.com/nhydb-run4/NHyDB/blob/main/LICENSE.md)).
 The source code is available, but this is **not an open-source license**:
 free use is limited to non-production purposes (unlimited for private
 individuals, time-limited for teaching, research and businesses), and
@@ -227,13 +236,13 @@ Please read the license text before using the software.
 
 The compiled extension module contains third-party Rust components under
 MIT/Apache-2.0-style licenses; their notices are in
-[`THIRD-PARTY-LICENSES.txt`](https://github.com/nhydb/NHyDB/blob/main/THIRD-PARTY-LICENSES.txt),
+[`THIRD-PARTY-LICENSES.txt`](https://github.com/nhydb-run4/NHyDB/blob/main/THIRD-PARTY-LICENSES.txt),
 which is also shipped inside the wheel.
 
 ## Development
 
-Building from source: [`BUILDING.md`](https://github.com/nhydb/NHyDB/blob/main/BUILDING.md) ·
-release procedure: [`RELEASING.md`](https://github.com/nhydb/NHyDB/blob/main/RELEASING.md)
+Building from source: [`BUILDING.md`](https://github.com/nhydb-run4/NHyDB/blob/main/BUILDING.md) ·
+release procedure: [`RELEASING.md`](https://github.com/nhydb-run4/NHyDB/blob/main/RELEASING.md)
 
 ```bash
 cargo test --workspace --release        # Rust core

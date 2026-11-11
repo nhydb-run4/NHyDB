@@ -297,6 +297,7 @@ impl Db {
         };
         self.append_block(BT_INDEX_DEF, idx.to_val().to_json()?.as_bytes(), 0)?;
         self.index_defs.insert(index_id, idx.clone());
+        self.ixm_new_defs.insert(index_id);
         self.index_name_map.insert((realm_id.clone(), name.to_string()), index_id);
         Ok(idx)
     }

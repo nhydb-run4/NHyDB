@@ -45,10 +45,29 @@ pub fn to_pyerr(e: Error) -> PyErr {
         Error::Query(m) => QueryError::new_err(m),
         Error::QueryPlan(m) => QueryPlanError::new_err(m),
         Error::QueryDomain(m) => QueryDomainError::new_err(m),
+        Error::QueryLimit(m) => QueryLimitError::new_err(m),
+        Error::ResourceLimit(b) => {
+            let (reason, msg) = *b;
+            let e = ResourceLimitError::new_err(msg);
+            Python::attach(|py| {
+                let _ = e.value(py).setattr("reason", reason);
+            });
+            e
+        }
         Error::SqlSyntax(m) => SQLSyntaxError::new_err(m),
         Error::Memory(m) => PyMemoryError::new_err(m),
         Error::Io(e) => io_err(e, None),
         Error::IoPath(e, p) => io_err(e, Some(p.display().to_string())),
+        Error::IoHint(b) => match b.0.raw_os_error() {
+            Some(code) => {
+                let (e, p, hint) = *b;
+                let text = e.to_string();
+                let suffix = format!(" (os error {code})");
+                let text = text.strip_suffix(&suffix).unwrap_or(&text).to_string();
+                os_error(code, format!("{hint}: {text}"), p.map(|p| p.display().to_string()))
+            }
+            None => PyOSError::new_err(format!("{}: {}", b.2, b.0)),
+        },
         Error::Foreign(any, m) => match any.downcast::<PyErr>() {
             Ok(pe) => *pe,
             Err(_) => NHyDBError::new_err(m),
@@ -224,9 +243,72 @@ pub fn from_val(py: Python<'_>, v: &Val) -> PyResult<Py<PyAny>> {
     from_val_d(py, v, 0)
 }
 
+/// `Val` → Python object, consuming the value (RUN9 V2): each part of a
+/// large result (e.g. the rows of `sql()`) is freed right after its
+/// conversion, so the Rust copy shrinks while the Python copy grows instead
+/// of both existing completely at the end. Same objects as [`from_val`];
+/// the dict rows of a list share their key objects (`KeyCache`).
+pub fn from_val_owned(py: Python<'_>, v: Val) -> PyResult<Py<PyAny>> {
+    from_val_o(py, v, 0)
+}
+
+/// RUN9 V2: the dict rows of one result list share the Python string
+/// objects of their keys (every row repeats the same column names). Only
+/// for rows of a list (a single dict gains nothing); bounded: only short
+/// keys, at most `KEY_CACHE_MAX` distinct ones, others are created per use.
+#[derive(Default)]
+struct KeyCache {
+    /// key index last seen at entry position `j` of a row: the rows of a
+    /// result have their columns in the same order, so this hits with one
+    /// comparison
+    at: Vec<Option<usize>>,
+    keys: Vec<(String, Py<PyString>)>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+const KEY_CACHE_MAX: usize = 1024;
+const KEY_CACHE_LEN: usize = 64;
+const KEY_CACHE_POS: usize = 64;
+
+impl KeyCache {
+    /// Python key for the `j`-th entry `k` of a row.
+    #[inline]
+    fn key(&mut self, py: Python<'_>, j: usize, k: &str) -> Py<PyString> {
+        // CPython keeps one shared object per 1-character Latin-1 string
+        if k.len() == 1 || k.len() > KEY_CACHE_LEN {
+            return PyString::new(py, k).unbind();
+        }
+        if let Some(Some(i)) = self.at.get(j) {
+            if self.keys[*i].0 == k {
+                return self.keys[*i].1.clone_ref(py);
+            }
+        }
+        let i = match self.index.get(k) {
+            Some(i) => *i,
+            None if self.keys.len() < KEY_CACHE_MAX => {
+                self.keys.push((k.to_string(), PyString::new(py, k).unbind()));
+                self.index.insert(k.to_string(), self.keys.len() - 1);
+                self.keys.len() - 1
+            }
+            None => return PyString::new(py, k).unbind(),
+        };
+        if j < KEY_CACHE_POS {
+            if self.at.len() <= j {
+                self.at.resize(j + 1, None);
+            }
+            self.at[j] = Some(i);
+        }
+        self.keys[i].1.clone_ref(py)
+    }
+}
+
+fn depth_error() -> PyErr {
+    PyValueError::new_err(format!("value nesting too deep (limit {MAX_OUTPUT_DEPTH} levels)"))
+}
+
 fn from_val_d(py: Python<'_>, v: &Val, depth: usize) -> PyResult<Py<PyAny>> {
     if depth > MAX_OUTPUT_DEPTH {
-        return Err(PyValueError::new_err(format!("value nesting too deep (limit {MAX_OUTPUT_DEPTH} levels)")));
+        return Err(depth_error());
     }
     let from_val = |py: Python<'_>, x: &Val| from_val_d(py, x, depth + 1);
     Ok(match v {
@@ -252,6 +334,63 @@ fn from_val_d(py: Python<'_>, v: &Val, depth: usize) -> PyResult<Py<PyAny>> {
             d.into_any().unbind()
         }
     })
+}
+
+fn from_val_o(py: Python<'_>, v: Val, depth: usize) -> PyResult<Py<PyAny>> {
+    if depth > MAX_OUTPUT_DEPTH {
+        return Err(depth_error());
+    }
+    Ok(match v {
+        Val::List(l) => {
+            // RUN¹⁰: a large result is a job of the RAM limiter while it is
+            // converted (checkpoint per MiB; it waits without the GIL).
+            // Declared first, so it ends last: after a cancel the partial
+            // list is freed before the job leaves (U2)
+            let mut meter = (l.len() >= PY_CONVERT_JOB_MIN)
+                .then(|| nhydb_core::limiter::Meter::new(nhydb_core::limiter::JobKind::Rigid, nhydb_core::limiter::JobPath::PyConvert));
+            let list = PyList::empty(py);
+            let mut kc = (l.len() > 1).then(KeyCache::default);
+            for x in l {
+                if let Some(m) = meter.as_mut() {
+                    if m.due((std::mem::size_of::<Val>() + nhydb_core::db::val_heap(&x)) as u64) {
+                        limiter_checkpoint(py, m)?;
+                    }
+                }
+                let o = match (x, kc.as_mut()) {
+                    (Val::Map(m), Some(kc)) if depth < MAX_OUTPUT_DEPTH => {
+                        let d = PyDict::new(py);
+                        for (j, (k, x)) in m.into_iter().enumerate() {
+                            d.set_item(kc.key(py, j, &k), from_val_o(py, x, depth + 2)?)?;
+                        }
+                        d.into_any().unbind()
+                    }
+                    (x, _) => from_val_o(py, x, depth + 1)?,
+                };
+                list.append(o)?;
+            }
+            list.into_any().unbind()
+        }
+        Val::Map(m) => {
+            let d = PyDict::new(py);
+            for (k, x) in m {
+                d.set_item(k, from_val_o(py, x, depth + 1)?)?;
+            }
+            d.into_any().unbind()
+        }
+        other => from_val_d(py, &other, depth)?,
+    })
+}
+
+/// Lists from this length on are converted as a limiter job.
+const PY_CONVERT_JOB_MIN: usize = 1024;
+
+/// RUN¹⁰: checkpoint of a job that holds the GIL: it never waits with the
+/// GIL held – a `WAIT` signal is sat out after releasing it (R4).
+pub fn limiter_checkpoint(py: Python<'_>, m: &mut nhydb_core::limiter::Meter) -> PyResult<()> {
+    if m.try_checkpoint().py()?.is_none() {
+        py.detach(|| m.checkpoint()).py()?;
+    }
+    Ok(())
 }
 
 pub fn opt_from_val(py: Python<'_>, v: Option<Val>) -> PyResult<Py<PyAny>> {
@@ -325,6 +464,13 @@ pub fn opt_nat(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Nat>> {
 
 /// u64-IDs (shape_id, layout_id, index_id).
 pub fn to_id(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<u64> {
+    // R9E-06: a negative id is an error, not id 0
+    if obj.extract::<u64>().is_err() {
+        use num_traits::Signed;
+        if to_int(obj)?.is_negative() {
+            return Err(PyValueError::new_err(format!("{what} must be >= 0")));
+        }
+    }
     match to_nat(obj)?.as_u64() {
         Some(v) if v <= i64::MAX as u64 => Ok(v),
         _ => Err(PyValueError::new_err(format!("{what} too large (max 2^63-1)"))),

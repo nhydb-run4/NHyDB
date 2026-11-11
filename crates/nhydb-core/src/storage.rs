@@ -49,6 +49,8 @@ thread_local! {
     /// Test-only (T017): positional file reads and bytes read on this thread
     /// (complexity tests count I/O instead of measuring wall-clock time).
     pub(crate) static FILE_READS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Test-only (RUN9 V1): largest single positional read on this thread.
+    pub(crate) static MAX_FILE_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -57,6 +59,7 @@ fn count_read(len: usize) {
         let (n, b) = c.get();
         c.set((n + 1, b + len as u64));
     });
+    MAX_FILE_READ.with(|c| c.set(c.get().max(len as u64)));
 }
 
 fn read_only_error() -> Error {

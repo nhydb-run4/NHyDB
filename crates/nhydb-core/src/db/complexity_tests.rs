@@ -112,9 +112,10 @@ fn read_counts_scale_as_expected() {
     assert_eq!(large.get_again.0, 0, "repeated lookup is served from the cache");
     assert_eq!(small.cell.0, large.cell.0, "sparse cell lookup must not depend on the number of blocks");
     assert!(large.cell.0 <= 2, "sparse cell lookup: {:?}", large.cell);
-    // indexed search: directory + posting, independent of the number of data blocks
-    assert_eq!(small.find.0, large.find.0, "indexed search must not scan data blocks");
-    assert!(large.find.0 <= 3, "indexed search: {:?}", large.find);
+    // indexed search: root page (header + payload) and, for a posting too
+    // large for the leaf, its chunk block – never data blocks (0.28.2: the
+    // posting of a key grows with the data and moves out of the leaf)
+    assert!(small.find.0 <= 4 && large.find.0 <= 4, "indexed search must not scan data blocks: {:?} / {:?}", small.find, large.find);
     assert_eq!(large.find_again.0, 0, "repeated indexed search is served from the cache");
     // opening: one scan, at most a few reads per block (header + plausibility)
     let per_block = |m: &Measured| m.open.0 as f64 / (2 * m.blocks) as f64;

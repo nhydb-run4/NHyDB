@@ -78,9 +78,9 @@ def sc_values(db):
 
 
 def sc_overlay_delete(db):
-    """Sparse overlays/tombstones on BASE fields, delete/delete_record,
-    extensions surviving delete(realm, u), re-put after delete, overlapping
-    dense rewrites, pure sparse records."""
+    """Sparse overlays/tombstones on BASE fields, delete_area/delete_record,
+    extensions surviving a delete of the BASE fields (F026, T-02), re-put
+    after delete, overlapping dense rewrites, pure sparse records."""
     _schema(db)
     db.put_dense_batch(1, 1, _rows(1, 12), shape_id=1)
     db.put_extensions(1, 2, {"ext": "a"})
@@ -88,8 +88,8 @@ def sc_overlay_delete(db):
     db.commit()
     db.put_cell(1, 4, 2, 99)          # overlay on BASE x
     db.delete_cell(1, 5, 2)           # tombstone on BASE x
-    db.delete(1, 2)                   # extension 'a' stays visible (F026)
-    db.delete(1, 3)
+    db.delete_area(1, 2, 2, 1, 5)     # BASE only: extension 'a' stays visible (F026, T-02)
+    db.delete_record(1, 3)
     db.put(1, 3, [3, 4, "done", 1.5, "fox again"], shape_id=1)
     db.delete_record(1, 6)
     db.put_cell(1, 6, 2, 77)          # sparse BASE value after delete_record

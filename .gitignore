@@ -27,6 +27,10 @@ __pycache__/
 !/tests/python/golden/golden.nhydb
 !/tests/python/golden/golden.nhydb.layout.enc
 !/tests/python/golden/golden.nhydb.layout.key
+# Golden database of the older format 0.16: checks that it is rejected
+!/tests/python/golden_016/golden.nhydb
+!/tests/python/golden_016/golden.nhydb.layout.enc
+!/tests/python/golden_016/golden.nhydb.layout.key
 
 # OS / editor
 .DS_Store

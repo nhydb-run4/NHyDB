@@ -122,6 +122,87 @@ pub fn vals_to_out(v: Vec<Val>) -> OutCol {
     OutCol::Vals(v)
 }
 
+/// R4-B: `vals_to_out` built value by value (`sql_numpy` streams its rows):
+/// the same column for the same sequence of values, without keeping a
+/// `Val` per value while the column is bool, int64 or float64.
+#[derive(Default)]
+pub enum ColBuilder {
+    #[default]
+    Empty,
+    Bool(Vec<u8>),
+    Int(Vec<i64>),
+    /// float64 with the positions that were exact `Int` (|i| <= 2**53)
+    Float { f: Vec<f64>, ints: Vec<bool> },
+    Vals(Vec<Val>),
+}
+
+impl ColBuilder {
+    pub fn push(&mut self, v: Val) {
+        const EXACT: u64 = 1u64 << 53;
+        let cur = std::mem::take(self);
+        *self = match (cur, v) {
+            (ColBuilder::Empty, Val::Bool(b)) => ColBuilder::Bool(vec![b as u8]),
+            (ColBuilder::Empty, Val::Int(i)) => ColBuilder::Int(vec![i]),
+            (ColBuilder::Empty, Val::Float(x)) => ColBuilder::Float { f: vec![x], ints: vec![false] },
+            (ColBuilder::Empty, other) => ColBuilder::Vals(vec![other]),
+            (ColBuilder::Bool(mut b), Val::Bool(x)) => {
+                b.push(x as u8);
+                ColBuilder::Bool(b)
+            }
+            (ColBuilder::Int(mut is), Val::Int(i)) => {
+                is.push(i);
+                ColBuilder::Int(is)
+            }
+            (ColBuilder::Int(is), Val::Float(x)) if is.iter().all(|i| i.unsigned_abs() <= EXACT) => {
+                let mut f: Vec<f64> = is.iter().map(|i| *i as f64).collect();
+                let mut ints = vec![true; is.len()];
+                f.push(x);
+                ints.push(false);
+                ColBuilder::Float { f, ints }
+            }
+            (ColBuilder::Float { mut f, mut ints }, Val::Float(x)) => {
+                f.push(x);
+                ints.push(false);
+                ColBuilder::Float { f, ints }
+            }
+            (ColBuilder::Float { mut f, mut ints }, Val::Int(i)) if i.unsigned_abs() <= EXACT => {
+                f.push(i as f64);
+                ints.push(true);
+                ColBuilder::Float { f, ints }
+            }
+            (ColBuilder::Vals(mut vs), x) => {
+                vs.push(x);
+                ColBuilder::Vals(vs)
+            }
+            (other, x) => {
+                let mut vs = other.into_vals();
+                vs.push(x);
+                ColBuilder::Vals(vs)
+            }
+        };
+    }
+
+    fn into_vals(self) -> Vec<Val> {
+        match self {
+            ColBuilder::Empty => Vec::new(),
+            ColBuilder::Bool(b) => b.into_iter().map(|x| Val::Bool(x != 0)).collect(),
+            ColBuilder::Int(is) => is.into_iter().map(Val::Int).collect(),
+            ColBuilder::Float { f, ints } => f.into_iter().zip(ints).map(|(x, i)| if i { Val::Int(x as i64) } else { Val::Float(x) }).collect(),
+            ColBuilder::Vals(v) => v,
+        }
+    }
+
+    pub fn finish(self) -> OutCol {
+        match self {
+            ColBuilder::Empty => OutCol::I64(Vec::new()),
+            ColBuilder::Bool(b) => OutCol::Bool(b),
+            ColBuilder::Int(i) => OutCol::I64(i),
+            ColBuilder::Float { f, .. } => OutCol::F64(f),
+            ColBuilder::Vals(v) => OutCol::Vals(v),
+        }
+    }
+}
+
 fn typed<T: pyo3::buffer::Element + Copy>(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<T>> {
     let b = PyBuffer::<T>::get(obj)?;
     b.to_vec(py)
@@ -376,4 +457,46 @@ pub fn out_to_numpy(py: Python<'_>, col: OutCol) -> PyResult<Py<PyAny>> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ColumnBuffer>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod col_builder_tests {
+    use super::*;
+
+    fn same(a: &OutCol, b: &OutCol) -> bool {
+        match (a, b) {
+            (OutCol::I64(x), OutCol::I64(y)) => x == y,
+            (OutCol::F64(x), OutCol::F64(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+            (OutCol::Bool(x), OutCol::Bool(y)) => x == y,
+            (OutCol::Vals(x), OutCol::Vals(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| format!("{p:?}") == format!("{q:?}")),
+            _ => false,
+        }
+    }
+
+    /// R4-B: the incremental builder equals `vals_to_out` on random columns.
+    #[test]
+    fn builder_equals_vals_to_out() {
+        let pool = [
+            Val::Int(1), Val::Int(-7), Val::Int(1 << 53), Val::Int((1 << 53) + 1), Val::Int(i64::MIN), Val::Float(0.5),
+            Val::Float(-0.0), Val::Float(f64::NAN), Val::Bool(true), Val::Bool(false), Val::None, Val::str("x"),
+        ];
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 7) as usize;
+            // mostly homogeneous columns with occasional other values
+            let base = (next() % pool.len() as u64) as usize;
+            let col: Vec<Val> = (0..len).map(|_| if next() % 4 == 0 { pool[(next() % pool.len() as u64) as usize].clone() } else { pool[base].clone() }).collect();
+            let mut b = ColBuilder::default();
+            for v in col.iter().cloned() {
+                b.push(v);
+            }
+            assert!(same(&b.finish(), &vals_to_out(col.clone())), "{col:?}");
+        }
+    }
 }

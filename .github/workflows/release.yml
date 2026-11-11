@@ -83,7 +83,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
-          args: --release --out dist -i python3.9 python3.10 python3.11 python3.12 python3.13 python3.14
+          args: --release --out dist -i python3.12 python3.13 python3.14 python3.15
           # crates/nhydb-core/src/zlib.rs links the system zlib on Unix
           before-script-linux: |
             if command -v dnf >/dev/null; then dnf install -y zlib-devel
@@ -108,18 +108,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        id: py39
-        with:
-          python-version: "3.9"
-      - uses: actions/setup-python@v6
-        id: py310
-        with:
-          python-version: "3.10"
-      - uses: actions/setup-python@v6
-        id: py311
-        with:
-          python-version: "3.11"
-      - uses: actions/setup-python@v6
         id: py312
         with:
           python-version: "3.12"
@@ -131,13 +119,17 @@ jobs:
         id: py314
         with:
           python-version: "3.14"
+      - uses: actions/setup-python@v6
+        id: py315
+        with:
+          python-version: "3.15"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           # explicit interpreters only: automatic discovery would also pick up
-          # other Python versions preinstalled on the runner (e.g. 3.15 on macOS)
-          args: --release --out dist -i ${{ steps.py39.outputs.python-path }} ${{ steps.py310.outputs.python-path }} ${{ steps.py311.outputs.python-path }} ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }}
+          # other Python versions preinstalled on the runner (e.g. pre-releases)
+          args: --release --out dist -i ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }} ${{ steps.py315.outputs.python-path }}
       - uses: actions/upload-artifact@v6
         with:
           name: dist-macos-${{ matrix.target }}
@@ -149,18 +141,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
-        id: py39
-        with:
-          python-version: "3.9"
-      - uses: actions/setup-python@v6
-        id: py310
-        with:
-          python-version: "3.10"
-      - uses: actions/setup-python@v6
-        id: py311
-        with:
-          python-version: "3.11"
-      - uses: actions/setup-python@v6
         id: py312
         with:
           python-version: "3.12"
@@ -172,13 +152,17 @@ jobs:
         id: py314
         with:
           python-version: "3.14"
+      - uses: actions/setup-python@v6
+        id: py315
+        with:
+          python-version: "3.15"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: x64
           # explicit interpreters only: automatic discovery would also pick up
-          # other Python versions preinstalled on the runner (e.g. 3.15 on macOS)
-          args: --release --out dist -i ${{ steps.py39.outputs.python-path }} ${{ steps.py310.outputs.python-path }} ${{ steps.py311.outputs.python-path }} ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }}
+          # other Python versions preinstalled on the runner (e.g. pre-releases)
+          args: --release --out dist -i ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }} ${{ steps.py315.outputs.python-path }}
       - uses: actions/upload-artifact@v6
         with:
           name: dist-windows-x64
@@ -220,7 +204,7 @@ jobs:
           path: dist
 
   # Installs the built wheels like a user and runs the Python test suite on
-  # every platform with every supported Python version (5 x 6 = 30 jobs).
+  # every platform with every supported Python version (5 x 4 = 20 jobs).
   test:
     needs: verify
     runs-on: ${{ matrix.os }}
@@ -228,7 +212,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-latest, windows-latest]
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

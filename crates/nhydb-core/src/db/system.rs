@@ -119,7 +119,7 @@ fn read_json(path: &Path) -> Result<Val> {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::NotFound(format!("[Errno 2] No such file or directory: '{}'", path.display()))
         } else {
-            Error::IoPath(e, path.to_path_buf())
+            Error::IoPath(e, path.into())
         }
     })?;
     let s = std::str::from_utf8(&raw).map_err(|_| Error::Corruption(format!("{}: not UTF-8", path.display())))?;
@@ -140,7 +140,7 @@ pub fn key_create(path: &Path, db_id: &str, db_name: &str, mode: Durability) -> 
     let mut raw = raw.into_bytes();
     let dir = platform::parent_dir(path);
     // F048: OS errors name the key file
-    std::fs::create_dir_all(&dir).map_err(|e| Error::IoPath(e, path.to_path_buf()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| Error::IoPath(e, path.into()))?;
     let mut f = platform::create_new(path, true).map_err(|e| e.at_path(path))?;
     let res = (|| -> Result<()> {
         f.write_all(&raw)?;
@@ -418,13 +418,31 @@ pub fn check_record(item: &Val, prev: Option<&Val>) -> Result<()> {
     Ok(())
 }
 
+/// Binds a SYSTEM record taken from the block directory to the first record
+/// of the file (block directory, 0.17): the chain between them was checked
+/// when the directory was written; here the immutable cells must still be
+/// those of the bootstrap record and the generation must not go backwards.
+pub fn check_record_bound(item: &Val, first: &Val) -> Result<()> {
+    check_record(first, None)?;
+    let (c, f) = (item.get("cells").unwrap(), first.get("cells").unwrap());
+    if IMMUTABLE_CELLS.iter().any(|k| c.get(k) != f.get(k)) {
+        return Err(Error::Corruption("R0,u1 immutable system cells violated".into()));
+    }
+    let g = c.get("5").and_then(|v| v.as_i64());
+    let fg = f.get("5").and_then(|v| v.as_i64());
+    match (g, fg) {
+        (Some(g), Some(fg)) if g >= fg => Ok(()),
+        _ => Err(Error::Corruption("R0,u1 layout generation goes backwards".into())),
+    }
+}
+
 /// `_write_initial_system_db`: new DB file with superblocks and the first
 /// SYSTEM block (block ID 1).
 pub fn write_initial_db(path: &Path, record: &Val, mode: Durability) -> Result<()> {
     let payload = record.to_json()?.into_bytes();
     let end = align8(DATA_START + BLOCK_HEADER_SIZE as u64 + payload.len() as u64);
     let t = super::now_ns();
-    let st = SuperState { generation: 0, checkpoint_offset: 0, last_valid_end: end, next_block_id: 2, created_ns: t, updated_ns: t, flags: 0 };
+    let st = SuperState { generation: 0, checkpoint_offset: 0, last_valid_end: end, next_block_id: 2, created_ns: t, updated_ns: t, flags: 0, dir_root: 0 };
     let sb = pack_super(&st);
     let mut f = platform::create_new(path, false)?;
     f.write_all(&sb)?;

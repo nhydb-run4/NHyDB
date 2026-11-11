@@ -71,7 +71,7 @@ def test_sparse_overrides_consistent_across_access_paths(tmp_path):
     db.create_classic_layout(1, 1, "c", shape_id=1, base_reserve_to=8)
     db.put_dense_batch(1, 1, [[u, "a" if u % 2 else "b", u] for u in range(1, 21)], shape_id=1)
     db.put_points(1, [(4, 2, "a", "utf8"), (6, 3, 1000, "varuint"), (30, 1, 30, "varuint"), (30, 2, "b", "utf8")])
-    db.delete_point(1, 8, 3)
+    db.delete_cell(1, 8, 3)
     db.create_index(1, 1, "idx_status", "status")
     db.create_index(2, 1, "idx_amount", "amount")
     db.build_indexes(commit=True)

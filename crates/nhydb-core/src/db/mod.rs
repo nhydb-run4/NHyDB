@@ -9,25 +9,35 @@ pub mod batch;
 pub mod blockcache;
 pub mod columns;
 pub mod cursor;
+pub mod delete;
 pub mod dense;
+pub mod directory;
+pub mod idxspill;
 pub mod index;
 pub mod interval;
 pub mod layout;
 pub mod maint;
 pub mod materialize;
 pub mod math;
+pub mod mempot;
+pub mod merge;
 pub mod read;
 pub mod schema_ops;
+pub mod secindex;
+pub mod segindex;
 pub mod sparse;
 pub mod system;
 pub mod vindex;
+pub mod winners;
 
 #[cfg(test)]
 mod complexity_tests;
+#[cfg(test)]
+mod directory_tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::address::{lane_from_flags, Lane};
@@ -44,7 +54,8 @@ use system::SystemState;
 use crate::val::{Val, ValKey};
 use crate::vmap;
 
-use interval::IntervalIndex;
+use directory::{DelIndex, DirState};
+use segindex::SegIndex;
 
 /// Key `(realm, lane)`.
 pub type RL = (Nat, Lane);
@@ -84,25 +95,24 @@ pub struct SparseSegment {
     pub payload_len: u64,
 }
 
+/// Dense segments of one `(realm, lane)`: directory runs + in-memory tail
+/// (`segindex.rs`) and aggregates that are kept without the segments.
 #[derive(Default)]
 pub struct DenseKeyIndex {
-    /// Segments in registration order (stable indices).
-    pub segs: Vec<DenseSegment>,
-    pub iv: IntervalIndex,
+    pub(crate) idx: SegIndex<DenseSegment>,
+    /// sum of `count` over all segments
+    pub records: u64,
+    /// shapes referenced by the segments
+    pub shapes: std::collections::BTreeSet<u64>,
 }
 
-impl DenseKeyIndex {
-    /// Segments sorted by `(u_start, block_id)` (canonical list order).
-    pub fn sorted(&self) -> Vec<&DenseSegment> {
-        self.iv.ids_by_start().iter().map(|&i| &self.segs[i]).collect()
-    }
-}
-
+/// Sparse segments of one `(realm, lane)`.
 #[derive(Default)]
 pub struct SparseKeyIndex {
-    /// Segments in block order.
-    pub segs: Vec<SparseSegment>,
-    pub iv: IntervalIndex,
+    pub(crate) idx: SegIndex<SparseSegment>,
+    /// sums of `group_count` / `cell_count` over all segments
+    pub groups: u64,
+    pub cells: u64,
 }
 
 /// State of a sparse cell.
@@ -124,8 +134,23 @@ impl SVal {
     }
 }
 
-/// Merged sparse state of a u group: v → state.
-pub type SparseMap = BTreeMap<Nat, SVal>;
+/// Merged sparse state of a u group: v → (newest state, id of the block it
+/// comes from). The block id decides against a DENSE record (F1, see
+/// [`dense_hides`]).
+pub type SparseMap = BTreeMap<Nat, (SVal, u64)>;
+
+/// F1 (0.28.2/delete-api-f1): the newest write of a cell wins, whatever
+/// layer it went to. A DENSE record written in block `dense_bid` with
+/// `shape` holds every field of that shape; a SPARSE state of one of those
+/// fields written in an *older* block (`sparse_bid < dense_bid`) is hidden by
+/// the record. States of v outside the shape (extensions, reserved BASE
+/// positions, fields of other shapes) are never hidden: a `put` writes only
+/// the fields of its shape. DELETE blocks hide the DENSE record only; a full
+/// delete (`delete_record`) also tombstones every SPARSE state of the u.
+#[inline]
+pub(crate) fn dense_hides(shape: &ShapeDef, dense_bid: u64, v: &Nat, sparse_bid: u64) -> bool {
+    sparse_bid < dense_bid && shape.by_v(v).is_some()
+}
 
 /// Decoded sparse cell with type information.
 #[derive(Clone, Debug)]
@@ -156,30 +181,236 @@ pub type SparseBlockIndex = Vec<(Nat, u64, u32)>;
 /// States `(v, value/tombstone)` of a u group in a sparse block.
 pub type SparseStates = Vec<(Nat, SVal)>;
 
+/// Key of the posting pool (`[cache] posting_cache_bytes`): decoded index
+/// payloads of all kinds.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum PostKey {
+    /// document-u posting of a key
+    Us(u64, Lane, ValKey),
+    /// FULLTEXT term posting with positions
+    Ft(u64, Lane, String),
+    /// FULLTEXT document lengths: one segment (by its encoded key) or, for
+    /// indexes of 0.28.0/0.28.1, the whole list (empty key)
+    DocLens(u64, Lane, Vec<u8>),
+    /// AP9: base posting \ change mask ∪ overlay of a stale index, valid
+    /// for one overlay version (`db/index/ixmaint.rs`)
+    Ov(u64, Lane, ValKey, u64),
+}
+
+#[derive(Clone)]
+pub(crate) enum PostVal {
+    Us(Arc<Vec<Nat>>),
+    Ft(Arc<Vec<crate::textindex::FtPosting>>),
+    DocLens(Arc<crate::textindex::DocLenSeg>),
+}
+
 #[derive(Default)]
 pub(crate) struct Caches {
-    pub sparse_block_index: HashMap<u64, Arc<SparseBlockIndex>>,
-    /// Decoded states per `(block_id, u)`: blocks are immutable, so writes
-    /// never invalidate entries (P019); schema changes clear it
-    /// (`clear_decode_caches`), rollbacks reset all caches.
-    pub sparse_record: HashMap<(u64, Nat), Arc<SparseStates>>,
-    pub sparse_merged: HashMap<(Nat, Lane, Nat), Arc<SparseMap>>,
+    /// Sparse decode caches, one byte budget for the three
+    /// (`[cache] sparse_cache_bytes`, `trim_sparse`): group directory of a
+    /// sparse block (by block offset); decoded states per `(block_id, u)`
+    /// (blocks are immutable, so writes never invalidate entries, P019;
+    /// schema changes clear them, `clear_decode_caches`; rollbacks reset all
+    /// caches); merged state of a u group `(realm, lane, u)`.
+    pub(crate) sparse_block_index: mempot::BudgetMap<u64, Arc<SparseBlockIndex>>,
+    pub(crate) sparse_record: mempot::BudgetMap<(u64, Nat), Arc<SparseStates>>,
+    pub(crate) sparse_merged: mempot::BudgetMap<(Nat, Lane, Nat), Arc<SparseMap>>,
     /// v indexes per `(realm, lane, u)` (see `vindex.rs`)
-    pub sparse_uindex: HashMap<(Nat, Lane, Nat), Arc<vindex::UIndex>>,
-    /// Number of jump marks in `sparse_uindex`
-    pub uindex_ck: usize,
-    pub field_meta: HashMap<(Nat, Nat, Nat), Option<FieldDef>>,
+    /// cached v indexes with their last use (LRU tick)
+    pub sparse_uindex: HashMap<(Nat, Lane, Nat), (Arc<vindex::UIndex>, u64)>,
+    /// estimated heap bytes of `sparse_uindex`
+    pub uindex_bytes: usize,
+    pub uindex_tick: u64,
+    /// v index builds (complete) and catch-ups (later blocks only)
+    pub uindex_builds: u64,
+    pub uindex_catchups: u64,
+    /// declared type per address and the tick of its last use (RUN8: LRU half)
+    pub field_meta: HashMap<(Nat, Nat, Nat), (Option<FieldDef>, u64)>,
+    pub field_meta_tick: u64,
     /// Block cache + per-block "verified" registry (`blockcache.rs`).
     pub block_cache: blockcache::BlockCache,
-    /// Items held in the budgeted caches (R016, `blockcache::bounded_insert`).
-    pub used: blockcache::CacheUse,
-    pub postings: HashMap<(u64, Lane, ValKey), Arc<Vec<Nat>>>,
-    /// Lazily loaded SECONDARY directories and sorted keys.
-    pub sec_dirs: HashMap<(u64, Lane), Arc<SecondaryDir>>,
-    pub sec_sorted: HashMap<(u64, Lane), Arc<Vec<Val>>>,
-    /// FULLTEXT payloads (positions per term, corpus).
-    pub ft_postings: HashMap<(u64, Lane, String), Arc<Vec<crate::textindex::FtPosting>>>,
-    pub ft_corpus: HashMap<(u64, Lane), Arc<crate::textindex::FtCorpus>>,
+    /// Decoded index payloads (postings, FULLTEXT positions and document
+    /// lengths), one byte budget.
+    pub(crate) postings: mempot::BudgetMap<PostKey, PostVal>,
+    /// Decoded pages of the SECONDARY key trees by block offset (LRU,
+    /// budget `[cache] index_page_cache_bytes`).
+    pub(crate) sec_pages: mempot::BudgetMap<u64, Arc<secindex::SecPage>>,
+    /// pages read from the file
+    pub(crate) sec_reads: u64,
+    /// Decoded block directory pages with their last use (LRU, budget in
+    /// entries, `directory.rs`).
+    pub(crate) dir_pages: HashMap<u64, (directory::AnyPage, u64)>,
+    pub(crate) dir_pages_used: usize,
+    /// estimated heap bytes of `dir_pages`
+    pub(crate) dir_pages_bytes: usize,
+    pub(crate) dir_tick: u64,
+    /// bytes of this handle booked in the process pot (`mempot.rs`)
+    pub(crate) charged: usize,
+    /// 0.28.2/scan: winner views built / not built (budget, compact form,
+    /// metadata; `stats()["overlay_view"]`, since open or the last rollback)
+    pub(crate) overlay_view_built: u64,
+    pub(crate) overlay_view_declined: u64,
+}
+
+/// Estimated bytes of one `field_meta` entry: key, value, map slot and the
+/// heap of the field definition (RB3-04).
+const FIELD_META_COST: usize = std::mem::size_of::<((Nat, Nat, Nat), (Option<FieldDef>, u64))>() + 96;
+
+/// Estimated heap bytes of a value (strings, bytes, containers).
+pub fn val_heap(v: &Val) -> usize {
+    match v {
+        Val::Str(s) => s.capacity(),
+        Val::Bytes(b) => b.capacity(),
+        Val::Big(b) => b.bits() as usize / 8 + 16,
+        Val::List(l) => l.capacity() * std::mem::size_of::<Val>() + l.iter().map(val_heap).sum::<usize>(),
+        Val::Map(m) => m.capacity() * std::mem::size_of::<(String, Val)>() + m.iter().map(|(k, v)| k.capacity() + val_heap(v)).sum::<usize>(),
+        _ => 0,
+    }
+}
+
+pub(crate) fn nat_heap(n: &Nat) -> usize {
+    match n {
+        Nat::S(_) => 0,
+        Nat::B(b) => b.bits() as usize / 8 + 32,
+    }
+}
+
+fn sval_heap(s: &SVal) -> usize {
+    match s {
+        SVal::Tomb => 0,
+        SVal::V(v) => val_heap(v),
+    }
+}
+
+/// Estimated heap bytes of a group directory.
+pub(crate) fn block_index_cost(v: &SparseBlockIndex) -> usize {
+    v.capacity() * std::mem::size_of::<(Nat, u64, u32)>() + v.iter().map(|e| nat_heap(&e.0)).sum::<usize>() + 48
+}
+
+/// Estimated heap bytes of decoded record states.
+pub(crate) fn states_cost(v: &SparseStates) -> usize {
+    v.capacity() * std::mem::size_of::<(Nat, SVal)>() + v.iter().map(|(n, s)| nat_heap(n) + sval_heap(s)).sum::<usize>() + 48
+}
+
+/// Estimated heap bytes of a merged u group (BTreeMap: about 1.5 slots per
+/// entry).
+pub(crate) fn merged_cost(m: &SparseMap) -> usize {
+    m.len() * std::mem::size_of::<(Nat, (SVal, u64))>() * 3 / 2 + m.iter().map(|(n, (s, _))| nat_heap(n) + sval_heap(s)).sum::<usize>() + 48
+}
+
+impl PostVal {
+    pub(crate) fn cost(&self) -> usize {
+        match self {
+            PostVal::Us(v) => 48 + v.capacity() * std::mem::size_of::<Nat>() + v.iter().map(nat_heap).sum::<usize>(),
+            PostVal::Ft(v) => {
+                48 + v.capacity() * std::mem::size_of::<crate::textindex::FtPosting>()
+                    + v.iter().map(|p| p.positions.capacity() * 8 + nat_heap(&p.u)).sum::<usize>()
+            }
+            PostVal::DocLens(s) => s.cost(),
+        }
+    }
+}
+
+impl Caches {
+    pub(crate) fn sparse_bytes(&self) -> usize {
+        self.sparse_block_index.bytes() + self.sparse_record.bytes() + self.sparse_merged.bytes()
+    }
+
+    /// Evicts from the three sparse caches (largest first) until they hold
+    /// at most `limit` bytes together; returns the bytes freed.
+    pub(crate) fn evict_sparse_to(&mut self, limit: usize) -> usize {
+        let before = self.sparse_bytes();
+        while self.sparse_bytes() > limit {
+            let excess = self.sparse_bytes() - limit;
+            let sizes = [self.sparse_block_index.bytes(), self.sparse_record.bytes(), self.sparse_merged.bytes()];
+            let (i, &n) = sizes.iter().enumerate().max_by_key(|(_, b)| **b).expect("three");
+            let to = n.saturating_sub(excess);
+            let got = match i {
+                0 => self.sparse_block_index.evict_to(to),
+                1 => self.sparse_record.evict_to(to),
+                _ => self.sparse_merged.evict_to(to),
+            };
+            if got == 0 {
+                break;
+            }
+        }
+        before - self.sparse_bytes()
+    }
+
+    /// Keeps the three sparse caches within their common budget (down to
+    /// 3/4 of it once exceeded).
+    pub(crate) fn trim_sparse(&mut self, budget: usize) {
+        if self.sparse_bytes() > budget {
+            self.evict_sparse_to(budget - budget / 4);
+        }
+    }
+
+    /// Bytes held by this handle (what is booked in the process pot).
+    pub(crate) fn tracked_bytes(&self) -> usize {
+        self.sparse_bytes()
+            + self.uindex_bytes
+            + self.block_cache.tracked_bytes()
+            + self.postings.bytes()
+            + self.sec_pages.bytes()
+            + self.dir_pages_bytes
+            + self.field_meta_bytes()
+    }
+
+    /// Estimated heap bytes of the field type cache (entry, map slot and
+    /// the name of the field definition).
+    pub(crate) fn field_meta_bytes(&self) -> usize {
+        self.field_meta.len() * FIELD_META_COST
+    }
+
+    /// Evicts about `want` bytes, least recently used first, from the pools
+    /// in the order of their size. A pool that frees nothing is skipped, not
+    /// the end of the eviction (RB3-02). The verified registry comes last:
+    /// dropping it costs CRC checks again. Returns the bytes freed.
+    pub(crate) fn shrink(&mut self, want: usize) -> usize {
+        const POOLS: usize = 7;
+        let mut freed = 0usize;
+        let mut exhausted = [false; POOLS + 1];
+        for _ in 0..(8 + POOLS + 1) {
+            if freed >= want {
+                break;
+            }
+            let pools = [
+                self.postings.bytes(),
+                self.sparse_bytes(),
+                self.block_cache.cached_bytes(),
+                self.sec_pages.bytes(),
+                self.uindex_bytes,
+                self.dir_pages_bytes,
+                self.field_meta_bytes(),
+            ];
+            let pick = pools.iter().enumerate().filter(|(i, b)| !exhausted[*i] && **b > 0).max_by_key(|(_, b)| **b).map(|(i, b)| (i, *b));
+            let (i, size) = match pick {
+                Some(p) => p,
+                None if !exhausted[POOLS] && self.block_cache.registry_bytes() > 0 => (POOLS, self.block_cache.registry_bytes()),
+                None => break,
+            };
+            let take = (want - freed).min(size);
+            let limit = size - take;
+            let got = match i {
+                0 => self.postings.evict_to(limit),
+                1 => self.evict_sparse_to(limit),
+                2 => self.block_cache.evict_to(limit),
+                3 => self.sec_pages.evict_to(limit),
+                4 => vindex::evict_uindex_to(self, limit),
+                5 => directory::evict_dir_pages_to(self, limit),
+                6 => {
+                    self.field_meta.clear();
+                    size
+                }
+                _ => self.block_cache.shrink_registry(take),
+            };
+            if got == 0 {
+                exhausted[i] = true;
+            }
+            freed += got;
+        }
+        freed
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +489,9 @@ pub struct OpenOptions {
     pub lock: LockOverride,
     /// Internal compaction staging file (file name check is skipped).
     pub internal_compaction: bool,
+    /// Ignore the block directory and scan every block on open (used by
+    /// the compaction of a file whose directory is damaged).
+    pub ignore_directory: bool,
 }
 
 impl OpenOptions {
@@ -328,6 +562,9 @@ pub struct Db {
     own_super: bool,
     /// Warnings of the open (superblock fallback, key file permissions, …).
     pub open_warnings: Vec<String>,
+    /// RUN¹⁰: an internal handle (temporary file of create/compaction); it
+    /// neither defines the RAM limiter nor ends its statistics interval
+    internal: bool,
     pub checkpoint_offset: u64,
     pub last_valid_end: u64,
     pub next_block_id: u64,
@@ -344,7 +581,8 @@ pub struct Db {
     pub index_defs: BTreeMap<u64, IndexDef>,
     pub(crate) index_name_map: HashMap<(Nat, String), u64>,
     pub(crate) dense: HashMap<RL, DenseKeyIndex>,
-    pub(crate) deletes: HashMap<(Nat, Lane, Nat), u64>,
+    /// DELETE entries per `(realm, lane)` (directory runs + tail).
+    pub(crate) deletes: HashMap<RL, DelIndex>,
     pub(crate) secondary_blocks: HashMap<(u64, Lane), index::SecondaryMeta>,
     pub(crate) secondary_source_block: HashMap<(u64, Lane), u64>,
     pub(crate) max_u: HashMap<RL, Nat>,
@@ -360,7 +598,17 @@ pub struct Db {
     pub last_checkpoint_obj: Val,
     pub(crate) dyn_mode: DynMode,
     pub(crate) dyn_v: Option<Nat>,
-    pub(crate) caches: Mutex<Caches>,
+    pub(crate) caches: Arc<Mutex<Caches>>,
+    /// AP9: overlays of stale indexes per `(realm, lane, index source)`
+    /// (`db/index/ixmaint.rs`); derived, rebuilt on demand.
+    pub(crate) overlays: Mutex<index::ixmaint::OverlayMap>,
+    /// AP9: maintenance state of the writer per `(realm, lane)`.
+    pub(crate) ixm: HashMap<RL, index::ixmaint::MaintState>,
+    /// AP9: a maintenance step is running (its own commits do not start another).
+    pub(crate) ixm_busy: bool,
+    /// AP9: indexes defined since the last commit (built by `build_indexes`,
+    /// not by the maintenance of the commit that publishes them).
+    pub(crate) ixm_new_defs: HashSet<u64>,
     /// Effective runtime configuration.
     pub config: Config,
     /// Process write lock (`<db>.lock`).
@@ -373,6 +621,20 @@ pub struct Db {
     pub math_layouts: BTreeMap<u64, math::MathLayoutState>,
     /// Internal copy (compaction) may write into exclusive MATH realms.
     pub(crate) internal_math_writes: bool,
+    /// IT1: counts the events that discard data of this handle (rollback,
+    /// dropped append buffer). Cursors remember it on their first batch and
+    /// stop instead of reading block offsets that may be reused by new
+    /// writes ([`Db::check_cursor_epoch`]).
+    pub(crate) cursor_epoch: u64,
+    /// Persistent block directory state (`directory.rs`).
+    pub(crate) dir: DirState,
+    /// flush mode of the next commit (`checkpoint`, compaction target)
+    pub(crate) dir_force: Option<directory::FlushMode>,
+    /// open without the block directory (`OpenOptions::ignore_directory`)
+    pub(crate) ignore_directory: bool,
+    /// Write path fills the sparse group-directory cache with the blocks it
+    /// writes (off for the compaction target: nothing reads them there).
+    pub(crate) write_cache: bool,
 }
 
 /// Low-level block information (`BlockInfo`).
@@ -488,12 +750,12 @@ impl Db {
             for old in [p, lp.as_path(), kp.as_path()] {
                 if old.exists() {
                     let a = sibling_temp(old, "replaced")?;
-                    std::fs::rename(old, &a).map_err(|e| Error::IoPath(e, old.to_path_buf()))?;
+                    std::fs::rename(old, &a).map_err(|e| Error::IoPath(e, old.into()))?;
                     aside.push((old.to_path_buf(), a));
                 }
             }
             for (t, fin) in [(&tkp, &kp), (&tlp, &lp), (&tdb, &p.to_path_buf())] {
-                std::fs::rename(t, fin).map_err(|e| Error::IoPath(e, fin.clone()))?;
+                std::fs::rename(t, fin).map_err(|e| Error::IoPath(e, fin.as_path().into()))?;
                 placed.push(fin.clone());
                 platform::sync_renamed(fin, mode).map_err(|e| e.at_path(fin))?; // R005 (Windows)
             }
@@ -536,7 +798,16 @@ impl Db {
         let cfg = opts.resolve_config(&p)?;
         cfg.durability.check_supported()?;
         let lock = if opts.readonly { DbLock::none(&p) } else { DbLock::acquire(&p, cfg.lock)? };
-        Db::open_locked(&p, &opts, cfg, lock)
+        let db = Db::open_locked(&p, &opts, cfg, lock)?;
+        // E6 (R9B-04): a staging file of an in-place compaction that was
+        // killed. A compaction holds the write lock of the database for its
+        // whole run, so while this handle holds its own lock none can run:
+        // the file is a leftover and removed (best effort; `health` reports
+        // one that stays).
+        if db.lock.is_held() {
+            let _ = db.remove_compaction_leftover_unchecked();
+        }
+        Ok(db)
     }
 
     /// Opens with the lock already held. Fail closed: nothing in the file is
@@ -642,6 +913,7 @@ impl Db {
             other_super,
             own_super: false,
             open_warnings: Vec::new(),
+            internal: opts.internal_compaction,
             checkpoint_offset: sup.checkpoint_offset,
             last_valid_end: sup.last_valid_end,
             next_block_id: sup.next_block_id,
@@ -670,7 +942,11 @@ impl Db {
             last_checkpoint_obj: Val::map(),
             dyn_mode: DynMode::Off,
             dyn_v: None,
-            caches: Mutex::new(Caches::default()),
+            caches: Arc::new(Mutex::new(Caches::default())),
+            overlays: Mutex::new(HashMap::new()),
+            ixm: HashMap::new(),
+            ixm_busy: false,
+            ixm_new_defs: HashSet::new(),
             config: cfg,
             lock,
             sys: SystemState {
@@ -687,10 +963,16 @@ impl Db {
             max_db_size_bytes: crate::config::DEFAULT_DB_MAX_SIZE_BYTES,
             math_layouts: BTreeMap::new(),
             internal_math_writes: false,
+            cursor_epoch: 0,
+            dir: DirState::default(),
+            dir_force: None,
+            ignore_directory: opts.ignore_directory,
+            write_cache: true,
         };
-        // 1) One scan over the committed range: register data blocks,
-        //    verify the R0 chain, reject layout metadata inside the DB.
-        let record = db.open_scan(committed)?;
+        // 1) Block directory of the superblock plus one scan over the
+        //    committed blocks behind it (or the full scan): register data
+        //    blocks, verify the R0 chain, reject layout metadata inside the DB.
+        let record = db.load_storage_state(committed)?;
         #[cfg(test)]
         AFTER_OPEN_SCAN.with(|h| {
             if let Some(f) = h.borrow_mut().as_mut() {
@@ -776,7 +1058,9 @@ impl Db {
                 db.invalidate_blocks_from(committed);
             }
         }
+        warnings.append(&mut db.open_warnings);
         db.open_warnings = warnings;
+        db.register_caches();
         Ok(db)
     }
 
@@ -799,16 +1083,19 @@ impl Db {
     }
 
     /// Plausibility of the DATA routing prefixes registered by the open scan
-    /// (they are read without payload CRC, see F021): every DATA segment
+    /// (read without payload CRC, protected by the prefix checksum, F021):
+    /// every DATA segment
     /// must refer to a published shape of its own realm (`put_dense_batch`
     /// only writes a shape of the target realm, and a shape never changes
     /// its realm), so a flipped realm varint is rejected here. A flipped
     /// `u_start` of the same length is caught when a read misses the
     /// displaced segment (`check_uncovered_u`). SPARSE prefixes are covered
-    /// by the payload CRC during the scan (`verify_scanned_payload`).
+    /// by the prefix checksum.
     fn check_segment_plausibility(&self) -> Result<()> {
-        for idx in self.dense.values() {
-            for seg in &idx.segs {
+        // The tail segments carry their block; the persisted ones are
+        // represented by the shape set of their key (directory aggregate).
+        for ((realm, _lane), idx) in &self.dense {
+            for seg in &idx.idx.tail {
                 let Some(shape) = self.shapes.get(&seg.shape_id) else {
                     return Err(Error::Corruption(format!(
                         "DATA block {} (byte {}) refers to unknown shape {}",
@@ -822,6 +1109,18 @@ impl Db {
                     )));
                 }
             }
+            for sid in &idx.shapes {
+                match self.shapes.get(sid) {
+                    None => return Err(Error::Corruption(format!("DATA segments of realm {realm} refer to unknown shape {sid}"))),
+                    Some(shape) if &shape.realm_id != realm => {
+                        return Err(Error::Corruption(format!(
+                            "DATA segments of realm {realm} refer to shape {sid} of realm {}",
+                            shape.realm_id
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
         }
         Ok(())
     }
@@ -829,6 +1128,8 @@ impl Db {
     /// Resets all state derived from the file and schema
     /// (rollback of a failed MATH batch).
     pub(crate) fn reset_in_memory_state(&mut self) {
+        // AP9: overlays and counters describe the discarded state
+        self.ixm_reset();
         self.realms.clear();
         self.shapes.clear();
         self.extension_defs.clear();
@@ -849,7 +1150,9 @@ impl Db {
         self.dense_overlap_keys.clear();
         self.has_overlays = false;
         self.math_layouts.clear();
-        *self.caches.get_mut().unwrap_or_else(|e| e.into_inner()) = Caches::default();
+        *self.cache() = Caches::default();
+        let stats = self.dir.stats;
+        self.dir = DirState { stats, ..DirState::default() };
     }
 
     pub fn sync_mode(&self) -> SyncMode {
@@ -871,6 +1174,27 @@ impl Db {
             return Err(Error::NHyDB("database is closed".into()));
         }
         Ok(())
+    }
+
+    /// Current cursor epoch (IT1): changes whenever this handle discards
+    /// data that an open cursor may still refer to.
+    pub fn cursor_epoch(&self) -> u64 {
+        self.cursor_epoch
+    }
+
+    /// IT1: binds a cursor to the epoch of its first batch; afterwards a
+    /// changed epoch (rollback, dropped append buffer) ends the cursor with
+    /// an error instead of reading offsets of discarded blocks, which a new
+    /// write may already have reused.
+    pub fn check_cursor_epoch(&self, bound: &mut Option<u64>) -> Result<()> {
+        match *bound {
+            None => {
+                *bound = Some(self.cursor_epoch);
+                Ok(())
+            }
+            Some(e) if e == self.cursor_epoch => Ok(()),
+            Some(_) => Err(Error::NHyDB(CURSOR_INVALIDATED.into())),
+        }
     }
 
     /// `close(commit=True)`. A read-only database is closed without
@@ -903,7 +1227,8 @@ impl Db {
         self.closed = true;
         self.lock.release();
         // F028: no read is answered from caches after close (C_index).
-        *self.caches.get_mut().unwrap_or_else(|e| e.into_inner()) = Caches::default();
+        *self.cache() = Caches::default();
+        mempot::POT.unregister(&self.caches, !self.internal);
         res
     }
 
@@ -931,6 +1256,17 @@ impl Db {
     /// database must be reopened. A commit without changes writes no
     /// superblock once both slots hold the current state.
     pub fn commit(&mut self) -> Result<u64> {
+        let end = self.commit_core()?;
+        // AP9: automatic index maintenance after a successful data commit
+        // (its own commit; never fails the data commit)
+        if self.config.index_maint.auto && !self.ixm_busy {
+            self.ixm_after_commit();
+        }
+        self.ixm_new_defs.clear();
+        Ok(end.max(self.sup.last_valid_end))
+    }
+
+    fn commit_core(&mut self) -> Result<u64> {
         if self.closed {
             return Err(Error::NHyDB("database is closed".into()));
         }
@@ -954,7 +1290,15 @@ impl Db {
             let env = system::envelope_bytes(&db_id, &[self.sys.active_entry.clone(), next_entry.clone()], &self.sys.key)?;
             system::atomic_write(&self.sys.layout_path, &env, self.store.sync_mode)?;
             let next_record = system::next_record(&self.sys.record, new_gen, system::entry_digest(&next_entry)?);
-            self.append_block(BT_SYSTEM, next_record.to_json()?.as_bytes(), 0)?;
+            let (sys_off, _) = self.append_block(BT_SYSTEM, next_record.to_json()?.as_bytes(), 0)?;
+            let prev_sys_off = self.dir.last_system_off;
+            self.dir.last_system_off = sys_off;
+            let mode = self.dir_force.take().unwrap_or(directory::FlushMode::Commit);
+            if let Err(e) = self.maybe_flush_directory(mode) {
+                self.dir.last_system_off = prev_sys_off;
+                self.sys.poisoned = true;
+                return Err(e);
+            }
             let r = (|| -> Result<()> {
                 self.store.flush()?;
                 self.store.fsync_barrier()?;
@@ -973,10 +1317,12 @@ impl Db {
             // G2-1/G2-4: no blocks appended since the last commit – no
             // barrier, no superblock (a handle that changed nothing never
             // overwrites the commit boundary of another writer).
-            if !self.has_pending() {
+            let mode = self.dir_force.take().unwrap_or(directory::FlushMode::Commit);
+            if !self.has_pending() && !(mode != directory::FlushMode::Commit && self.directory_checkpoint_pending(mode)) {
                 return Ok(self.sup.last_valid_end);
             }
             self.check_no_concurrent_writer()?;
+            self.maybe_flush_directory(mode)?;
             // A failed write keeps the buffer (retry possible); a failed
             // fsync or superblock write poisons the handle.
             self.store.flush()?;
@@ -1036,6 +1382,7 @@ impl Db {
             // writes them over the other writer's blocks.
             self.sys.poisoned = true;
             self.store.discard_pending();
+            self.cursor_epoch += 1;
             let end = self.store.len();
             self.invalidate_blocks_from(end);
             return Err(Error::Locked(format!(
@@ -1061,7 +1408,10 @@ impl Db {
     fn mirror_super(&mut self) -> Result<()> {
         let s = &self.sup;
         let mirrored = self.other_super.as_ref().is_some_and(|o| {
-            o.last_valid_end == s.last_valid_end && o.checkpoint_offset == s.checkpoint_offset && o.next_block_id == s.next_block_id
+            o.last_valid_end == s.last_valid_end
+                && o.checkpoint_offset == s.checkpoint_offset
+                && o.next_block_id == s.next_block_id
+                && o.dir_root == s.dir_root
         });
         if !self.own_super || mirrored || self.has_pending() || self.concurrent_writer()?.is_some() {
             return Ok(());
@@ -1085,6 +1435,7 @@ impl Db {
             created_ns: self.sup.created_ns,
             updated_ns: now_ns(),
             flags: self.sup.flags,
+            dir_root: self.dir.root_off,
         };
         self.store.write_at((slot * SUPERBLOCK_SIZE) as u64, &pack_super(&s))?;
         self.store.fsync()?;
@@ -1148,7 +1499,8 @@ impl Db {
             )));
         }
         let payload = vmap! {"contract" => "NHYDB_DB_CONFIG_V015", "max_db_size_bytes" => Val::int(size_bytes as i128)}.to_json()?;
-        self.append_block_limit(BT_DB_CONFIG, &[payload.as_bytes()], 0, Some(size_bytes))?;
+        let (off, _) = self.append_block_limit(BT_DB_CONFIG, &[payload.as_bytes()], 0, Some(size_bytes))?;
+        self.dir.last_config_off = off;
         self.max_db_size_bytes = size_bytes;
         if commit {
             self.commit()?;
@@ -1298,7 +1650,7 @@ impl Db {
 
     pub(crate) fn read_header_at(&self, off: u64) -> Result<BlockInfo> {
         let size = self.store.len();
-        if off < DATA_START || off + BLOCK_HEADER_SIZE as u64 > size {
+        if off < DATA_START || off.checked_add(BLOCK_HEADER_SIZE as u64).is_none_or(|e| e > size) {
             return Err(Error::Corruption(format!("invalid block offset {off}")));
         }
         let mut raw = [0u8; BLOCK_HEADER_SIZE];
@@ -1331,25 +1683,48 @@ impl Db {
     /// Reads header and payload including CRC check (`_read_block`).
     pub(crate) fn read_block(&self, off: u64) -> Result<(BlockInfo, Vec<u8>)> {
         let info = self.read_header_at(off)?;
-        let payload = self.store.read_vec(off + BLOCK_HEADER_SIZE as u64, info.payload_len as usize)?;
-        if crc32(&payload) != info.payload_crc {
-            return Err(Error::Corruption(format!("block {}: payload CRC mismatch", info.block_id)));
-        }
+        let payload = self.read_payload_checked(&info)?;
         Ok((info, payload))
     }
 
+    /// Payload of the block `info` describes, CRC-checked.
+    pub(crate) fn read_payload_checked(&self, info: &BlockInfo) -> Result<Vec<u8>> {
+        let payload = self.store.read_vec(info.offset + BLOCK_HEADER_SIZE as u64, info.payload_len as usize)?;
+        if crc32(&payload) != info.payload_crc {
+            return Err(Error::Corruption(format!("block {}: payload CRC mismatch", info.block_id)));
+        }
+        Ok(payload)
+    }
+
     #[inline]
-    pub(crate) fn cache(&self) -> MutexGuard<'_, Caches> {
-        self.caches.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn cache(&self) -> mempot::CacheGuard<'_> {
+        mempot::CacheGuard::new(&self.caches)
+    }
+
+    /// Joins the process cache pot (`mempot.rs`); a different
+    /// `cache.total_bytes` than the one in force is reported as a warning.
+    fn register_caches(&mut self) {
+        let src = self.config.source.clone();
+        if let Some(w) = mempot::POT.register(&self.caches, self.config.cache_total_bytes, src.clone()) {
+            self.open_warnings.push(w);
+        }
+        // RUN¹⁰: the first handle of the process defines the limiter
+        if !self.internal {
+            let lim = crate::limiter::global();
+            if let Some(w) = lim.configure_for(&self.config.limiter, src, Some(&self.path)) {
+                self.open_warnings.push(w);
+            }
+            lim.start_log_clock();
+        }
     }
 
     pub(crate) fn clear_decode_caches(&mut self) {
-        let c = self.caches.get_mut().unwrap_or_else(|e| e.into_inner());
+        let mut c = self.cache();
         c.field_meta.clear();
         c.sparse_record.clear();
         c.sparse_merged.clear();
         c.sparse_uindex.clear();
-        c.uindex_ck = 0;
+        c.uindex_bytes = 0;
     }
 
     // ------------------------------------------------------------------
@@ -1388,6 +1763,8 @@ impl Db {
             let shape = get_vu_u64(raw, &mut p, "DATA shape")?;
             let u_start = get_vu(raw, &mut p)?;
             let count = get_vu_u64(raw, &mut p, "DATA count")?;
+            // RD-08: the routing prefix is checked on open
+            check_prefix_crc(raw, &mut p).map_err(|e| Error::Corruption(format!("DATA block {} (byte {}): {e}", info.block_id, info.offset)))?;
             Ok((realm, shape, u_start, count, p))
         })?;
         if u_start.is_zero() {
@@ -1403,8 +1780,8 @@ impl Db {
         if records_off > payload_off + info.payload_len {
             return Err(Error::Corruption(format!("DATA block {}: offset table too large", info.block_id)));
         }
-        // Plausibility of the (not CRC-checked) prefix: the last entry of the
-        // offset table must end exactly at the end of the payload.
+        // Plausibility of the offset table (not covered by the prefix
+        // checksum): its last entry must end exactly at the end of the payload.
         let last: [u8; 4] = sb.get(&self.store, records_off - 4, 4)?.try_into().expect("4 bytes");
         if records_off + u32::from_le_bytes(last) as u64 != payload_off + info.payload_len {
             return Err(Error::Corruption(format!(
@@ -1429,41 +1806,6 @@ impl Db {
         })
     }
 
-    /// F021: CRC check of a SPARSE payload during the open scan. Sparse
-    /// overlays of a u overlap freely, so a displaced segment (flipped realm,
-    /// `u_start` or `u_end` of the same varint length) cannot be found from
-    /// its neighbours at read time; a missed overlay would silently return
-    /// the older BASE value. Small blocks usually already sit in the scan
-    /// window; larger ones are streamed in chunks. The block is registered as
-    /// verified, so later reads do not check it again.
-    fn verify_scanned_payload(&mut self, info: &BlockInfo, sb: &mut ScanBuf) -> Result<()> {
-        const CHUNK: u64 = 1 << 20;
-        let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
-        let crc = if info.payload_len <= ScanBuf::LARGE_WINDOW as u64 {
-            crc32(sb.get(&self.store, payload_off, info.payload_len as usize)?)
-        } else {
-            let mut h = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; CHUNK as usize];
-            let end = payload_off + info.payload_len;
-            let mut off = payload_off;
-            while off < end {
-                let n = (end - off).min(CHUNK) as usize;
-                self.store.read_exact_at(off, &mut buf[..n])?;
-                h.update(&buf[..n]);
-                off += n as u64;
-            }
-            h.finalize()
-        };
-        if crc != info.payload_crc {
-            return Err(Error::Corruption(format!(
-                "SPARSE block {} (byte {}): payload CRC mismatch",
-                info.block_id, info.offset
-            )));
-        }
-        self.note_verified(info.offset, info.payload_len);
-        Ok(())
-    }
-
     fn parse_sparse_prefix(&self, info: &BlockInfo, sb: &mut ScanBuf) -> Result<SparseSegment> {
         let payload_off = info.offset + BLOCK_HEADER_SIZE as u64;
         let (realm, u_start, u_end, group_count, cell_count, p) =
@@ -1477,6 +1819,7 @@ impl Db {
                 let u_end = get_vu(raw, &mut p)?;
                 let group_count = get_vu_u64(raw, &mut p, "SPARSE groups")?;
                 let cell_count = get_vu_u64(raw, &mut p, "SPARSE cells")?;
+                check_prefix_crc(raw, &mut p).map_err(|e| Error::Corruption(format!("SPARSE block {} (byte {}): {e}", info.block_id, info.offset)))?;
                 Ok((realm, u_start, u_end, group_count, cell_count, p))
             })?;
         if group_count == 0 || cell_count == 0 || u_start.is_zero() || u_end < u_start {
@@ -1507,33 +1850,65 @@ impl Db {
         *e = (*e).max(bid);
     }
 
-    pub(crate) fn register_segment(&mut self, seg: DenseSegment) {
+    pub(crate) fn register_segment(&mut self, seg: DenseSegment) -> Result<()> {
         let key: RL = (seg.realm_id.clone(), seg.lane);
         let bid = seg.block_id;
-        let idx = self.dense.entry(key.clone()).or_default();
-        if idx.iv.any_overlap(&seg.u_start, &seg.u_end) {
-            self.has_overlays = true;
-            self.overlay_keys.insert(key.clone());
-            self.dense_overlap_keys.insert(key.clone());
+        // Overlap with an earlier segment: decided once per key (the flag
+        // never goes back); beyond the largest u end no lookup is needed.
+        if !self.dense_overlap_keys.contains(&key) {
+            let beyond = self.max_u.get(&key).is_none_or(|m| &seg.u_start > m);
+            let overlap = !beyond
+                && match self.dense.get(&key) {
+                    Some(idx) => idx.idx.any_overlap(self, &seg.u_start, &seg.u_end)?,
+                    None => false,
+                };
+            if overlap {
+                self.has_overlays = true;
+                self.overlay_keys.insert(key.clone());
+                self.dense_overlap_keys.insert(key.clone());
+            }
         }
         let mu = self.max_u.entry(key.clone()).or_insert(Nat::ZERO);
         if seg.u_end > *mu {
             *mu = seg.u_end.clone();
         }
-        let i = idx.segs.len();
-        idx.iv.insert(seg.u_start.clone(), seg.u_end.clone(), i);
-        idx.segs.push(seg);
+        self.dir.tail_entries += 1;
+        self.dir.tail_bytes += seg.payload_len;
+        let idx = self.dense.entry(key.clone()).or_default();
+        idx.records += seg.count;
+        idx.shapes.insert(seg.shape_id);
+        let n = seg.count;
+        idx.idx.push(seg);
         self.note_data_block(&key, bid);
+        self.ixm_note_written(&key, n);
+        Ok(())
     }
 
     pub(crate) fn register_sparse_segment(&mut self, seg: SparseSegment) {
         let key: RL = (seg.realm_id.clone(), seg.lane);
         let bid = seg.block_id;
+        self.dir.tail_entries += 1;
+        self.dir.tail_bytes += seg.payload_len;
         let idx = self.sparse.entry(key.clone()).or_default();
-        let i = idx.segs.len();
-        idx.iv.insert(seg.u_start.clone(), seg.u_end.clone(), i);
-        idx.segs.push(seg);
+        idx.groups += seg.group_count;
+        idx.cells += seg.cell_count;
+        let n = seg.group_count;
+        idx.idx.push(seg);
         self.note_data_block(&key, bid);
+        self.ixm_note_written(&key, n);
+        self.has_overlays = true;
+        self.overlay_keys.insert(key);
+    }
+
+    /// Registers a DELETE of `(realm, lane, u)` by block `bid`.
+    pub(crate) fn register_delete(&mut self, realm: Nat, lane: Lane, u: Nat, bid: u64) {
+        let key: RL = (realm, lane);
+        self.dir.tail_entries += 1;
+        let d = self.deletes.entry(key.clone()).or_default();
+        let e = d.tail.entry(u).or_insert(0);
+        *e = (*e).max(bid);
+        self.note_data_block(&key, bid);
+        self.ixm_note_written(&key, 1);
         self.has_overlays = true;
         self.overlay_keys.insert(key);
     }
@@ -1551,6 +1926,9 @@ impl Db {
     fn open_scan_range(&mut self, start: u64, end: u64, mut record: Option<Val>) -> Result<Val> {
         let mut off = start;
         let mut maxid = 0u64;
+        // RA2-02: a continued scan starts behind a known block (directory
+        // root, earlier scan); its first block is checked against that id
+        let mut prev_id = if start > DATA_START { self.dir.scan_last_id } else { 0 };
         // P015: headers, prefixes and offset-table ends of consecutive
         // blocks come from one read-ahead window instead of 3 reads per block.
         let mut sb = ScanBuf::default();
@@ -1559,7 +1937,25 @@ impl Db {
             if off < DATA_START || off + BLOCK_HEADER_SIZE as u64 > size {
                 return Err(Error::Corruption(format!("invalid block offset {off}")));
             }
-            let info = Self::header_info(off, sb.get(&self.store, off, BLOCK_HEADER_SIZE)?, size)?;
+            let info = match Self::header_info(off, sb.get(&self.store, off, BLOCK_HEADER_SIZE)?, size) {
+                Ok(i) => i,
+                Err(e) => {
+                    // RA-01: a directory block with a damaged header is
+                    // redundant – skip it (the directory falls back anyway)
+                    let mut raw = [0u8; BLOCK_HEADER_SIZE];
+                    self.store.read_exact_at(off, &mut raw)?;
+                    let read_at = |buf: &mut [u8], o: u64| self.store.read_exact_at(o, buf);
+                    match directory::damaged_directory_extent(&read_at, off, &raw, end) {
+                        Some(next) => {
+                            self.open_warnings.push(format!("damaged block directory block at byte {off} skipped ({e})"));
+                            self.dir.stats.damaged += 1;
+                            off = next;
+                            continue;
+                        }
+                        None => return Err(e),
+                    }
+                }
+            };
             sb.adapt(info.next_offset - off);
             if info.next_offset > end {
                 return Err(Error::Corruption("system bootstrap: incomplete commit block".into()));
@@ -1573,28 +1969,55 @@ impl Db {
                         self.sys.math_constants_stored = true;
                     }
                     record = Some(item);
+                    self.dir.last_system_off = off;
+                }
+                BT_DIRECTORY => {
+                    // directory blocks of a later flush (catch-up of a
+                    // read-only handle): the blocks they cover are
+                    // registered by this scan anyway
                 }
                 bt if is_layout_meta(bt) => {
                     return Err(Error::Corruption("layout metadata must not be stored inside the DB".into()));
                 }
                 BT_DELETE | BT_CHECKPOINT | BT_DB_CONFIG => {
-                    let (_i, payload) = self.read_block(off)?;
+                    let payload = if info.payload_len <= ScanBuf::LARGE_WINDOW as u64 {
+                        let raw = sb.get(&self.store, off + BLOCK_HEADER_SIZE as u64, info.payload_len as usize)?.to_vec();
+                        if crc32(&raw) != info.payload_crc {
+                            return Err(Error::Corruption(format!("block {}: payload CRC mismatch", info.block_id)));
+                        }
+                        raw
+                    } else {
+                        self.read_block(off)?.1
+                    };
                     self.apply_meta_block(&info, &payload)?;
+                    match info.block_type {
+                        BT_CHECKPOINT => self.dir.last_checkpoint_off = off,
+                        BT_DB_CONFIG => self.dir.last_config_off = off,
+                        _ => {}
+                    }
                 }
                 BT_DATA_DENSE => {
                     let seg = self.parse_dense_prefix(&info, &mut sb)?;
-                    self.register_segment(seg);
+                    self.register_segment(seg)?;
                 }
                 BT_SPARSE_CELLS => {
-                    self.verify_scanned_payload(&info, &mut sb)?;
                     let seg = self.parse_sparse_prefix(&info, &mut sb)?;
+                    // not registered as verified: the payload CRC is
+                    // checked on first use
                     self.register_sparse_segment(seg);
                 }
                 BT_SECONDARY => {
                     self.parse_secondary_directory(&info)?;
                 }
+                BT_SECONDARY_PAGE => self.dir.unlisted_blocks += 1,
                 _ => {}
             }
+            // RD-05: block ids grow with the file position (a copied or
+            // swapped block with a foreign id is corruption)
+            if info.block_id <= prev_id && (off > start || start > DATA_START) {
+                return Err(Error::Corruption(format!("block {} at byte {off}: block ids not ascending (previous {prev_id})", info.block_id)));
+            }
+            prev_id = info.block_id;
             maxid = maxid.max(info.block_id);
             off = info.next_offset;
         }
@@ -1604,6 +2027,7 @@ impl Db {
         let record = record.ok_or_else(|| Error::Corruption("R0,u1 bootstrap missing or invalid end of file".into()))?;
         self.last_valid_end = end;
         self.next_block_id = self.next_block_id.max(maxid + 1);
+        self.dir.scan_last_id = prev_id;
         Ok(record)
     }
 
@@ -1636,11 +2060,7 @@ impl Db {
                 if p != payload.len() {
                     return Err(Error::Corruption("DELETE trailing bytes".into()));
                 }
-                let key: RL = (r.clone(), lane);
-                self.deletes.insert((r, lane, u), info.block_id);
-                self.note_data_block(&key, info.block_id);
-                self.has_overlays = true;
-                self.overlay_keys.insert(key);
+                self.register_delete(r, lane, u, info.block_id);
             }
             BT_CHECKPOINT => {
                 if payload.starts_with(CHECKPOINT_TAG) {
@@ -1716,7 +2136,7 @@ pub(crate) fn slots_from_bytes(raw: &[u8]) -> [SlotState; 2] {
         if b.len() == SUPERBLOCK_SIZE && &b[..8] != SUPER_MAGIC {
             return SlotState {
                 sup: None,
-                error: Some(format!("unsupported file format {} (expected NHYDB016)", String::from_utf8_lossy(&b[..8]))),
+                error: Some(format!("unsupported file format {} (expected NHYDB {FILE_FORMAT_VERSION})", format_name(&b[..8]))),
             };
         }
         match unpack_super(b) {
@@ -1759,6 +2179,11 @@ const OPEN_RACE_ATTEMPTS: u32 = 12;
 /// Maximum number of incremental catch-ups within one read-only open attempt
 /// (N1): each one scans only the bytes committed since the previous one.
 const OPEN_CATCH_UP_LIMIT: u32 = 64;
+
+/// Error of a cursor whose handle discarded data after its first batch (IT1).
+pub const CURSOR_INVALIDATED: &str =
+    "iterator invalidated: rollback() (or a dropped append buffer) discarded data of this database object after the \
+     iteration started; already returned and buffered results may belong to the discarded state. Restart the query";
 
 pub(crate) fn judge_superblocks(slots: &[SlotState; 2], physical: u64) -> SuperJudgement {
     let mut problems: Vec<String> = Vec::new();
@@ -1808,11 +2233,11 @@ pub(crate) fn judge_superblocks(slots: &[SlotState; 2], physical: u64) -> SuperJ
 /// The error names the affected path (`filename`).
 fn is_a_directory(_what: &str, p: &Path) -> Error {
     #[cfg(unix)]
-    return Error::IoPath(std::io::Error::from_raw_os_error(libc::EISDIR), p.to_path_buf());
+    return Error::IoPath(std::io::Error::from_raw_os_error(libc::EISDIR), p.into());
     #[cfg(not(unix))]
     return Error::IoPath(
         std::io::Error::new(std::io::ErrorKind::IsADirectory, format!("{_what} '{}' is a directory", p.display())),
-        p.to_path_buf(),
+        p.into(),
     );
 }
 
@@ -2288,7 +2713,12 @@ mod file_handle_tests {
         put(&mut w, 4, b"d".to_vec(), true).unwrap();
         let sup_before = std::fs::read(&p).unwrap()[..DATA_START as usize].to_vec();
         put(&mut r, 9, b"x".to_vec(), false).unwrap();
+        // IT1: the dropped append buffer also ends open cursors of the handle
+        let mode = cursor::RangeMode::Get { dyn_mode: None, dyn_v: None, include_extensions: true };
+        let mut cur = cursor::RangeCursor::new(Nat::S(1), NL, Nat::ZERO, Nat::S(100), mode);
+        assert_eq!(cur.next_batch(&r, 1).unwrap().len(), 1);
         assert!(matches!(r.commit(), Err(Error::Locked(m)) if m.contains("concurrent writer")));
+        assert!(matches!(cur.next_batch(&r, 1), Err(Error::NHyDB(m)) if m == CURSOR_INVALIDATED));
         assert_eq!(&std::fs::read(&p).unwrap()[..DATA_START as usize], &sup_before[..], "superblocks untouched");
         let _ = r.close(true);
         drop(r);

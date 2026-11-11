@@ -17,6 +17,7 @@ import warnings
 import pytest
 
 import nhydb
+import timing
 from nhydb.query import Q
 
 SB = 4096
@@ -107,7 +108,7 @@ def test_n1_real_plan_mismatch_stays_corruption(tmp_path):
         t = time.time()
         with pytest.raises(nhydb.CorruptionError, match="no layout plan"):
             nhydb.NHyDB(p, **kw)
-        assert time.time() - t < 5
+        assert time.time() - t < timing.limit(5)
 
 
 # --------------------------------------------------------------------------

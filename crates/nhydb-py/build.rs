@@ -51,13 +51,28 @@ fn source_files(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Content that enters the fingerprint. Manifests without their
+/// `license-file` lines: `maturin sdist` rewrites `license-file.workspace =
+/// true` to `license-file = "LICENSE.md"` (P-08), which does not change
+/// the build. Must match `_hashed_bytes()` in `tests/python/conftest.py`.
+fn hashed_bytes(rel: &str, data: Vec<u8>) -> Vec<u8> {
+    if !rel.ends_with("Cargo.toml") {
+        return data;
+    }
+    data.split_inclusive(|&b| b == b'\n')
+        .filter(|l| !l.trim_ascii_start().starts_with(b"license-file"))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.join("../..");
     let hash = if root.join("crates/nhydb-core/src").is_dir() {
         let mut crc = 0u32;
         for (rel, p) in source_files(&root) {
-            let data = fs::read(&p).unwrap_or_default();
+            let data = hashed_bytes(&rel, fs::read(&p).unwrap_or_default());
             crc = crc32_update(crc, rel.as_bytes());
             crc = crc32_update(crc, b"\0");
             crc = crc32_update(crc, &data);

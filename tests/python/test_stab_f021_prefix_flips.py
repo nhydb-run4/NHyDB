@@ -1,12 +1,12 @@
-"""F021: routing prefixes of DATA/SPARSE blocks are read on open without the
-payload CRC. A flipped value of the same varint length must not lead to
-silently missing or stale data: the open (or the first read) must raise
-CorruptionError.
+"""F021/RD-08: routing prefixes of DATA/SPARSE blocks are read on open
+without the payload CRC. Since 0.28.2 they carry their own CRC32 (prefix
+checksum), so a flipped value of the same varint length is rejected on open;
+the payload CRC is checked on first use. Silently missing or stale data must
+never result: the open (or the first read) must raise CorruptionError.
 
 Each case writes a small database, flips one prefix field in place and
-recomputes the payload and header CRC (the payload CRC is what protects the
-prefix; a consistent manipulation of both CRCs is out of scope, but a
-flipped prefix with a stale payload CRC must be caught)."""
+recomputes the header CRC (and optionally the payload CRC). A consistent
+manipulation of all CRCs is out of scope (forged block)."""
 import struct
 import zlib
 
@@ -15,9 +15,20 @@ import pytest
 
 import nhydb
 
-DATA_TAG, SPARSE_TAG = b"D10D", b"SP10"
+DATA_TAG, SPARSE_TAG = b"D28D", b"SP28"
+PREFIX_FIELDS = {DATA_TAG: 4, SPARSE_TAG: 5}
 HDR = 32
 
+
+
+def _crc32c(data):
+    """CRC-32C (Castagnoli) – the prefix checksum of DATA/SPARSE blocks."""
+    c = 0xFFFFFFFF
+    for x in data:
+        c ^= x
+        for _ in range(8):
+            c = (c >> 1) ^ (0x82F63B78 & -(c & 1))
+    return c ^ 0xFFFFFFFF
 
 def _hdr_crc(h):
     t = bytearray(h)
@@ -47,10 +58,10 @@ def _blocks(b, tag):
         off = (ps + plen + 7) & ~7
 
 
-def _flip(path, tag, field, old, new, nth=0, fix_payload_crc=False):
+def _flip(path, tag, field, old, new, nth=0, fix_payload_crc=False, fix_prefix_crc=False):
     """Replaces prefix field `field` (0-based VarUInt index after the tag)
     of the nth block with `tag`: old -> new (both single-byte varints). Only
-    the header CRC is recomputed unless `fix_payload_crc`."""
+    the header CRC is recomputed unless `fix_prefix_crc` / `fix_payload_crc`."""
     b = bytearray(path.read_bytes())
     off, ps, plen = list(_blocks(b, tag))[nth]
     p = ps + 4
@@ -59,6 +70,11 @@ def _flip(path, tag, field, old, new, nth=0, fix_payload_crc=False):
     assert _vu(b, p) == (old, p + 1), (_vu(b, p), old)
     assert old < 0x80 and new < 0x80
     b[p] = new
+    if fix_prefix_crc:
+        q = ps + 4
+        for _ in range(PREFIX_FIELDS[tag]):
+            q = _vu(b, q)[1]
+        struct.pack_into("<I", b, q, _crc32c(bytes(b[ps:q])))
     if fix_payload_crc:
         struct.pack_into("<I", b, off + 24, zlib.crc32(bytes(b[ps:ps + plen])) & 0xFFFFFFFF)
     struct.pack_into("<I", b, off + 28, _hdr_crc(b[off:off + HDR]))
@@ -131,6 +147,17 @@ def test_data_realm_flip_is_corruption_on_open(tmp_path):
     _two_realm_db(p).close()
     _flip(p, DATA_TAG, 0, 1, 2)  # realm 1 -> 2 (shape 1 belongs to realm 1)
     for kw in ({"readonly": True}, {}):
+        with pytest.raises(nhydb.CorruptionError, match="DATA block .* prefix checksum"):
+            nhydb.NHyDB(p, **kw)
+
+
+def test_data_realm_flip_with_fixed_prefix_checksum_is_corruption_on_open(tmp_path):
+    """Prefix checksum recomputed, payload CRC stale: the shape check of
+    0.28.0 still rejects the open (shape 1 belongs to realm 1)."""
+    p = tmp_path / "dp.nhydb"
+    _two_realm_db(p).close()
+    _flip(p, DATA_TAG, 0, 1, 2, fix_prefix_crc=True)
+    for kw in ({"readonly": True}, {}):
         with pytest.raises(nhydb.CorruptionError, match="realm"):
             nhydb.NHyDB(p, **kw)
 
@@ -143,13 +170,36 @@ def test_data_realm_flip_to_unknown_realm_is_corruption_on_open(tmp_path):
         nhydb.NHyDB(p, readonly=True)
 
 
-def test_sparse_prefix_flip_with_fixed_payload_crc_is_out_of_scope(tmp_path):
-    """Documents the boundary: with both CRCs recomputed the block is
+def test_sparse_prefix_flip_with_fixed_payload_crc_is_caught_by_prefix_checksum(tmp_path):
+    p = tmp_path / "fp.nhydb"
+    _overlay_db(p)
+    _flip(p, SPARSE_TAG, 0, 1, 2, fix_payload_crc=True)
+    for kw in ({"readonly": True}, {}):
+        with pytest.raises(nhydb.CorruptionError, match="SPARSE block .* prefix checksum"):
+            nhydb.NHyDB(p, **kw)
+
+
+def test_sparse_prefix_flip_with_fixed_prefix_checksum_fails_on_first_use(tmp_path):
+    """Prefix checksum recomputed, payload CRC stale: the open registers the
+    block (no payload CRC on open any more), the first use of the block
+    raises; reads never return the stale BASE value."""
+    p = tmp_path / "fq.nhydb"
+    _overlay_db(p)
+    _flip(p, SPARSE_TAG, 1, 5, 9, fix_prefix_crc=True)
+    with nhydb.NHyDB(p, readonly=True) as db:
+        with pytest.raises(nhydb.CorruptionError):
+            db.get(1, 20)
+        assert not db.verify()["ok"]
+    _reads_raise_or_correct(p, [(lambda db: db.get(1, 20)["a"], 999), (lambda db: db.get(2, 5)["a"], 105)])
+
+
+def test_sparse_prefix_flip_with_all_crcs_fixed_is_out_of_scope(tmp_path):
+    """Documents the boundary: with all CRCs recomputed the block is
     authentic as far as the file can tell; the open must still succeed and
     the database stay readable (no crash, no format error)."""
     p = tmp_path / "fx.nhydb"
     _overlay_db(p)
-    _flip(p, SPARSE_TAG, 0, 1, 2, fix_payload_crc=True)
+    _flip(p, SPARSE_TAG, 0, 1, 2, fix_prefix_crc=True, fix_payload_crc=True)
     with nhydb.NHyDB(p, readonly=True) as db:
         assert db.get(1, 5)["a"] == 5  # overlay now belongs to realm 2
         assert db.get(2, 5)["a"] == 999
@@ -163,21 +213,50 @@ def test_intact_sparse_db_opens_and_reads(tmp_path):
         assert db.verify(deep=True)["ok"]
 
 
-def test_large_sparse_block_is_crc_checked_on_open(tmp_path):
-    """A SPARSE payload above the 64 KiB scan window is CRC-checked in
-    chunks (streamed path); intact it opens, a flipped realm is rejected."""
-    p = tmp_path / "big.nhydb"
+def _big_sparse_db(p, n=30_000):
     db = _two_realm_db(p)
-    n = 30_000
     db.put_cells_numpy(1, np.arange(1, n + 1, dtype=np.uint64), 7,
                        np.arange(n, dtype=np.uint64), type="u64", commit=True,
                        u_window=n)
     db.close()
+
+
+def test_large_sparse_block_body_damage_is_caught_on_first_use(tmp_path):
+    """RD-08: the open checks only the prefix checksum of a SPARSE block; a
+    damaged byte at the end of the payload is found by the payload CRC on
+    the first use of the block. The open must not register the block as
+    verified, otherwise a partial read of an intact group would pass."""
+    p = tmp_path / "bd.nhydb"
+    n = 30_000
+    _big_sparse_db(p, n)
+    b = bytearray(p.read_bytes())
+    (off, ps, plen), = _blocks(b, SPARSE_TAG)
+    b[ps + plen - 3] ^= 0x01
+    p.write_bytes(bytes(b))
+    with nhydb.NHyDB(p, readonly=True) as db:
+        assert db.get(2, 5)["a"] == 105  # other realm: untouched
+        with pytest.raises(nhydb.CorruptionError, match="CRC"):
+            db.get_value(1, 1, 7)  # first group intact, block damaged
+        with pytest.raises(nhydb.CorruptionError):
+            db.get_value(1, 2, 7)
+        assert not db.verify()["ok"]
+    before = p.read_bytes()
+    with pytest.raises(nhydb.CorruptionError):
+        nhydb.NHyDB.compact_file(p, make_backup=False)
+    assert p.read_bytes() == before
+
+
+def test_large_sparse_block_is_crc_checked_on_open(tmp_path):
+    """A SPARSE payload above the 64 KiB scan window: intact it opens, a
+    flipped realm is rejected on open by the prefix checksum."""
+    p = tmp_path / "big.nhydb"
+    n = 30_000
+    _big_sparse_db(p, n)
     (off, ps, plen), = _blocks(p.read_bytes(), SPARSE_TAG)
     assert plen > 64 << 10
     with nhydb.NHyDB(p, readonly=True) as db:
         assert db.get_value(1, n, 7) == n - 1
     _flip(p, SPARSE_TAG, 0, 1, 2)
     for kw in ({"readonly": True}, {}):
-        with pytest.raises(nhydb.CorruptionError, match="SPARSE block .* payload CRC"):
+        with pytest.raises(nhydb.CorruptionError, match="SPARSE block .* prefix checksum"):
             nhydb.NHyDB(p, **kw)

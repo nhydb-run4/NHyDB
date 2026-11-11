@@ -48,24 +48,8 @@ pub struct RawCellCursor {
     next_u: Option<Nat>,
     pending: VecDeque<RawCell>,
     phase: Phase,
-}
-
-fn merge_intervals(mut rr: Vec<(Nat, Nat)>) -> Vec<(Nat, Nat)> {
-    rr.retain(|(a, b)| a <= b);
-    rr.sort();
-    let mut out: Vec<(Nat, Nat)> = Vec::new();
-    for (x, y) in rr {
-        if let Some(last) = out.last_mut() {
-            if x <= last.1.add_u64(1) {
-                if y > last.1 {
-                    last.1 = y;
-                }
-                continue;
-            }
-        }
-        out.push((x, y));
-    }
-    out
+    /// IT1: epoch of the handle at creation (keys are taken from it).
+    epoch: Option<u64>,
 }
 
 impl RawCellCursor {
@@ -87,6 +71,7 @@ impl RawCellCursor {
             next_u: None,
             pending: VecDeque::new(),
             phase: Phase::Dense,
+            epoch: Some(db.cursor_epoch),
         }
     }
 
@@ -100,8 +85,7 @@ impl RawCellCursor {
                     }
                     let key = &self.keys[self.ki];
                     self.ki += 1;
-                    let ranges = db.dense.get(key).map(|ix| ix.segs.iter().map(|s| (s.u_start.clone(), s.u_end.clone())).collect()).unwrap_or_default();
-                    self.intervals = merge_intervals(ranges);
+                    self.intervals = db.dense_merged_ranges(key)?;
                     self.ii = 0;
                     continue;
                 }
@@ -114,13 +98,18 @@ impl RawCellCursor {
             } else {
                 self.ii += 1;
             }
-            let Some(seg) = db.resolve_segment(&rid, &u, ln) else {
+            let Some(seg) = db.resolve_segment(&rid, &u, ln)? else {
                 continue;
             };
-            let rec = db.with_record_bytes(seg, &u, |raw| db.decode_dense_record(seg, raw))?;
+            let rec = db.with_record_bytes(&seg, &u, |raw| db.decode_dense_record(&seg, raw))?;
             let mut by_v = rec.by_v();
             if db.sparse.contains_key(&(rid.clone(), ln)) {
-                for (v, st) in db.sparse_updates_for_u(&rid, &u, ln)?.iter() {
+                let shape = db.shape_of(seg.shape_id)?;
+                for (v, (st, bid)) in db.sparse_updates_for_u(&rid, &u, ln)?.iter() {
+                    // F1: the record is newer than this state of its field
+                    if super::dense_hides(shape, seg.block_id, v, *bid) {
+                        continue;
+                    }
                     match st {
                         SVal::Tomb => {
                             by_v.remove(v);
@@ -143,6 +132,7 @@ impl RawCellCursor {
     pub fn next_batch(&mut self, db: &Db, max: usize) -> Result<Vec<RawCell>> {
 
         db.check_open()?;
+        db.check_cursor_epoch(&mut self.epoch)?;
         let mut out = Vec::new();
         while out.len() < max {
             if let Some(c) = self.pending.pop_front() {
@@ -162,7 +152,7 @@ impl RawCellCursor {
                         continue;
                     }
                     for p in pts {
-                        if db.resolve_segment(&p.realm, &p.u, p.lane).is_some() {
+                        if db.resolve_segment(&p.realm, &p.u, p.lane)?.is_some() {
                             continue;
                         }
                         out.push(RawCell { realm: p.realm, lane: p.lane, u: p.u, v: p.v, value: p.value });

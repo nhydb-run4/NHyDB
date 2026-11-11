@@ -223,6 +223,15 @@ fn enum_to_raw(f: &FieldDef, value: &Val) -> Result<Option<Val>> {
 
 /// Encodes a value according to the field type (including enum) and appends the bytes.
 pub fn encode_value(f: &FieldDef, value: &Val, out: &mut Vec<u8>) -> Result<()> {
+    // E1 (R9E-01): a typed (DENSE) field cannot store `None`, whatever its
+    // type – no silent `"None"` (utf8) or `False` (bool) as in v0.14. The
+    // SPARSE writer stores a null cell without calling this (`is_null`).
+    if let Val::None = value {
+        return Err(Error::Value(format!(
+            "field '{}': a DENSE field cannot store None (store a null cell with put_cell(..., None), remove a value with delete_cell)",
+            f.name
+        )));
+    }
     let mapped = enum_to_raw(f, value)?;
     let value = mapped.as_ref().unwrap_or(value);
     encode_raw(f, f.typ, value, out)
@@ -473,6 +482,27 @@ pub fn skip_raw(typ: TypeCode, buf: &[u8], pos: &mut usize, name: impl FnOnce() 
             })?;
             *pos = end;
             Ok(())
+        }
+    }
+}
+
+/// Encoded length of a value of type `typ` that starts at `buf[0]`, from
+/// as few bytes as needed (fixed width, varint end, length prefix):
+/// `Ok(None)` if `buf` ends before the length is known. Lets a stream skip
+/// a value without reading it (memory-bounded merge, RB-01).
+pub fn raw_extent(typ: TypeCode, buf: &[u8]) -> Result<Option<usize>> {
+    if let Some(size) = typ.fixed_size() {
+        return Ok(Some(size));
+    }
+    let vu_end = |b: &[u8]| b.iter().position(|x| *x < 0x80).map(|i| i + 1);
+    match typ {
+        TypeCode::VarUInt | TypeCode::VarInt => Ok(vu_end(buf)),
+        _ => {
+            let Some(e) = vu_end(buf) else { return Ok(None) };
+            let mut p = 0usize;
+            let n = get_vu(&buf[..e], &mut p)?.as_u64().ok_or_else(|| Error::Corruption("length value out of range".into()))?;
+            let n = usize::try_from(n).ok().and_then(|n| n.checked_add(e)).ok_or_else(|| Error::Corruption("length value out of range".into()))?;
+            Ok(Some(n))
         }
     }
 }

@@ -1166,26 +1166,135 @@ pub fn output_columns(cq: &CompiledQuery) -> Vec<String> {
         .collect()
 }
 
-fn project_rows(rows: &Val, cq: &CompiledQuery) -> Vec<Val> {
-    let Some(rows) = rows.as_list() else { return Vec::new() };
-    rows.iter()
-        .map(|raw| {
-            let mut out = Val::map();
-            for it in &cq.output {
-                let (source, target) = match it.kind.as_str() {
-                    "aggregate" => (it.alias.clone().unwrap_or_default(), it.alias.clone().unwrap_or_default()),
-                    "relevance" => ("relevance".to_string(), it.alias.clone().unwrap_or_else(|| "relevance".into())),
-                    _ => (it.name.clone(), it.alias.clone().unwrap_or_else(|| it.name.clone())),
-                };
-                out.set(target, raw.get(&source).cloned().unwrap_or(Val::None));
+fn project_rows(rows: Option<Val>, cq: &CompiledQuery) -> Result<Vec<Val>> {
+    let Some(Val::List(rows)) = rows else { return Ok(Vec::new()) };
+    // (source, target) per output column; R4-B: the engine rows are consumed,
+    // a source value is moved at its last use and cloned before
+    let cols: Vec<(String, String)> = cq
+        .output
+        .iter()
+        .map(|it| match it.kind.as_str() {
+            "aggregate" => (it.alias.clone().unwrap_or_default(), it.alias.clone().unwrap_or_default()),
+            "relevance" => ("relevance".to_string(), it.alias.clone().unwrap_or_else(|| "relevance".into())),
+            _ => (it.name.clone(), it.alias.clone().unwrap_or_else(|| it.name.clone())),
+        })
+        .collect();
+    let last: Vec<bool> = (0..cols.len()).map(|i| !cols[i + 1..].iter().any(|(s, _)| *s == cols[i].0)).collect();
+    // RUN¹⁰ U1: output names are unique (SQL rejects duplicates); if they
+    // were not, `set` semantics (a later column replaces an earlier one) apply
+    let unique = (0..cols.len()).all(|i| !cols[i + 1..].iter().any(|(_, t)| *t == cols[i].1));
+    // RUN¹⁰ U1: the projection is a phase of its own after collecting; it is
+    // a limiter job (checkpoint per MiB of new row memory), so it is neither
+    // invisible nor unsteerable for the RAM limiter
+    let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::Collect);
+    rows.into_iter()
+        .map(|mut raw| {
+            if let Val::Map(items) = &mut raw {
+                // the row already is the output row (same keys, same order,
+                // no alias): keep it, no new memory
+                if unique && items.len() == cols.len() && items.iter().zip(&cols).all(|((k, _), (s, t))| k == s && s == t) {
+                    return Ok(raw);
+                }
             }
-            out
+            let mut out: Vec<(String, Val)> = Vec::with_capacity(cols.len());
+            let mut grown = 0usize;
+            for ((source, target), is_last) in cols.iter().zip(&last) {
+                let (k, v) = match &mut raw {
+                    Val::Map(items) => match items.iter_mut().find(|(k, _)| k == source) {
+                        // last use: move the value, and the key if it is not renamed
+                        Some((k, v)) if *is_last => {
+                            let key = if source == target { std::mem::take(k) } else { target.clone() };
+                            (key, std::mem::take(v))
+                        }
+                        Some((_, v)) => (target.clone(), v.clone()),
+                        None => (target.clone(), Val::None),
+                    },
+                    _ => (target.clone(), Val::None),
+                };
+                grown += k.capacity() + crate::db::val_heap(&v);
+                if unique {
+                    out.push((k, v));
+                } else if let Some(slot) = out.iter_mut().find(|(x, _)| *x == k) {
+                    slot.1 = v;
+                } else {
+                    out.push((k, v));
+                }
+            }
+            meter.grow((grown + out.capacity() * std::mem::size_of::<(String, Val)>()) as u64)?;
+            Ok(Val::Map(out))
         })
         .collect()
 }
 
 fn opt_big(v: &Option<BigInt>) -> Val {
     v.clone().map(Val::from_bigint).unwrap_or(Val::None)
+}
+
+/// R4-B: rows of a SELECT in chunks (`open_sql`): the same rows as
+/// `execute_sql(...)["rows"]` in the same order. Field queries of the
+/// engine are built per chunk (`QueryEngine::open_rows`); COUNT, aggregate
+/// and ranked results are complete when the cursor opens.
+pub struct SqlCursor {
+    cq: CompiledQuery,
+    rows: crate::query::RowCursor,
+    projected: bool,
+    columns: Vec<String>,
+}
+
+impl SqlCursor {
+    /// Column names (as `execute_sql(...)["columns"]`).
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The next at most `n` rows (empty: done); `anchor_sink` see
+    /// `RowCursor::next_batch`.
+    pub fn next_batch(&mut self, engine: &QueryEngine<'_>, n: usize, anchor_sink: Option<&mut Option<Error>>) -> Result<Vec<Val>> {
+        let batch = self.rows.next_batch(engine, n, anchor_sink)?;
+        if self.projected { Ok(batch) } else { project_rows(Some(Val::List(batch)), &self.cq) }
+    }
+}
+
+/// `open_sql`: compiles and plans like `execute_sql`; the rows follow with
+/// `SqlCursor::next_batch`.
+/// `enforce_limit`: see `QueryEngine::open_rows`.
+pub fn open_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: Lane, enforce_limit: bool) -> Result<SqlCursor> {
+    engine.db.check_open()?;
+    let cq = compile_sql(engine.db, text, params, lane)?;
+    let columns = output_columns(&cq);
+    let done = |rows: Vec<Val>, cq: CompiledQuery| SqlCursor {
+        cq,
+        rows: crate::query::RowCursor::from_rows(rows),
+        projected: true,
+        columns: columns.clone(),
+    };
+    if cq.statement.explain {
+        return Ok(done(Vec::new(), cq));
+    }
+    let realm = Some(cq.realm.to_bigint());
+    let only_count = cq.output.len() == 1 && cq.output[0].kind == "aggregate" && cq.output[0].op == "count" && cq.output[0].name == "*" && cq.group_by.is_empty();
+    let base = ExecOptions {
+        realm,
+        lane: cq.lane,
+        limit: opt_big(&cq.limit),
+        offset: Val::from_bigint(cq.offset.clone()),
+        layout_id: Some(cq.layout_id),
+        ..Default::default()
+    };
+    let order_val = || Val::List(cq.order_by.iter().map(|(k, d)| Val::List(vec![Val::str(k.as_str()), Val::str(d.as_str())])).collect());
+    let select_val = || Val::List(cq.select.iter().map(|s| Val::str(s.as_str())).collect());
+    if only_count || cq.return_mode == "aggregate" || cq.ranked {
+        // complete (small) results: exactly the rows of `execute_sql`
+        let r = execute_sql(engine, text, params, lane)?;
+        let rows = match r.get("rows") {
+            Some(Val::List(l)) => l.clone(),
+            _ => Vec::new(),
+        };
+        return Ok(done(rows, cq));
+    }
+    let opts = ExecOptions { return_mode: "fields".into(), select: Some(select_val()), order_by: Some(order_val()), ..base };
+    let rows = engine.open_rows(&cq.expr, &opts, enforce_limit)?;
+    Ok(SqlCursor { cq, rows, projected: false, columns })
 }
 
 /// `execute_sql(text, parameters=None, *, lane=0)`
@@ -1197,11 +1306,16 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
     let realm = Some(cq.realm.to_bigint());
     if cq.statement.explain {
         let plan = engine.explain(&cq.expr, realm, cq.lane, &cq.return_mode)?;
-        return Ok(vmap! {
+        let mut out = vmap! {
             "query_version" => QUERY_VERSION, "language" => SQL_LANGUAGE_VERSION, "statement" => "EXPLAIN SELECT",
             "source" => source, "columns" => Val::List(Vec::new()), "rows" => Val::List(Vec::new()), "returned" => 0i64,
             "plan" => plan.get("plan").cloned().unwrap_or(Val::None), "optimizer" => plan.get("optimizer").cloned().unwrap_or(Val::None),
-        });
+        };
+        // RC4-05: the large-result hints of `explain()` (only when present)
+        if let Some(h) = plan.get("hints") {
+            out.set("hints", h.clone());
+        }
+        return Ok(out);
     }
     let only_count = cq.output.len() == 1 && cq.output[0].kind == "aggregate" && cq.output[0].op == "count" && cq.output[0].name == "*" && cq.group_by.is_empty();
     let base = ExecOptions {
@@ -1221,7 +1335,7 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
         let count = Val::from_bigint(query::py_int(&count)?);
         (r, vec![vmap! {alias => count}])
     } else if cq.return_mode == "aggregate" {
-        let r = engine.execute(
+        let mut r = engine.execute(
             &cq.expr,
             &ExecOptions {
                 return_mode: "aggregate".into(),
@@ -1231,19 +1345,19 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
                 ..base
             },
         )?;
-        let rows = project_rows(r.get("rows").unwrap_or(&Val::None), &cq);
+        let rows = project_rows(r.remove("rows"), &cq)?;
         (r, rows)
     } else if cq.ranked {
         let limit = match &cq.limit {
             Some(l) => Val::from_bigint(l.clone()),
             None => Val::Int(20),
         };
-        let r = engine.search(&cq.expr, base.realm.clone(), cq.lane, Some(&select_val()), &limit, &base.offset, false, 1.2, 0.75)?;
-        let rows = project_rows(r.get("rows").unwrap_or(&Val::None), &cq);
+        let mut r = engine.search(&cq.expr, base.realm.clone(), cq.lane, Some(&select_val()), &limit, &base.offset, false, 1.2, 0.75)?;
+        let rows = project_rows(r.remove("rows"), &cq)?;
         (r, rows)
     } else {
-        let r = engine.execute(&cq.expr, &ExecOptions { return_mode: "fields".into(), select: Some(select_val()), order_by: Some(order_val()), ..base })?;
-        let rows = project_rows(r.get("rows").unwrap_or(&Val::None), &cq);
+        let mut r = engine.execute(&cq.expr, &ExecOptions { return_mode: "fields".into(), select: Some(select_val()), order_by: Some(order_val()), ..base })?;
+        let rows = project_rows(r.remove("rows"), &cq)?;
         (r, rows)
     };
     let matched = match engine_res.get("count") {

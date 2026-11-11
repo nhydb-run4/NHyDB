@@ -1,7 +1,7 @@
-//! Sparse cell store (`SPARSE_CELLS`, tag `SP10`).
+//! Sparse cell store (`SPARSE_CELLS`, tag `SP28`).
 //!
-//! Block layout:
-//! `SP10 | vu realm | vu u_start | vu u_end | vu groups | vu cells | stream`
+//! Block layout (prefix sealed with its own checksum, as in DATA blocks):
+//! `SP28 | vu realm | vu u_start | vu u_end | vu groups | vu cells | stream`
 //! stream per u group: `vu u_delta | vu rec_len | record`
 //! record: `vu count | (vu (v_delta<<3 | flags) [typecode] [value])*`
 //! flags: 1 = tombstone, 2 = self-typed, 4 = null.
@@ -19,8 +19,7 @@ use crate::schema::{LayoutKind, ShapeDef};
 use crate::val::Val;
 use crate::vmap;
 
-use super::blockcache::{bounded_insert, SPARSE_CELLS_BUDGET, SPARSE_INDEX_BUDGET};
-use super::{Db, SVal, SparseCellMeta, SparseMap, SparseSegment};
+use super::{Db, SVal, SparseMap, SparseSegment};
 
 /// Larger decoded/merged u groups are not cached
 /// (otherwise several GB with COLUMN/PACKED; targeted accesses go through
@@ -238,6 +237,7 @@ impl Db {
         u_end.put_vu(&mut payload);
         put_vu64(&mut payload, group_count);
         put_vu64(&mut payload, cell_count);
+        seal_prefix(&mut payload);
         let prefix_len = payload.len();
         payload.extend_from_slice(&stream);
         Ok(Some(EncodedSparse { payload, prefix_len, u_start, u_end, group_count, cell_count, local_index }))
@@ -264,14 +264,19 @@ impl Db {
         let idx: Vec<(Nat, u64, u32)> =
             enc.local_index.iter().map(|(u, rel, ln)| (u.clone(), entries_off + rel, *ln)).collect();
         {
-            let c = self.caches.get_mut().unwrap_or_else(|e| e.into_inner());
-            for (u, _, _) in &idx {
-                c.sparse_merged.remove(&(realm.clone(), lane, u.clone()));
+            let write_cache = self.write_cache;
+            let budget = self.config.sparse_cache_bytes;
+            let mut c = self.cache();
+            if !c.sparse_merged.is_empty() {
+                for (u, _, _) in &idx {
+                    c.sparse_merged.remove(&(realm.clone(), lane, u.clone()));
+                }
             }
-            if c.sparse_merged.len() > 4096 {
-                c.sparse_merged.clear();
+            if write_cache {
+                let cost = super::block_index_cost(&idx);
+                c.sparse_block_index.insert(off, Arc::new(idx), cost, budget);
+                c.trim_sparse(budget);
             }
-            bounded_insert(&mut c.sparse_block_index, &mut c.used.sparse_block_index, bid, Arc::new(idx), |v| v.len(), SPARSE_INDEX_BUDGET, usize::MAX);
         }
         self.register_sparse_segment(seg);
         Ok(vmap! {
@@ -336,20 +341,31 @@ impl Db {
             return Ok(vmap! {"cells" => 0i64, "blocks" => 0i64, "bytes" => 0i64});
         }
         let mut groups = self.group_points(realm, cells, u_window)?;
-        let mut encoded = Vec::with_capacity(groups.len());
-        for by_u in groups.values_mut() {
-            encoded.push(self.encode_sparse_segment(realm, by_u)?);
-        }
-        let (mut cells_n, mut bytes, mut blocks, mut ugroups) = (0i64, 0i64, 0i64, 0i64);
-        for enc in encoded {
-            blocks += 1;
-            if let Some(enc) = enc {
-                let r = self.write_sparse_segment(realm, enc, lane)?;
-                cells_n += r.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
-                bytes += r.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
-                ugroups += r.get("u_groups").and_then(|v| v.as_i64()).unwrap_or(0);
+        // N2 (RUN8): one block per u window; a failure in a later block must
+        // not leave the earlier ones behind for the next commit. RUN9 V5:
+        // each window is encoded right before its block is appended (the
+        // encoding reads only the schema, which the writes do not change),
+        // so only one encoded window is in memory at a time
+        let (cells_n, bytes, blocks, ugroups) = self.write_scope(|db| {
+            let (mut cells_n, mut bytes, mut blocks, mut ugroups) = (0i64, 0i64, 0i64, 0i64);
+            // RUN¹⁰: checkpoint of the RAM limiter between two blocks
+            let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::Write);
+            for by_u in groups.values_mut() {
+                let enc = db.encode_sparse_segment(realm, by_u)?;
+                by_u.clear();
+                blocks += 1;
+                if let Some(enc) = enc {
+                    let r = db.write_sparse_segment(realm, enc, lane)?;
+                    cells_n += r.get("cells").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let b = r.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0);
+                    bytes += b;
+                    ugroups += r.get("u_groups").and_then(|v| v.as_i64()).unwrap_or(0);
+                    meter.grow(b.max(0) as u64)?;
+                }
             }
-        }
+            db.maybe_flush_directory(super::directory::FlushMode::AfterWrite)?;
+            Ok((cells_n, bytes, blocks, ugroups))
+        })?;
         if commit {
             self.commit()?;
         }
@@ -370,6 +386,7 @@ impl Db {
             Some(enc) => self.write_sparse_segment(realm, enc, lane)?,
             None => vmap! {"cells" => 0i64, "records" => 0i64, "block_offset" => Val::None, "bytes" => 0i64},
         };
+        self.maybe_flush_directory(super::directory::FlushMode::AfterWrite)?;
         if commit {
             self.commit()?;
         }
@@ -382,10 +399,50 @@ impl Db {
 
     /// u → (absolute offset, length) of a sparse block (`_ensure_sparse_block_index`).
     pub(crate) fn sparse_block_index(&self, seg: &SparseSegment) -> Result<Arc<Vec<(Nat, u64, u32)>>> {
-        if let Some(c) = self.cache().sparse_block_index.get(&seg.block_id) {
-            return Ok(c.clone());
+        if let Some(c) = self.cached_block_index(seg.block_offset) {
+            return Ok(c);
         }
         let payload = self.block_payload(seg.block_offset)?;
+        let out = match self.sparse_group_index(seg, &payload) {
+            Ok(x) => x,
+            Err(e) => {
+                self.forget_verified(seg.block_offset);
+                return Err(e);
+            }
+        };
+        let arc = Arc::new(out);
+        let (cost, budget) = (super::block_index_cost(&arc), self.config.sparse_cache_bytes);
+        let mut c = self.cache();
+        c.sparse_block_index.insert(seg.block_offset, arc.clone(), cost, budget);
+        c.trim_sparse(budget);
+        Ok(arc)
+    }
+
+    fn cached_block_index(&self, off: u64) -> Option<Arc<Vec<(Nat, u64, u32)>>> {
+        self.cache().sparse_block_index.get(&off)
+    }
+
+    /// Like [`Db::sparse_block_index`] without adding the result to the
+    /// cache (v index builds over many blocks: the group directories are
+    /// needed once, and caching them would keep about 100 bytes per block).
+    pub(crate) fn sparse_block_index_uncached(&self, seg: &SparseSegment) -> Result<Arc<Vec<(Nat, u64, u32)>>> {
+        if let Some(c) = self.cached_block_index(seg.block_offset) {
+            return Ok(c);
+        }
+        let payload = self.block_payload(seg.block_offset)?;
+        match self.sparse_group_index(seg, &payload) {
+            Ok(x) => Ok(Arc::new(x)),
+            Err(e) => {
+                self.forget_verified(seg.block_offset);
+                Err(e)
+            }
+        }
+    }
+
+    /// Group directory `(u, absolute offset, length)` of a SPARSE payload
+    /// (prefix checked against the entry, complete structure validated).
+    pub(crate) fn sparse_group_index(&self, seg: &SparseSegment, payload: &[u8]) -> Result<Vec<(Nat, u64, u32)>> {
+        self.check_sparse_prefix(seg, payload)?;
         let start = (seg.entries_offset - seg.payload_offset) as usize;
         let mv = &payload[start..];
         let bid = seg.block_id;
@@ -423,11 +480,42 @@ impl Db {
         if out.is_empty() || out[0].0 != seg.u_start || out[out.len() - 1].0 != seg.u_end {
             return Err(Error::Corruption(format!("SPARSE block {bid}: u range contradicts stream")));
         }
-        let arc = Arc::new(out);
-        let mut c = self.cache();
-        let c = &mut *c;
-        bounded_insert(&mut c.sparse_block_index, &mut c.used.sparse_block_index, bid, arc.clone(), |v| v.len(), SPARSE_INDEX_BUDGET, usize::MAX);
-        Ok(arc)
+        Ok(out)
+    }
+
+    /// Payload of a SPARSE block checked against its segment entry (block
+    /// directory, 0.17; the open scan registered tail entries from this very
+    /// prefix): tag, realm, u range and counts must agree.
+    pub(crate) fn check_sparse_prefix(&self, seg: &SparseSegment, payload: &[u8]) -> Result<()> {
+        let bad = || Error::Corruption(format!("SPARSE block {} (byte {}): block contradicts its directory entry", seg.block_id, seg.block_offset));
+        if !payload.starts_with(SPARSE_TAG) {
+            return Err(bad());
+        }
+        if payload.len() as u64 != seg.payload_len {
+            return Err(bad());
+        }
+        // RD-01: header of the entry (block id, type, lane)
+        let (bt, bid, flags, plen) = self.block_header_of(seg.block_offset)?;
+        if bt != BT_SPARSE_CELLS || bid != seg.block_id || plen != seg.payload_len || crate::address::lane_from_flags(flags) != seg.lane {
+            return Err(bad());
+        }
+        let mut p = 4usize;
+        let realm = get_vu(payload, &mut p)?;
+        let u0 = get_vu(payload, &mut p)?;
+        let u1 = get_vu(payload, &mut p)?;
+        let groups = get_vu_u64(payload, &mut p, "SPARSE groups")?;
+        let cells = get_vu_u64(payload, &mut p, "SPARSE cells")?;
+        check_prefix_crc(payload, &mut p)?;
+        if realm != seg.realm_id
+            || u0 != seg.u_start
+            || u1 != seg.u_end
+            || groups != seg.group_count
+            || cells != seg.cell_count
+            || seg.payload_offset + p as u64 != seg.entries_offset
+        {
+            return Err(bad());
+        }
+        Ok(())
     }
 
     /// Raw bytes of a u group in a sparse block (empty if missing).
@@ -444,7 +532,7 @@ impl Db {
     fn sparse_record_states(&self, realm: &Nat, seg: &SparseSegment, u: &Nat) -> Result<Arc<Vec<(Nat, SVal)>>> {
         let ck = (seg.block_id, u.clone());
         if let Some(c) = self.cache().sparse_record.get(&ck) {
-            return Ok(c.clone());
+            return Ok(c);
         }
         let vals: Vec<(Nat, SVal)> = match self.read_sparse_record_bytes(seg, u)? {
             None => Vec::new(),
@@ -458,9 +546,10 @@ impl Db {
         if arc.len() > SPARSE_CACHE_MAX_CELLS {
             return Ok(arc);
         }
+        let (cost, budget) = (super::states_cost(&arc), self.config.sparse_cache_bytes);
         let mut c = self.cache();
-        let c = &mut *c;
-        bounded_insert(&mut c.sparse_record, &mut c.used.sparse_record, ck, arc.clone(), |v| v.len(), SPARSE_CELLS_BUDGET, 4096);
+        c.sparse_record.insert(ck, arc.clone(), cost, budget);
+        c.trim_sparse(budget);
         Ok(arc)
     }
 
@@ -468,18 +557,17 @@ impl Db {
     pub fn sparse_updates_for_u(&self, realm: &Nat, u: &Nat, lane: Lane) -> Result<Arc<SparseMap>> {
         let mk = (realm.clone(), lane, u.clone());
         if let Some(m) = self.cache().sparse_merged.get(&mk) {
-            return Ok(m.clone());
+            return Ok(m);
         }
         let mut out = SparseMap::new();
         if let Some(idx) = self.sparse.get(&(realm.clone(), lane)) {
             let mut hits = Vec::new();
-            idx.iv.stab(u, &mut hits);
-            hits.sort_unstable();
-            for i in hits {
-                let seg = &idx.segs[i];
+            idx.idx.stab(self, u, &mut hits)?;
+            hits.sort_unstable_by_key(|s| s.block_id);
+            for seg in &hits {
                 let states = self.sparse_record_states(realm, seg, u)?;
                 for (v, s) in states.iter() {
-                    out.insert(v.clone(), s.clone());
+                    out.insert(v.clone(), (s.clone(), seg.block_id));
                 }
             }
         }
@@ -487,9 +575,10 @@ impl Db {
         if arc.len() > SPARSE_CACHE_MAX_CELLS {
             return Ok(arc);
         }
+        let (cost, budget) = (super::merged_cost(&arc), self.config.sparse_cache_bytes);
         let mut c = self.cache();
-        let c = &mut *c;
-        bounded_insert(&mut c.sparse_merged, &mut c.used.sparse_merged, mk, arc.clone(), |v| v.len(), SPARSE_CELLS_BUDGET, 4096);
+        c.sparse_merged.insert(mk, arc.clone(), cost, budget);
+        c.trim_sparse(budget);
         Ok(arc)
     }
 
@@ -503,58 +592,15 @@ impl Db {
 
     /// All live sparse points in their newest state, sorted.
     pub fn iter_materialized_sparse_points(&self, realm: Option<&Nat>, lane: Option<Lane>) -> Result<Vec<MaterializedPoint>> {
-        let mut latest: BTreeMap<(Nat, Lane, Nat, Nat), SparseCellMeta> = BTreeMap::new();
-        let mut keys: Vec<&(Nat, Lane)> = self.sparse.keys().collect();
-        keys.sort();
-        for key in keys {
-            let (rid, ln) = key;
-            if realm.map(|r| r != rid).unwrap_or(false) || lane.map(|l| l != *ln).unwrap_or(false) {
-                continue;
+        let mut out = Vec::new();
+        let mut cur = super::cursor::SparsePointCursor::new(self, realm, lane);
+        loop {
+            let batch = cur.next_batch(self, 65_536)?;
+            if batch.is_empty() {
+                break;
             }
-            let idx = &self.sparse[key];
-            for seg in &idx.segs {
-                let bi = self.sparse_block_index(seg)?;
-                let payload = self.block_payload(seg.block_offset)?;
-                for (u, abs, len) in bi.iter() {
-                    let rel = (abs - seg.payload_offset) as usize;
-                    let vals = self.decode_sparse_record(rid, u, &payload[rel..rel + *len as usize])?;
-                    for (v, meta) in vals {
-                        latest.insert((rid.clone(), *ln, u.clone(), v), meta);
-                    }
-                }
-            }
+            out.extend(batch);
         }
-        Ok(latest
-            .into_iter()
-            .filter_map(|((r, l, u, v), m)| match m.value {
-                SVal::Tomb => None,
-                SVal::V(value) => Some(MaterializedPoint {
-                    realm: r,
-                    lane: l,
-                    u,
-                    v,
-                    value,
-                    typ: if m.selftyped { m.typ } else { None },
-                }),
-            })
-            .collect())
-    }
-
-    /// All sparse states incl. tombstones in their newest state (compaction).
-    pub(crate) fn latest_sparse_states(&self) -> Result<BTreeMap<(Nat, Lane, Nat, Nat), SparseCellMeta>> {
-        let mut latest = BTreeMap::new();
-        for ((rid, ln), idx) in &self.sparse {
-            for seg in &idx.segs {
-                let bi = self.sparse_block_index(seg)?;
-                let payload = self.block_payload(seg.block_offset)?;
-                for (u, abs, len) in bi.iter() {
-                    let rel = (abs - seg.payload_offset) as usize;
-                    for (v, meta) in self.decode_sparse_record(rid, u, &payload[rel..rel + *len as usize])? {
-                        latest.insert((rid.clone(), *ln, u.clone(), v), meta);
-                    }
-                }
-            }
-        }
-        Ok(latest)
+        Ok(out)
     }
 }

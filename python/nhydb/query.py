@@ -20,6 +20,7 @@ from ._native import (  # noqa: F401
     QueryError,
     QueryPlanError,
     QueryDomainError,
+    QueryLimitError,
     SQLSyntaxError,
     QUERY_VERSION,
     expr_from_spec,
@@ -482,7 +483,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         sql_text = args.sql
     sql_params = json.loads(args.params) if args.params else None
 
-    with NHyDB(args.file) as db:
+    # N3 (RUN8): a query only reads; it must not take the write lock
+    with NHyDB(args.file, readonly=True) as db:
         engine = QueryEngine(db)
         if sql_text is not None:
             if args.explain and not sql_text.lstrip().upper().startswith("EXPLAIN"):
@@ -520,7 +522,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
 __all__ = [
     "QUERY_VERSION", "DOMAIN_RECORD", "DOMAIN_CELL",
-    "QueryError", "QueryPlanError", "QueryDomainError", "SQLSyntaxError",
+    "QueryError", "QueryPlanError", "QueryDomainError", "QueryLimitError", "SQLSyntaxError",
     "SQL_LANGUAGE_VERSION", "SQLToken", "SQLSelectItem", "SQLOrderItem", "SQLSelectStatement", "SQLCompiledQuery",
     "parse_sql",
     "Expr", "BoolExpr", "FieldPredicate", "StructPredicate", "MathPredicate", "DirectNPredicate", "AllPredicate",

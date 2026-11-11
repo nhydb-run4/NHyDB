@@ -280,8 +280,10 @@ fn put_vu_big(out: &mut Vec<u8>, b: &BigUint) {
 
 /// VarUInt decoded as u64; returns `None` if the value does not fit into
 /// 64 bits (the position is then left unchanged). Errors on truncated
-/// input.
-#[inline]
+/// input. Always inlined (R4: hot in every decoder; with more call sites
+/// LTO stopped inlining it into `get_vu`, +25 % for the FULLTEXT document
+/// length decode).
+#[inline(always)]
 pub fn get_vu64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
     let mut p = *pos;
     let mut value: u128 = 0;

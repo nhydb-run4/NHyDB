@@ -1,6 +1,8 @@
 //! Sorted set kernels (`sorted_unique_ints`, `intersect/union/
 //! difference_sorted_ints`) over ascending sorted sequences.
 
+use crate::nat::Nat;
+
 /// Intersection of two sorted sequences (galloping when lengths differ greatly).
 pub fn intersect_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
@@ -75,6 +77,27 @@ pub fn difference_sorted<T: Ord + Clone>(a: &[T], b: &[T]) -> Vec<T> {
     out
 }
 
+/// All u of the sorted, disjoint inclusive ranges that are not in the
+/// sorted list `b` (NOT over the metadata universe without expanding it
+/// first).
+pub fn ranges_minus_sorted(ranges: &[(Nat, Nat)], b: &[Nat]) -> Vec<Nat> {
+    let mut out = Vec::new();
+    let mut j = 0;
+    for (lo, hi) in ranges {
+        let mut u = lo.clone();
+        while &u <= hi {
+            while j < b.len() && b[j] < u {
+                j += 1;
+            }
+            if j >= b.len() || b[j] != u {
+                out.push(u.clone());
+            }
+            u = u.add_u64(1);
+        }
+    }
+    out
+}
+
 /// Sorts and removes duplicates.
 pub fn sorted_unique<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v.sort();
@@ -95,6 +118,13 @@ mod tests {
         let big: Vec<i32> = (0..10000).collect();
         assert_eq!(intersect_sorted(&[5, 77, 20000], &big), vec![5, 77]);
         assert_eq!(sorted_unique(vec![7, 1, 7, 3]), vec![1, 3, 7]);
+        let n = |x: u64| Nat::from(x);
+        let r = [(n(1), n(4)), (n(8), n(9))];
+        assert_eq!(ranges_minus_sorted(&r, &[n(0), n(2), n(4), n(9), n(12)]), vec![n(1), n(3), n(8)]);
+        assert_eq!(ranges_minus_sorted(&r, &[]), vec![n(1), n(2), n(3), n(4), n(8), n(9)]);
+        let big = Nat::from(u64::MAX);
+        let rb = [(big.clone(), big.add_u64(2))];
+        assert_eq!(ranges_minus_sorted(&rb, &[big.add_u64(1)]), vec![big.clone(), big.add_u64(2)]);
     }
 }
 

@@ -291,7 +291,7 @@ def test_non_integral_coordinates_raise_typeerror(tmp_path, bad):
         lambda: db.put_cell(1, 3, 10, 1, type="varint", lane=bad),
         lambda: db.get(1, bad),
         lambda: db.get_value(1, 3, bad),
-        lambda: db.delete(1, bad),
+        lambda: db.delete_record(1, bad),
         lambda: db.put_points(1, [(bad, 10, 1, "varint")]),
         lambda: db.put_record(1, bad, {"a": 1}),
         lambda: db.read_numpy(1, bad, 1),
@@ -330,10 +330,14 @@ def test_delete_methods_return_values_and_no_phantom_writes(tmp_path):
     assert db.delete_cell(1, 14, 744) is False                        # already deleted
     after = db.next_block_id
     assert after == before + 1
-    assert db.delete_cell(1, 1, "a" if False else 1) is True          # dense BASE field
+    assert db.delete_cell(1, 1, 1) is True                            # dense BASE field
     assert db.get_value(1, 1, 1) is None
-    assert db.delete(1, 2) is True and db.delete(1, 999) is False
-    assert db.delete_record(1, 999) == 0
+    # number of live cells deleted (0.28.2/delete-api-f1): all 7 BASE fields
+    assert db.delete_record(1, 2) == len(FIELDS)
+    assert db.delete_record(1, 2) == 0                                 # already deleted
+    before = db.next_block_id
+    assert db.delete_record(1, 999) == 0                               # never existed: nothing written
+    assert db.next_block_id == before
     with pytest.raises(nhydb.SchemaError):
         db.delete_cell(99, 1, 1)
     with pytest.raises(nhydb.RealmLimitError):
@@ -432,6 +436,32 @@ def test_build_fingerprint_present():
     assert h == "unknown" or (h.startswith("crc32:") and len(h) == 14)
 
 
+def test_build_fingerprint_ignores_the_sdist_license_rewrite(tmp_path):
+    """P-08: ``maturin sdist`` rewrites ``license-file.workspace = true`` to
+    ``license-file = "LICENSE.md"`` in the crate manifests; the fingerprint
+    stays the same, any other manifest change still changes it."""
+    import shutil
+    import conftest
+    root = conftest.ROOT
+    if not (root / "crates/nhydb-core/src").is_dir():
+        pytest.skip("no source checkout")
+    for rel, src in conftest._source_files(root):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+    base = conftest.source_hash(tmp_path)
+    assert base == conftest.source_hash(root)
+    for crate in ("nhydb-core", "nhydb-py"):
+        m = tmp_path / "crates" / crate / "Cargo.toml"
+        t = m.read_bytes()
+        assert b"license-file.workspace = true" in t
+        m.write_bytes(t.replace(b"license-file.workspace = true", b'license-file = "LICENSE.md"'))
+    assert conftest.source_hash(tmp_path) == base
+    m = tmp_path / "crates/nhydb-core/Cargo.toml"
+    m.write_bytes(m.read_bytes() + b"\n# changed\n")
+    assert conftest.source_hash(tmp_path) != base
+
+
 # ----------------------------------------------------------------------
 # R009 / T009: converter depth limits (subprocess)
 # ----------------------------------------------------------------------
@@ -487,7 +517,9 @@ def test_threads_on_one_object_defined_error_no_corruption(tmp_path):
                     fn()
                 except RuntimeError as e:
                     errors.append(str(e))
-                except Exception as e:  # pragma: no cover - would be a regression
+                except BaseException as e:  # pragma: no cover - would be a regression
+                    # BaseException: a PyO3 PanicException does not derive from
+                    # Exception (R9D-01, D H-3) and must show up here
                     unexpected.append(repr(e))
         return run
 
@@ -502,11 +534,30 @@ def test_threads_on_one_object_defined_error_no_corruption(tmp_path):
         db.put_numpy_batch(1, u, _cols(BATCH))
         written.append(u)
 
+    side = iter(range(5_000_000, 10**9))
+
+    def batch_writer():
+        # R9D-01/R9D-02: the batch borrows the handle at its calls and flush
+        b = db.batch()
+        b.put_cell(1, next(side), 2, 7, type="varint")
+        b.flush()
+
+    def iterate():
+        it = db.range(1, 1, 60)
+        next(it)
+        for _ in it:
+            pass
+
+    from nhydb.query import Q, QueryEngine
+    engine = QueryEngine(db)
     threads = [threading.Thread(target=guard(f)) for f in (
         writer,
         lambda: db.commit(),
         lambda: db.get(1, 5),
         lambda: db.read_numpy(1, 1, 50),
+        batch_writer,
+        iterate,
+        lambda: engine.execute(Q.all(), realm=1, return_mode="count"),
     )]
     for t in threads:
         t.start()

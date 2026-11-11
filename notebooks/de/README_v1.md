@@ -1,11 +1,11 @@
-# NHyDB 0.27.1 – Notebook-Reihe v1 (deutsche Fassung)
+# NHyDB 0.28.2 – Notebook-Reihe v1 (deutsche Fassung)
 
 Eine interaktive Einführung in **NHyDB**, die Datenbank, in der jeder Wert eine mathematische
 Adresse hat, und in die **Dynadron**-Mathematik dahinter. Jedes Notebook verbindet kurze
-Erklärungen, ausführbaren Code gegen die echte NHyDB-0.27.1-API, Diagramme aus echten
+Erklärungen, ausführbaren Code gegen die echte NHyDB-0.28.2-API, Diagramme aus echten
 Engine-Daten und kleine Experimente zum Selbst-Ändern.
 
-> Erstellt für **NHyDB 0.27.1**. Mit anderen Versionen können die Ausgaben abweichen.
+> Erstellt für **NHyDB 0.28.2**. Mit anderen Versionen können die Ausgaben abweichen.
 >
 > 🇬🇧 **English:** Diese Fassung ist inhaltlich identisch mit der englischen Reihe in
 > [`../en/`](../en/README_v1.md). Übersetzt sind die Begleittexte. **Code, Code-Kommentare, Programmausgaben und
@@ -46,8 +46,8 @@ mit ▶ markierten Experimenten; optionale Vertiefungen sind mit ⏩ *Vertiefung
 ### Cookbook-Referenzlabor (`reference/`)
 
 Basierend auf dem offiziellen englischen
-[NHyDB Python Cookbook](https://github.com/nhydb/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md),
-das die maßgebliche Referenz bleibt: alle 57 ausführbaren Cookbook-Beispiele, jedes als
+[NHyDB Python Cookbook](https://github.com/nhydb-run4/NHyDB/blob/main/docs/cookbook/PYTHON_COOKBOOK.md),
+das die maßgebliche Referenz bleibt: alle 61 ausführbaren Cookbook-Beispiele, jedes als
 eigenständige Code-Zelle mit der erwarteten Ausgabe darunter. Code und erwartete Ausgaben sind
 unverändert, die Begleittexte übersetzt.
 
@@ -69,17 +69,17 @@ Die ausführliche deutsche Technische Dokumentation zu NHyDB liegt in diesem Rep
 **1. Notebooks holen.** Klone das Repository (oder lade es auf GitHub als ZIP-Datei herunter):
 
 ```bash
-git clone https://github.com/nhydb/NHyDB.git
+git clone https://github.com/nhydb-run4/NHyDB.git
 cd NHyDB
 ```
 
-**2. Python-Pakete installieren.** Du brauchst Python 3.9 oder neuer. Eine virtuelle Umgebung
+**2. Python-Pakete installieren.** Du brauchst Python 3.12–3.15. Eine virtuelle Umgebung
 trennt die Installation von deinem System-Python (empfohlen):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-python -m pip install "nhydb==0.27.1" numpy pandas matplotlib jupyterlab ipykernel
+python -m pip install "nhydb==0.28.2" numpy pandas matplotlib jupyterlab ipykernel
 ```
 
 **3. JupyterLab starten** im Notebook-Ordner:
@@ -102,7 +102,7 @@ Zum Beenden den Browser-Tab schließen und im Terminal *Strg + C* drücken.
 
 Alle Notebooks legen ihre Datenbanken in einem temporären Ordner an und löschen ihn am Ende;
 keine Datei außerhalb dieses Ordners wird angefasst. Die Zeitmessungen in den Notebooks 08, 10
-und 13 stammen von einem MacBook Air (Apple M2) und fallen auf anderen Rechnern anders aus.
+und 13 stammen von einem MacBook Pro (Apple M1 Max) und fallen auf anderen Rechnern anders aus.
 
 **Automatisierte Ausführung (optional).** Um Notebooks ohne Browser-Oberfläche auszuführen, etwa
 als Test, verwende `jupyter execute` im Ordner `notebooks/de/`:

@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+import timing
+
 ROOT = Path(__file__).resolve().parents[2]
 COOKBOOK = ROOT / "docs" / "cookbook" / "PYTHON_COOKBOOK.md"
 EXAMPLES = ROOT / "examples" / "python"
@@ -29,15 +31,24 @@ def _blocks():
     text = COOKBOOK.read_text(encoding="utf-8")
     fences = list(FENCE.finditer(text))
     out = []
-    for i, m in enumerate(f for f in fences if f.group(1).strip() == "python"):
+    per_title = {}
+    for m in (f for f in fences if f.group(1).strip() == "python"):
         heads = re.findall(r"^#{2,4} (.+)$", text[: m.start()], re.M)
-        title = re.sub(r"[^A-Za-z0-9]+", "-", heads[-1]).strip("-")[:50] if heads else "start"
+        # T-09: stable test ids – the heading without its section number plus
+        # the position of the block under that heading (or an explicit
+        # `# id: name` line in the block), so that a block added elsewhere
+        # does not rename the tests (the dir3 evaluation refers to them)
+        head = re.sub(r"^\d+(\.\d+)*\.?\s*", "", heads[-1]) if heads else "start"
+        title = re.sub(r"[^A-Za-z0-9]+", "-", head).strip("-")[:50] or "start"
+        per_title[title] = per_title.get(title, 0) + 1
+        marker = re.search(r"^# id: ([A-Za-z0-9_-]+)\s*$", m.group(2), re.M)
+        test_id = marker.group(1) if marker else f"{title}-{per_title[title]}"
         k = fences.index(m)
         nxt = fences[k + 1] if k + 1 < len(fences) else None
         expected = None
         if nxt is not None and nxt.group(1).strip() == "text" and not text[m.end():nxt.start()].strip():
             expected = nxt.group(2)
-        out.append(pytest.param(m.group(2), expected, id=f"{i + 1:03d}-{title}"))
+        out.append(pytest.param(m.group(2), expected, id=test_id))
     return out
 
 
@@ -46,7 +57,7 @@ def _run(code, cwd, expected=None):
         pytest.importorskip("numpy")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     r = subprocess.run([sys.executable, "-c", code], cwd=cwd, env=env, capture_output=True, text=True,
-                       encoding="utf-8", timeout=120)
+                       encoding="utf-8", timeout=timing.limit(120))
     assert r.returncode == 0, f"block failed (exit {r.returncode}):\n{r.stderr[-4000:]}\n--- code ---\n{code}"
     if expected is not None:
         assert r.stdout.rstrip("\n").splitlines() == expected.rstrip("\n").splitlines(), \

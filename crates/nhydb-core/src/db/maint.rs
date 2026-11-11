@@ -1,25 +1,25 @@
 //! Maintenance: checkpoint, verify, health, stats, tail inspection, repair,
 //! compaction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::address::{lane_name, realm_span, realm_v_bounds, Lane};
-use crate::codec::TypeCode;
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::nat::{get_vu, get_vu_u64, Nat};
-use crate::schema::LayoutKind;
+use crate::schema::{LayoutKind, ShapeDef};
 use crate::storage::Storage;
 use crate::val::Val;
 use crate::vmap;
 
 use super::dense::DenseRows;
 use super::layout::LayoutSpec;
+use super::merge::{MergedCell, SparseMerge, Verify};
 use super::sparse::CellInput;
 use super::system;
-use super::{judge_superblocks, Db, DenseSegment, OpenOptions, SVal, SlotState, SparseSegment, SuperJudgement};
+use super::{judge_superblocks, Db, DenseSegment, OpenOptions, SVal, SlotState, SparseSegment, SuperJudgement, RL};
 use crate::platform::{self, DbLock};
 
 /// `fmt_bytes`: `"1,234.56 KiB"`.
@@ -127,6 +127,12 @@ pub(crate) struct Inspection {
     pub last_good: u64,
     pub first_error: Option<String>,
     pub first_error_at: u64,
+    /// DIRECTORY blocks with intact header but damaged payload: redundant
+    /// data, they never cut the chain.
+    pub dir_damaged: Vec<u64>,
+    /// The directory of the chosen superblock uses a damaged block (it must
+    /// be dropped: the open then scans every block).
+    pub dir_ref_damaged: bool,
 }
 
 /// Next offset ≥ `from` (8-byte aligned) with a valid block header, or `size`.
@@ -165,6 +171,8 @@ impl Inspection {
             last_good: DATA_START.min(size),
             first_error: None,
             first_error_at: 0,
+            dir_damaged: Vec::new(),
+            dir_ref_damaged: false,
         };
         if size < DATA_START {
             ins.last_good = 0;
@@ -173,6 +181,7 @@ impl Inspection {
         }
         let mut chain_ok = true;
         let mut off = DATA_START;
+        let mut prev_bid = 0u64;
         while off < size {
             let fail = |ins: &mut Inspection, chain_ok: &mut bool, at: u64, msg: String| {
                 if *chain_ok {
@@ -190,6 +199,16 @@ impl Inspection {
             let h = match unpack_block_header(&raw) {
                 Ok(h) => h,
                 Err(e) => {
+                    if let Some(next) = super::directory::damaged_directory_extent(&read_at, off, &raw, size) {
+                        // RA-01: redundant directory block, never cuts the chain
+                        ins.dir_damaged.push(off);
+                        if chain_ok {
+                            ins.last_good = next;
+                        }
+                        ins.blocks.push(ScannedBlock { off, next, bt: BT_DIRECTORY, bid: 0, payload_len: next - off - BLOCK_HEADER_SIZE as u64, ok: true, error: None });
+                        off = next;
+                        continue;
+                    }
                     fail(&mut ins, &mut chain_ok, off, e.to_string());
                     let next = resync_block(&read_at, off + 8, size)?;
                     ins.blocks.push(ScannedBlock { off, next, bt: 0, bid: 0, payload_len: 0, ok: false, error: Some(e.to_string()) });
@@ -211,12 +230,23 @@ impl Inspection {
             read_at(&mut payload, pstart)?;
             let nxt = align8(pend);
             let mut err = None;
-            if crc32(&payload) != h.payload_crc {
-                err = Some(format!("Block {}: payload CRC mismatch", h.block_id));
+            if h.block_id <= prev_bid && off > DATA_START {
+                // RD-05: a copied or swapped block (ids grow with the position)
+                err = Some(format!("Block {}: block ids not ascending (previous {prev_bid})", h.block_id));
+            } else if crc32(&payload) != h.payload_crc {
+                if h.block_type == BT_DIRECTORY && nxt <= size {
+                    // block directory: redundant, rebuilt from the data blocks
+                    ins.dir_damaged.push(off);
+                } else {
+                    err = Some(format!("Block {}: payload CRC mismatch", h.block_id));
+                }
             } else if nxt > size {
                 err = Some(format!("Block {}: end incomplete", h.block_id));
             }
             let next = nxt.min(size);
+            if err.is_none() {
+                prev_bid = h.block_id;
+            }
             match err {
                 None => {
                     if chain_ok {
@@ -231,7 +261,42 @@ impl Inspection {
             }
             off = next;
         }
+        if !ins.dir_damaged.is_empty() {
+            ins.dir_ref_damaged = Self::directory_uses_damaged(&ins, &read_at);
+        }
         Ok(ins)
+    }
+
+    /// Whether the directory of the chosen superblock references a damaged
+    /// DIRECTORY block (or cannot be read at all).
+    fn directory_uses_damaged(ins: &Inspection, read_at: &dyn Fn(&mut [u8], u64) -> Result<()>) -> bool {
+        let Some((_, sup)) = ins.judgement.chosen else { return false };
+        if sup.dir_root == 0 {
+            return false;
+        }
+        let damaged: std::collections::HashSet<u64> = ins.dir_damaged.iter().copied().collect();
+        let payload_of = |off: u64| -> Option<Vec<u8>> {
+            let b = ins.blocks.iter().find(|b| b.off == off && b.ok && b.bt == BT_DIRECTORY)?;
+            let mut v = vec![0u8; b.payload_len as usize];
+            read_at(&mut v, off + BLOCK_HEADER_SIZE as u64).ok()?;
+            Some(v)
+        };
+        if damaged.contains(&sup.dir_root) {
+            return true;
+        }
+        let Some(root) = payload_of(sup.dir_root) else { return true };
+        let Ok(runs) = super::directory::root_run_offsets(&root) else { return true };
+        for r in runs {
+            if damaged.contains(&r) {
+                return true;
+            }
+            let Some(rp) = payload_of(r) else { return true };
+            let Ok(pages) = super::directory::run_page_offsets(&rp, r) else { return true };
+            if pages.iter().any(|p| damaged.contains(p)) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn committed(&self) -> Option<u64> {
@@ -259,7 +324,7 @@ impl Inspection {
         let boundary_on_block = self
             .committed()
             .is_some_and(|c| self.blocks.iter().any(|b| b.ok && b.next == c && b.next <= self.last_good));
-        self.first_error.is_none() && self.last_good == self.size && self.judgement.clean && boundary_on_block
+        self.first_error.is_none() && self.last_good == self.size && self.judgement.clean && boundary_on_block && !self.dir_ref_damaged
     }
 
     pub fn to_val(&self) -> Val {
@@ -291,6 +356,8 @@ impl Inspection {
                 "offset" => b.off as i64, "end" => b.next as i64, "error" => b.error.clone(),
             }).collect()),
             "later_valid_blocks" => later.iter().filter(|b| b.ok).count() as i64,
+            "damaged_directory_blocks" => Val::List(self.dir_damaged.iter().take(100).map(|o| Val::Int(*o as i64)).collect()),
+            "directory_damaged_in_use" => self.dir_ref_damaged,
         }
     }
 }
@@ -375,7 +442,7 @@ impl Db {
             let lane_obj = |lane: Lane| {
                 let k = (r.clone(), lane);
                 vmap! {
-                    "segments" => self.dense.get(&k).map(|d| d.segs.len()).unwrap_or(0) as i64,
+                    "segments" => self.dense.get(&k).map(|d| d.idx.len()).unwrap_or(0) as i64,
                     "max_u" => self.max_u.get(&k).cloned().unwrap_or_default(),
                 }
             };
@@ -395,7 +462,10 @@ impl Db {
         payload.extend_from_slice(obj.to_json()?.as_bytes());
         let (off, _bid) = self.append_block(BT_CHECKPOINT, &payload, 0)?;
         self.checkpoint_offset = off;
+        self.dir.last_checkpoint_off = off;
         self.last_checkpoint_obj = obj;
+        // the checkpoint writes the directory tail when it pays off
+        self.dir_force.get_or_insert(super::directory::FlushMode::Checkpoint);
         self.commit()?;
         Ok(off)
     }
@@ -410,10 +480,54 @@ impl Db {
         let mut last = DATA_START;
         let (mut blocks, mut records, mut sec_refs) = (0i64, 0i64, 0i64);
         let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        // block directory (0.17): live blocks must be intact; with `deep`
+        // the directory must describe exactly the data blocks of the file
+        let live_dir = self.live_directory_blocks();
+        let mut fp = DirFingerprint::default();
+        let mut delete_errors = 0u64;
+        // deep: aggregates recomputed from the blocks (RA-07/RD-03)
+        let mut agg: HashMap<RL, DeepAgg> = HashMap::new();
+        let mut deletes_seen: HashSet<(RL, Nat, u64)> = HashSet::new();
+        let mut max_data_bid = 0u64;
+        let mut prev_bid = 0u64;
         while off < size {
             let r: Result<u64> = (|| {
-                let (info, payload) = self.read_block(off)?;
+                let (info, payload) = match self.read_block(off) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let next = match self.read_header_at(off) {
+                            Ok(h) if h.block_type == BT_DIRECTORY => Some(h.next_offset),
+                            Ok(_) => None,
+                            Err(_) => {
+                                let mut raw = [0u8; BLOCK_HEADER_SIZE];
+                                self.store.read_exact_at(off, &mut raw)?;
+                                let read_at = |buf: &mut [u8], o: u64| self.store.read_exact_at(o, buf);
+                                super::directory::damaged_directory_extent(&read_at, off, &raw, size)
+                            }
+                        };
+                        if let Some(next) = next {
+                            // RD-09: one rule for every damaged directory
+                            // block – unused: warning; in use: error (the
+                            // data is intact, repair_file drops the directory)
+                            if live_dir.contains(&off) {
+                                errors.push(format!("at byte {off}: block directory block in use damaged ({e}); repair_file drops the directory without data loss"));
+                            } else {
+                                warnings.push(format!("at byte {off}: unused block directory block damaged ({e})"));
+                            }
+                            return Ok(next);
+                        }
+                        return Err(e);
+                    }
+                };
                 blocks += 1;
+                // RD-05: block ids grow with the file position
+                if info.block_id <= prev_bid && off > DATA_START {
+                    let prev = prev_bid;
+                    prev_bid = info.block_id;
+                    return Err(Error::Corruption(format!("block {}: block ids not ascending (previous {prev})", info.block_id)));
+                }
+                prev_bid = info.block_id;
                 match info.block_type {
                     BT_DATA_DENSE => {
                         if !payload.starts_with(DATA_TAG) {
@@ -424,6 +538,7 @@ impl Db {
                         let sid = get_vu_u64(&payload, &mut p, "DATA shape")?;
                         let u0 = get_vu(&payload, &mut p)?;
                         let cnt = get_vu_u64(&payload, &mut p, "DATA count")?;
+                        check_prefix_crc(&payload, &mut p)?;
                         let table_end = (cnt as usize)
                             .checked_add(1)
                             .and_then(|c| c.checked_mul(4))
@@ -461,6 +576,16 @@ impl Db {
                                 }
                                 self.decode_dense_record(&seg, &payload[table_end + s..table_end + e])?;
                             }
+                            let a = agg.entry((seg.realm_id.clone(), seg.lane)).or_default();
+                            a.records += cnt;
+                            a.shapes.insert(sid);
+                            if a.max_u.as_ref().is_none_or(|m| &seg.u_end > m) {
+                                a.max_u = Some(seg.u_end.clone());
+                            }
+                            a.max_bid = a.max_bid.max(info.block_id);
+                            a.dense.push((seg.u_start.clone(), seg.u_end.clone()));
+                            max_data_bid = max_data_bid.max(info.block_id);
+                            fp.add_dense(&seg, 1);
                         }
                     }
                     BT_SPARSE_CELLS => {
@@ -473,6 +598,7 @@ impl Db {
                         let u1 = get_vu(&payload, &mut p)?;
                         let groups = get_vu_u64(&payload, &mut p, "SPARSE groups")?;
                         let cells = get_vu_u64(&payload, &mut p, "SPARSE cells")?;
+                        check_prefix_crc(&payload, &mut p)?;
                         if groups == 0 || cells == 0 || u1 < u0 {
                             return Err(Error::Corruption("SPARSE range/group invalid".into()));
                         }
@@ -489,7 +615,9 @@ impl Db {
                             entries_offset: info.offset + BLOCK_HEADER_SIZE as u64 + p as u64,
                             payload_len: info.payload_len,
                         };
-                        let idx = self.sparse_block_index(&seg)?;
+                        // group directory from the payload in hand (no cache
+                        // insert: verify streams over the whole file)
+                        let idx = self.sparse_group_index(&seg, &payload)?;
                         if idx.len() as u64 != groups {
                             return Err(Error::Corruption("SPARSE group count contradicts stream".into()));
                         }
@@ -498,7 +626,28 @@ impl Db {
                                 let rel = (abs - seg.payload_offset) as usize;
                                 self.decode_sparse_record(&realm, u, &payload[rel..rel + *len as usize])?;
                             }
+                            let a = agg.entry((seg.realm_id.clone(), seg.lane)).or_default();
+                            a.groups += groups;
+                            a.cells += cells;
+                            a.max_bid = a.max_bid.max(info.block_id);
+                            a.overlay = true;
+                            max_data_bid = max_data_bid.max(info.block_id);
+                            fp.add_sparse(&seg, 1);
                         }
+                    }
+                    BT_DELETE if deep => {
+                        let mut p = 0usize;
+                        let r = get_vu(&payload, &mut p)?;
+                        let u = get_vu(&payload, &mut p)?;
+                        let key = (r, crate::address::lane_from_flags(info.flags));
+                        if !self.delete_block_id(&key, &u)?.is_some_and(|b| b >= info.block_id) {
+                            delete_errors += 1;
+                        }
+                        let a = agg.entry(key.clone()).or_default();
+                        a.max_bid = a.max_bid.max(info.block_id);
+                        a.overlay = true;
+                        max_data_bid = max_data_bid.max(info.block_id);
+                        deletes_seen.insert((key, u, info.block_id));
                     }
                     BT_SECONDARY if deep => {
                         let mut p = 4;
@@ -533,15 +682,44 @@ impl Db {
         if last != size && errors.is_empty() {
             errors.push(format!("last valid end {last} != file size {size}"));
         }
-        let mut warnings: Vec<String> = Vec::new();
+        if deep && errors.is_empty() {
+            match self.directory_fingerprint_mismatch(&mut fp) {
+                Ok(None) => {}
+                Ok(Some(m)) => errors.push(format!("block directory does not match the data blocks: {m}")),
+                Err(e) => errors.push(format!("block directory not readable: {e}")),
+            }
+            if delete_errors > 0 {
+                errors.push(format!("block directory misses {delete_errors} DELETE block(s)"));
+            }
+            // SECONDARY key trees: page binding, key order, counts, postings
+            let mut sec_keys: Vec<(u64, Lane)> = self.secondary_blocks.keys().copied().collect();
+            sec_keys.sort();
+            for (iid, lane) in sec_keys {
+                if let Err(e) = self.sec_verify_tree(iid, lane) {
+                    errors.push(format!("SECONDARY index {iid}/{}: {e}", lane_name(lane)));
+                }
+            }
+            match self.deep_state_mismatch(&mut agg, &deletes_seen, max_data_bid) {
+                Ok(m) => errors.extend(m),
+                Err(e) => errors.push(format!("block directory not readable: {e}")),
+            }
+        }
         for (iid, idx) in &self.index_defs {
             for lane in [0u8, 1] {
                 if self.secondary_source_block.contains_key(&(*iid, lane)) && !self.index_is_fresh(*iid, lane) {
-                    warnings.push(format!("Index {}/{} is stale (rebuild with build_indexes())", idx.name, lane_name(lane)));
+                    warnings.push(if !self.config.index_maint.auto {
+                        format!("Index {}/{} is stale (rebuild with build_indexes())", idx.name, lane_name(lane))
+                    } else {
+                        format!("Index {}/{} is stale: queries use the overlay of the changes until the automatic maintenance renews it", idx.name, lane_name(lane))
+                    });
                 }
             }
         }
         warnings.extend(self.open_warnings.iter().cloned());
+        warnings.extend(self.dir.flush_error.iter().cloned());
+        if let Some(d) = &self.dir.degraded {
+            warnings.push(format!("block directory is not merged any more in this session ({d}); repair_file drops the directory without data loss"));
+        }
         let n_err = errors.len() as i64;
         errors.truncate(100);
         Ok(vmap! {
@@ -692,6 +870,12 @@ impl Db {
                     created_ns: base.map(|b| b.created_ns).unwrap_or(t),
                     updated_ns: t,
                     flags: base.map(|b| b.flags).unwrap_or(0),
+                    // a directory whose root lies in the kept range covers
+                    // only blocks before it; otherwise the open scans fully
+                    dir_root: base
+                        .map(|b| b.dir_root)
+                        .filter(|r| *r >= DATA_START && *r < plan.target && !insp.dir_ref_damaged)
+                        .unwrap_or(0),
                 };
                 st.write_at((slot * SUPERBLOCK_SIZE) as u64, &pack_super(&s))?;
                 st.fsync()?;
@@ -760,6 +944,13 @@ impl Db {
         }
         if !beyond.is_empty() && !o.keep_uncommitted {
             reasons.push(format!("{} uncommitted block(s) after the commit boundary discarded", beyond.len()));
+        }
+        if insp.dir_ref_damaged {
+            reasons.push(format!(
+                "block directory damaged ({} block(s)); it is dropped (no data is cut, the next open scans all blocks, \
+                 the next checkpoint writes a new directory)",
+                insp.dir_damaged.len()
+            ));
         }
         let mut refusal = None;
         if !lost.is_empty() && !o.allow_data_loss {
@@ -972,9 +1163,58 @@ impl Db {
                   "layout_path" => lp.display().to_string(), "key_path" => kp.display().to_string(), "verify" => v})
     }
 
+    /// E6: path and size of the staging file of an in-place compaction
+    /// (`<db>.compacting`), if one exists.
+    pub fn compaction_leftover(&self) -> Option<(PathBuf, u64)> {
+        let p = with_suffix_append(&self.path, ".compacting");
+        let m = std::fs::symlink_metadata(&p).ok()?;
+        Some((p, m.len()))
+    }
+
+    /// E6: removes a leftover `<db>.compacting` (`cleanup_compaction()`).
+    /// Only a writer holding the write lock of the database may: a running
+    /// compaction holds that lock, so none can be running. Returns the bytes
+    /// removed (0: nothing there). Never touches anything but a regular file
+    /// of exactly that name.
+    pub fn remove_compaction_leftover(&mut self) -> Result<u64> {
+        self.check_open()?;
+        if self.readonly {
+            return Err(Error::NHyDB("database is opened read-only (readonly=True); cleanup_compaction() is not possible".into()));
+        }
+        if !self.lock.is_held() {
+            return Err(Error::NHyDB(
+                "cleanup_compaction() needs the write lock of the database (a running compaction holds it); \
+                 with [lock] enabled = false a running compaction cannot be ruled out"
+                    .into(),
+            ));
+        }
+        self.remove_compaction_leftover_unchecked()
+    }
+
+    pub(crate) fn remove_compaction_leftover_unchecked(&self) -> Result<u64> {
+        let Some((p, n)) = self.compaction_leftover() else { return Ok(0) };
+        let m = std::fs::symlink_metadata(&p)?;
+        if !m.file_type().is_file() {
+            return Err(Error::NHyDB(format!("'{}' is not a regular file; not removed", p.display())));
+        }
+        std::fs::remove_file(&p)?;
+        Ok(n)
+    }
+
     pub fn health(&self, deep: bool) -> Result<Val> {
         let t0 = Instant::now();
         let mut checks = Vec::new();
+        // E6 (R9B-04): leftover staging file of a killed compaction (a check
+        // of its own only when there is one)
+        if let Some((p, n)) = self.compaction_leftover() {
+            checks.push(vmap! {
+                "name" => "compaction_leftover", "status" => "warning",
+                "details" => vmap! {
+                    "path" => p.display().to_string(), "bytes" => n as i64,
+                    "removable" => !self.readonly && self.lock.is_held(),
+                },
+            });
+        }
         let verify = self.verify(deep)?;
         let vok = verify.get("ok").map(|v| v.is_truthy()).unwrap_or(false);
         checks.push(vmap! {
@@ -1082,6 +1322,7 @@ impl Db {
             "details" => vmap! {"extensions" => self.extension_defs.len() as i64, "errors" => Val::List(ext_errors)},
         });
         let mut stale = Vec::new();
+        let mut overlay = Vec::new();
         let mut index_errors = Vec::new();
         for (iid, idef) in &self.index_defs {
             if let Err(e) = crate::textindex::normalize_options(idef.kind, &idef.options)
@@ -1091,14 +1332,24 @@ impl Db {
             }
             for lane in [0u8, 1] {
                 if self.secondary_source_block.contains_key(&(*iid, lane)) && !self.index_is_fresh(*iid, lane) {
-                    stale.push(Val::Str(format!("{}/{}", idef.name, lane_name(lane))));
+                    // AP9: a stale index with a base answers through the overlay of the changes
+                    // (manual maintenance: a warning, nobody renews it)
+                    let name = Val::Str(format!("{}/{}", idef.name, lane_name(lane)));
+                    if self.config.index_maint.auto {
+                        overlay.push(name);
+                    } else {
+                        stale.push(name);
+                    }
                 }
             }
         }
         checks.push(vmap! {
             "name" => "indexes",
             "status" => if !index_errors.is_empty() { "error" } else if !stale.is_empty() { "warning" } else { "ok" },
-            "details" => vmap! {"count" => self.index_defs.len() as i64, "stale" => Val::List(stale), "errors" => Val::List(index_errors)},
+            "details" => vmap! {
+                "count" => self.index_defs.len() as i64, "stale" => Val::List(stale), "overlay" => Val::List(overlay),
+                "errors" => Val::List(index_errors), "maintenance" => self.ixm_status(),
+            },
         });
         checks.push(vmap! {
             "name" => "checkpoint", "status" => if self.checkpoint_offset != 0 { "ok" } else { "warning" },
@@ -1119,7 +1370,22 @@ impl Db {
         let size = self.store.len();
         let mut off = DATA_START;
         while off < size {
-            let info = self.read_header_at(off)?;
+            let info = match self.read_header_at(off) {
+                Ok(i) => i,
+                Err(e) => {
+                    // RD-09: a damaged directory block does not break stats()
+                    let mut raw = [0u8; BLOCK_HEADER_SIZE];
+                    self.store.read_exact_at(off, &mut raw)?;
+                    let read_at = |buf: &mut [u8], o: u64| self.store.read_exact_at(o, buf);
+                    let next = super::directory::damaged_directory_extent(&read_at, off, &raw, size).ok_or(e)?;
+                    let d = by.entry("DIRECTORY").or_default();
+                    d.0 += 1;
+                    d.1 += (next - off) as i64;
+                    d.2 += (next - off - BLOCK_HEADER_SIZE as u64) as i64;
+                    off = next;
+                    continue;
+                }
+            };
             let name = block_name(info.block_type).unwrap();
             let e = by.entry(name).or_default();
             e.0 += 1;
@@ -1138,18 +1404,18 @@ impl Db {
             for lane in [0u8, 1] {
                 let key = (rid.clone(), lane);
                 let overlay = self.overlay_keys.contains(&key);
-                let dsegs = self.dense.get(&key).map(|d| d.segs.as_slice()).unwrap_or(&[]);
-                let ssegs = self.sparse.get(&key).map(|d| d.segs.as_slice()).unwrap_or(&[]);
-                let live = if overlay { Val::None } else { Val::Int(dsegs.iter().map(|s| s.count as i64).sum()) };
+                let d = self.dense.get(&key);
+                let sp = self.sparse.get(&key);
+                let live = if overlay { Val::None } else { Val::Int(d.map(|x| x.records).unwrap_or(0) as i64) };
                 lanes.set(
                     lane_name(lane),
                     vmap! {
-                        "lane" => lane as i64, "dense_segments" => dsegs.len() as i64,
+                        "lane" => lane as i64, "dense_segments" => d.map(|x| x.idx.len()).unwrap_or(0) as i64,
                         "max_u" => self.max_u.get(&key).cloned().unwrap_or_default(),
                         "live_records" => live, "has_overlays" => overlay,
-                        "sparse_segments" => ssegs.len() as i64,
-                        "sparse_u_groups" => ssegs.iter().map(|s| s.group_count as i64).sum::<i64>(),
-                        "materialized_sparse_cells" => ssegs.iter().map(|s| s.cell_count as i64).sum::<i64>(),
+                        "sparse_segments" => sp.map(|x| x.idx.len()).unwrap_or(0) as i64,
+                        "sparse_u_groups" => sp.map(|x| x.groups).unwrap_or(0) as i64,
+                        "materialized_sparse_cells" => sp.map(|x| x.cells).unwrap_or(0) as i64,
                     },
                 );
             }
@@ -1184,11 +1450,15 @@ impl Db {
                 "kind" => idx.kind.name(), "v" => idx.field_v(), "options" => idx.options.clone(), "lanes" => ls,
             });
         }
+        // own statements: a cache guard inside the map below would live
+        // until its end (and `cache_stats` locks again)
+        let posting_entries = self.cache().postings.len() as i64;
+        let cache = self.cache_stats();
         let phys = self.physical_block_stats()?;
         let sparse_bytes = phys.get("SPARSE_CELLS").map(|e| e.1).unwrap_or(0);
-        let sparse_cells: i64 = self.sparse.values().flat_map(|s| s.segs.iter()).map(|s| s.cell_count as i64).sum();
-        let sparse_groups: i64 = self.sparse.values().flat_map(|s| s.segs.iter()).map(|s| s.group_count as i64).sum();
-        let dense_records: i64 = self.dense.values().flat_map(|s| s.segs.iter()).map(|s| s.count as i64).sum();
+        let sparse_cells: i64 = self.sparse.values().map(|s| s.cells as i64).sum();
+        let sparse_groups: i64 = self.sparse.values().map(|s| s.groups as i64).sum();
+        let dense_records: i64 = self.dense.values().map(|s| s.records as i64).sum();
         let mut by_type = Val::map();
         for (k, (b, by, pb)) in &phys {
             by_type.set(*k, vmap! {"blocks" => *b, "bytes" => *by, "payload_bytes" => *pb});
@@ -1209,6 +1479,7 @@ impl Db {
             "recovered_tail_bytes" => self.recovered_tail_bytes as i64,
             "data_max_block_id" => self.data_max_block_id as i64, "storage" => storage,
             "block_cache" => self.block_cache_stats(),
+            "directory" => self.directory_stats(),
             "realms" => Val::List(realm_stats),
             "shapes" => Val::List(self.shapes.values().map(|s| vmap! {
                 "shape_id" => s.shape_id as i64, "realm_id" => &s.realm_id, "name" => s.name.as_str(),
@@ -1218,8 +1489,14 @@ impl Db {
             "math_layouts" => Val::List(self.math_layouts.keys().map(|lid| self.describe_math(*lid)).collect::<Result<Vec<_>>>()?),
             "extensions" => Val::List(self.extension_defs.values().map(|e| e.to_val()).collect()),
             "indexes" => Val::List(idx_stats),
-            "posting_cache_entries" => self.cache().postings.len() as i64,
+            "posting_cache_entries" => posting_entries,
+            "cache" => cache,
             "has_overlays" => self.has_overlays,
+            "overlay_view" => {
+                let c = self.cache();
+                vmap! {"enabled" => self.config.query_overlay_view, "max_bytes" => self.config.query_overlay_view_max_bytes as i64,
+                       "built" => c.overlay_view_built as i64, "declined" => c.overlay_view_declined as i64}
+            },
         })
     }
 
@@ -1249,10 +1526,23 @@ impl Db {
         }
         opts.output = opts.output.as_deref().map(platform::absolute).transpose()?;
         let mut created: Vec<PathBuf> = Vec::new();
-        let res = Self::compact_inner(&src_path, &opts, &mut created);
+        let mut res = Self::compact_inner(&src_path, &opts, &mut created);
         if res.is_err() {
             for f in created.iter().rev() {
                 let _ = std::fs::remove_file(f);
+            }
+        }
+        // RA-01: a damaged block directory of the source (the data blocks
+        // are intact) – compact from a full scan instead
+        let dir_err = |m: &str| m.starts_with("block directory") || m.contains("contradicts its directory entry");
+        if matches!(&res, Err(Error::Corruption(m)) if dir_err(m)) && !opts.open.ignore_directory {
+            opts.open.ignore_directory = true;
+            created.clear();
+            res = Self::compact_inner(&src_path, &opts, &mut created);
+            if res.is_err() {
+                for f in created.iter().rev() {
+                    let _ = std::fs::remove_file(f);
+                }
             }
         }
         res
@@ -1284,10 +1574,13 @@ impl Db {
         let mut lane_counts = [0i64; 2];
         let (dst_layout, dst_key);
         {
-            let src = Db::open_locked(&src_path, &opts.open, cfg.clone(), DbLock::held_elsewhere(&src_path))?;
+            let mut src = Db::open_locked(&src_path, &opts.open, cfg.clone(), DbLock::held_elsewhere(&src_path))?;
+            // one sequential pass: a small block cache suffices (records of
+            // one batch block), a large one would only hold read blocks
+            src.config.block_cache_bytes = src.config.block_cache_bytes.min(16 << 20);
             // Staging file: in-place with identical R0 identity and the same
             // sidecars; export with a new DB ID and its own sidecars.
-            let mut stage_opts = OpenOptions { internal_compaction: true, ..opts.open.clone() };
+            let mut stage_opts = OpenOptions { internal_compaction: true, ignore_directory: false, ..opts.open.clone() };
             if replace_original {
                 created.push(tmp_path.clone());
                 system::write_initial_db(&tmp_path, &system::initial_record_from(&src.sys.record, src.sys.math_constants_stored), mode)?;
@@ -1330,6 +1623,7 @@ impl Db {
             dst_key = dst.sys.key_path.clone();
             // Copy physical cells into exclusive MATH realms as well.
             dst.internal_math_writes = true;
+            dst.write_cache = false;
             let res = (|| -> Result<()> {
                 if dst.max_db_size_bytes != src.max_db_size_bytes {
                     dst.set_max_db_size(src.max_db_size_bytes, false)?;
@@ -1391,138 +1685,28 @@ impl Db {
                 // P002: memory bounded by one batch. Dense records are copied
                 // as raw BASE bytes (same shape in source and target, every
                 // record is decoded again by the deep verify below); dense EXT
-                // values follow as sparse cells in bounded chunks; whether a
-                // tombstone hides a dense value is computed on demand instead
-                // of a set over every record × field.
-                let states = src.latest_sparse_states()?;
-                const CELL_CHUNK: usize = 50_000;
-                let mut keys: Vec<_> = src.dense.keys().cloned().collect();
+                // values follow as sparse cells in bounded chunks. Sparse
+                // cells come from a memory-bounded merge (`merge.rs`) that
+                // runs in u order next to the dense records of the same
+                // realm/lane, so no map of all cells is ever built.
+                let mut keys: Vec<RL> = src.dense.keys().chain(src.sparse.keys()).cloned().collect();
                 keys.sort();
+                keys.dedup();
+                let mut cnt = CompactCounters::default();
+                // temporary runs of an external sparse merge next to the target
+                let run_dir = platform::parent_dir(&tmp_path);
                 for key in keys {
-                    let (rid, lane) = key.clone();
-                    let idx = &src.dense[&key];
-                    let mut area: Vec<u8> = Vec::new();
-                    let mut offsets: Vec<u32> = vec![0];
-                    let mut start: Option<Nat> = None;
-                    let mut last_u: Option<Nat> = None;
-                    let mut cur_shape: Option<u64> = None;
-                    let mut ext_cells: Vec<CellInput> = Vec::new();
-                    let flush = |dst: &mut Db, area: &mut Vec<u8>, offsets: &mut Vec<u32>, start: &Option<Nat>, shape: Option<u64>| -> Result<usize> {
-                        let n = offsets.len() - 1;
-                        if n == 0 {
-                            return Ok(0);
-                        }
-                        dst.put_dense_batch(&rid, start.as_ref().unwrap(), &DenseRows::Raw { area, offsets }, shape, &[], lane, false)?;
-                        area.clear();
-                        offsets.truncate(1);
-                        Ok(n)
-                    };
-                    let mut cursor: Option<Nat> = None;
-                    for seg in idx.sorted() {
-                        let mut u = match &cursor {
-                            Some(c) if c > &seg.u_start => c.clone(),
-                            _ => seg.u_start.clone(),
-                        };
-                        while u <= seg.u_end {
-                            if let Some(win) = src.resolve_segment(&rid, &u, lane) {
-                                let shape = src.shape_of(win.shape_id)?;
-                                let rows = offsets.len() - 1;
-                                let compatible = rows > 0
-                                    && cur_shape == Some(win.shape_id)
-                                    && last_u.as_ref().map(|l| l.add_u64(1) == u).unwrap_or(false)
-                                    && rows < batch_records;
-                                if rows > 0 && !compatible {
-                                    let n = flush(&mut dst, &mut area, &mut offsets, &start, cur_shape)?;
-                                    written_records += n as i64;
-                                    lane_counts[lane as usize] += n as i64;
-                                    written_batches += 1;
-                                }
-                                if offsets.len() == 1 {
-                                    start = Some(u.clone());
-                                    cur_shape = Some(win.shape_id);
-                                }
-                                let exts = src.with_record_bytes(win, &u, |raw| {
-                                    let mut p = 0usize;
-                                    for f in &shape.fields {
-                                        crate::codec::skip_value(f, raw, &mut p)?;
-                                    }
-                                    area.extend_from_slice(&raw[..p]);
-                                    let (ext, end) = src.decode_extensions(&rid, raw, p)?;
-                                    if end != raw.len() {
-                                        return Err(Error::Corruption("Dense record trailing bytes".into()));
-                                    }
-                                    Ok(ext)
-                                })?;
-                                let end = u32::try_from(area.len())
-                                    .map_err(|_| Error::Value("a DATA batch may contain at most 4 GiB of record data".into()))?;
-                                offsets.push(end);
-                                for (v, val) in exts {
-                                    if !states.contains_key(&(rid.clone(), lane, u.clone(), v.clone())) {
-                                        ext_cells.push(CellInput::new(u.clone(), v, val));
-                                    }
-                                }
-                                if ext_cells.len() >= CELL_CHUNK {
-                                    dst.put_points(&rid, std::mem::take(&mut ext_cells), lane, false, 10_000)?;
-                                }
-                                last_u = Some(u.clone());
-                                if offsets.len() > batch_records {
-                                    let n = flush(&mut dst, &mut area, &mut offsets, &start, cur_shape)?;
-                                    written_records += n as i64;
-                                    lane_counts[lane as usize] += n as i64;
-                                    written_batches += 1;
-                                }
-                            }
-                            u = u.add_u64(1);
-                        }
-                        cursor = Some(u);
-                    }
-                    let n = flush(&mut dst, &mut area, &mut offsets, &start, cur_shape)?;
-                    if n > 0 {
-                        written_records += n as i64;
-                        lane_counts[lane as usize] += n as i64;
-                        written_batches += 1;
-                    }
-                    if !ext_cells.is_empty() {
-                        dst.put_points(&rid, ext_cells, lane, false, 10_000)?;
-                    }
+                    compact_key(&src, &mut dst, &key, batch_records, &run_dir, &mut cnt)?;
                 }
-                // Sparse: newest state; tombstones only where they hide a
-                // dense value (BASE field of the stored shape or a dense EXT
-                // value of that record). Tombstones go into the same blocks.
-                let mut by_key: BTreeMap<(Nat, Lane), Vec<CellInput>> = BTreeMap::new();
-                for ((rid, lane, u, v), meta) in &states {
-                    let cell = match &meta.value {
-                        SVal::V(val) => CellInput::typed(u.clone(), v.clone(), val.clone(), if meta.selftyped { meta.typ } else { None }),
-                        SVal::Tomb => {
-                            let shadows = match src.resolve_segment(rid, u, *lane) {
-                                None => false,
-                                Some(win) => {
-                                    src.shape_of(win.shape_id)?.by_v(v).is_some()
-                                        || src.with_record_bytes(win, u, |raw| src.decode_dense_record(win, raw))?.extensions_by_v.contains_key(v)
-                                }
-                            };
-                            if !shadows {
-                                continue;
-                            }
-                            CellInput::tombstone(u.clone(), v.clone())
-                        }
-                    };
-                    let cells = by_key.entry((rid.clone(), *lane)).or_default();
-                    cells.push(cell);
-                    if cells.len() >= CELL_CHUNK {
-                        let chunk = std::mem::take(cells);
-                        dst.put_points(rid, chunk, *lane, false, 10_000)?;
-                    }
-                }
-                drop(states);
-                for ((rid, lane), cells) in by_key {
-                    if !cells.is_empty() {
-                        dst.put_points(&rid, cells, lane, false, 10_000)?;
-                    }
-                }
+                written_records += cnt.records;
+                written_batches += cnt.batches;
+                lane_counts[0] += cnt.lanes[0];
+                lane_counts[1] += cnt.lanes[1];
                 if opts.rebuild_indexes && !dst.index_defs.is_empty() {
                     dst.build_indexes(None, false)?;
                 }
+                // the compacted file gets one directory run
+                dst.dir_force = Some(super::directory::FlushMode::Compaction);
                 dst.checkpoint()?;
                 let v = dst.verify(true)?;
                 if !v.get("ok").map(|x| x.is_truthy()).unwrap_or(false) {
@@ -1558,6 +1742,20 @@ impl Db {
         let mut backup_plan = Val::None;
         let result_path = if replace_original {
             if opts.make_backup {
+                // RB-04: the backup is a full copy of the original – fail
+                // before writing it instead of filling the disk
+                let dir = platform::parent_dir(&src_path);
+                if let Some(free) = platform::free_space(&dir) {
+                    if free < before.saturating_add(1 << 20) {
+                        return Err(Error::Value(format!(
+                            "not enough free disk space for the backup copy of the compaction ({} needed, {} free in {}); \
+                             free space or compact with make_backup=False",
+                            fmt_bytes(before),
+                            fmt_bytes(free),
+                            dir.display()
+                        )));
+                    }
+                }
                 let (b, bp) = backup_triad(&src_path, &opts.open, &cfg, &format!(".before_compact_{}", stamp()))?;
                 backup = Val::Str(b.display().to_string());
                 backup_plan = bp.map(|x| Val::Str(x.display().to_string())).unwrap_or(Val::None);
@@ -1581,5 +1779,407 @@ impl Db {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(_: TypeCode) {}
+/// Order-independent fingerprint of segment entries per key (verify: the
+/// block scan adds, the directory subtracts; all zero = identical sets).
+#[derive(Default)]
+struct DirFingerprint {
+    acc: BTreeMap<(u8, RL), (u64, i64)>,
+}
+
+impl DirFingerprint {
+    fn mix(parts: &[u64]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        parts.hash(&mut h);
+        h.finish()
+    }
+
+    fn nat(n: &Nat) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        n.to_string().hash(&mut h);
+        h.finish()
+    }
+
+    fn put(&mut self, kind: u8, key: RL, f: u64, sign: i64) {
+        let e = self.acc.entry((kind, key)).or_insert((0, 0));
+        e.0 = if sign > 0 { e.0.wrapping_add(f) } else { e.0.wrapping_sub(f) };
+        e.1 += sign;
+    }
+
+    fn add_dense(&mut self, s: &DenseSegment, sign: i64) {
+        let f = Self::mix(&[
+            Self::nat(&s.u_start), Self::nat(&s.u_end), s.count, s.shape_id, s.block_id, s.block_offset,
+            s.payload_offset, s.offsets_offset, s.records_offset, s.payload_len,
+        ]);
+        self.put(1, (s.realm_id.clone(), s.lane), f, sign);
+    }
+
+    fn add_sparse(&mut self, s: &SparseSegment, sign: i64) {
+        let f = Self::mix(&[
+            Self::nat(&s.u_start), Self::nat(&s.u_end), s.group_count, s.cell_count, s.block_id, s.block_offset,
+            s.payload_offset, s.entries_offset, s.payload_len,
+        ]);
+        self.put(2, (s.realm_id.clone(), s.lane), f, sign);
+    }
+}
+
+/// Per-key state recomputed by `verify(deep=True)` from the data blocks.
+#[derive(Default)]
+struct DeepAgg {
+    records: u64,
+    shapes: std::collections::BTreeSet<u64>,
+    groups: u64,
+    cells: u64,
+    max_u: Option<Nat>,
+    max_bid: u64,
+    overlay: bool,
+    dense: Vec<(Nat, Nat)>,
+}
+
+impl Db {
+    /// RA-07/RD-03: the in-memory state that came from the directory root
+    /// (aggregates, routing flags) and the DELETE entries of the directory
+    /// must match what the data blocks say. Returns the differences.
+    fn deep_state_mismatch(&self, agg: &mut HashMap<RL, DeepAgg>, deletes: &HashSet<(RL, Nat, u64)>, max_data_bid: u64) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut keys: Vec<RL> = agg.keys().cloned().collect();
+        keys.extend(self.dense.keys().cloned());
+        keys.extend(self.sparse.keys().cloned());
+        keys.extend(self.max_u.keys().cloned());
+        keys.sort();
+        keys.dedup();
+        let empty = DeepAgg::default();
+        for key in &keys {
+            let a = agg.get_mut(key).map(|a| &mut *a);
+            let a: &DeepAgg = match a {
+                Some(a) => {
+                    a.dense.sort();
+                    // sorted by start: a range overlaps if it starts at or
+                    // before the largest end seen so far
+                    let mut reach: Option<&Nat> = None;
+                    let mut overlap = false;
+                    for (lo, hi) in &a.dense {
+                        if reach.is_some_and(|r| lo <= r) {
+                            overlap = true;
+                            break;
+                        }
+                        if reach.is_none_or(|r| hi > r) {
+                            reach = Some(hi);
+                        }
+                    }
+                    if overlap && !self.dense_overlap_keys.contains(key) {
+                        out.push(format!("realm {} lane {}: overlapping dense segments not flagged", key.0, key.1));
+                    }
+                    if (overlap || a.overlay) && (!self.overlay_keys.contains(key) || !self.has_overlays) {
+                        out.push(format!("realm {} lane {}: overlays not flagged", key.0, key.1));
+                    }
+                    a
+                }
+                None => &empty,
+            };
+            let d = self.dense.get(key);
+            let s = self.sparse.get(key);
+            let mem = (
+                d.map(|x| x.records).unwrap_or(0),
+                d.map(|x| x.shapes.clone()).unwrap_or_default(),
+                s.map(|x| x.groups).unwrap_or(0),
+                s.map(|x| x.cells).unwrap_or(0),
+            );
+            if mem != (a.records, a.shapes.clone(), a.groups, a.cells) {
+                out.push(format!("realm {} lane {}: aggregates differ from the data blocks", key.0, key.1));
+            }
+            if self.max_u.get(key).filter(|m| !m.is_zero()) != a.max_u.as_ref() {
+                out.push(format!("realm {} lane {}: largest dense u differs from the data blocks", key.0, key.1));
+            }
+            if self.data_max_block_id_by_lane.get(key).copied().unwrap_or(0) < a.max_bid {
+                out.push(format!("realm {} lane {}: newest data block id differs", key.0, key.1));
+            }
+        }
+        if self.data_max_block_id < max_data_bid {
+            out.push("newest data block id differs from the data blocks".into());
+        }
+        // every DELETE entry of the directory belongs to a DELETE block
+        let mut forged = 0u64;
+        for (key, d) in &self.deletes {
+            for (u, bid) in &d.tail {
+                if !deletes.contains(&(key.clone(), u.clone(), *bid)) {
+                    forged += 1;
+                }
+            }
+            let mut it = d.runs.iter_by_start();
+            while let Some(e) = it.next(self)? {
+                if !deletes.contains(&(key.clone(), e.u.clone(), e.block_id)) {
+                    forged += 1;
+                }
+            }
+        }
+        if forged > 0 {
+            out.push(format!("block directory lists {forged} DELETE entr(y/ies) without a DELETE block"));
+        }
+        Ok(out)
+    }
+}
+
+impl Db {
+    /// Subtracts every dense/sparse entry of the in-memory segment indexes
+    /// (directory runs + tail) from `fp`; returns a description of the first
+    /// key whose entries differ from the scanned blocks.
+    fn directory_fingerprint_mismatch(&self, fp: &mut DirFingerprint) -> Result<Option<String>> {
+        for ix in self.dense.values() {
+            let mut it = ix.idx.iter_by_start();
+            while let Some(s) = it.next(self)? {
+                fp.add_dense(&s, -1);
+            }
+        }
+        for ix in self.sparse.values() {
+            let mut it = ix.idx.iter_by_start();
+            while let Some(s) = it.next(self)? {
+                fp.add_sparse(&s, -1);
+            }
+        }
+        Ok(fp.acc.iter().find(|(_, (f, n))| *f != 0 || *n != 0).map(|((kind, (r, l)), (_, n))| {
+            format!("{} segments of realm {r} lane {l} differ (count difference {n})", if *kind == 1 { "dense" } else { "sparse" })
+        }))
+    }
+}
+
+/// Records/batches written by a compaction.
+#[derive(Default)]
+struct CompactCounters {
+    records: i64,
+    batches: i64,
+    lanes: [i64; 2],
+}
+
+/// Sparse cells collected for one `put_points` of the compaction target.
+struct CellChunk {
+    cells: Vec<CellInput>,
+    bytes: usize,
+}
+
+impl CellChunk {
+    const CELLS: usize = 50_000;
+    const BYTES: usize = 32 << 20;
+
+    fn push(&mut self, dst: &mut Db, rid: &Nat, lane: Lane, cell: CellInput, bytes: usize) -> Result<()> {
+        if self.add(cell, bytes) {
+            self.flush(dst, rid, lane)?;
+        }
+        Ok(())
+    }
+
+    /// Adds a cell without writing; `true`: the chunk is full and must be
+    /// flushed by the caller.
+    fn add(&mut self, cell: CellInput, bytes: usize) -> bool {
+        self.cells.push(cell);
+        self.bytes += bytes;
+        self.cells.len() >= Self::CELLS || self.bytes >= Self::BYTES
+    }
+
+    fn flush(&mut self, dst: &mut Db, rid: &Nat, lane: Lane) -> Result<()> {
+        if !self.cells.is_empty() {
+            // the chunk is sorted by (u, v): one block per chunk covers a u
+            // range disjoint from the other chunks, a u window would only
+            // split scattered u into many tiny blocks
+            dst.put_points(rid, std::mem::take(&mut self.cells), lane, false, u64::MAX)?;
+        }
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+/// Sparse cell for the target: values always, tombstones only where they
+/// hide a dense value of the source (BASE field of the stored shape or a
+/// dense EXT value of that record) – `dense` describes the live dense
+/// record at the cell's u, if any.
+///
+/// F1: a state older than the live dense record of one of its shape fields
+/// is hidden by the record and dropped (`dense_bid` = block id of the
+/// record in the source). The surviving states of a u must reach the target
+/// after its dense record (higher block id), see `compact_key`.
+fn sparse_cell_out(c: &MergedCell, dense: Option<(&ShapeDef, &[Nat], u64)>) -> Option<CellInput> {
+    if let Some((shape, _, dense_bid)) = dense {
+        if super::dense_hides(shape, dense_bid, &c.v, c.bid) {
+            return None;
+        }
+    }
+    let dense = dense.map(|(shape, ext_vs, _)| (shape, ext_vs));
+    match &c.meta.value {
+        SVal::V(val) => Some(CellInput::typed(c.u.clone(), c.v.clone(), val.clone(), if c.meta.selftyped { c.meta.typ } else { None })),
+        SVal::Tomb => {
+            let shadows = dense.is_some_and(|(shape, ext_vs)| shape.by_v(&c.v).is_some() || ext_vs.binary_search(&c.v).is_ok());
+            shadows.then(|| CellInput::tombstone(c.u.clone(), c.v.clone()))
+        }
+    }
+}
+
+/// Copies the live state of one `(realm, lane)` into the compaction target:
+/// dense records in u order (raw BASE bytes, batches of `batch_records`),
+/// their EXT values and the newest sparse states from the merge, consumed
+/// in the same u order (bounded memory, `merge.rs`).
+fn compact_key(src: &Db, dst: &mut Db, key: &RL, batch_records: usize, run_dir: &Path, cnt: &mut CompactCounters) -> Result<()> {
+    let mut meter = crate::limiter::Meter::new(crate::limiter::JobKind::Rigid, crate::limiter::JobPath::Compact);
+    let (rid, lane) = key.clone();
+    let mut merge = match src.sparse.contains_key(key) {
+        true => Some(SparseMerge::with_temp_dir(src, &rid, lane, Verify::Incremental, run_dir)?),
+        false => None,
+    };
+    let mut look: Option<MergedCell> = None;
+    let mut sparse_out = CellChunk { cells: Vec::new(), bytes: 0 };
+    let mut ext_out = CellChunk { cells: Vec::new(), bytes: 0 };
+    // next sparse cell (lookahead)
+    macro_rules! peek_cell {
+        () => {{
+            if look.is_none() {
+                if let Some(m) = merge.as_mut() {
+                    look = m.next(src)?;
+                }
+            }
+            look.as_ref()
+        }};
+    }
+    if let Some(idx) = src.dense.get(key) {
+        let mut area: Vec<u8> = Vec::new();
+        let mut offsets: Vec<u32> = vec![0];
+        let mut start: Option<Nat> = None;
+        let mut last_u: Option<Nat> = None;
+        let mut cur_shape: Option<u64> = None;
+        let mut flush = |dst: &mut Db, area: &mut Vec<u8>, offsets: &mut Vec<u32>, start: &Option<Nat>, shape: Option<u64>| -> Result<usize> {
+            let n = offsets.len() - 1;
+            if n == 0 {
+                return Ok(0);
+            }
+            dst.put_dense_batch(&rid, start.as_ref().unwrap(), &DenseRows::Raw { area, offsets }, shape, &[], lane, false)?;
+            // RUN¹⁰: checkpoint of the RAM limiter per MiB copied
+            meter.grow(area.len() as u64)?;
+            area.clear();
+            offsets.truncate(1);
+            Ok(n)
+        };
+        let mut cursor: Option<Nat> = None;
+        let mut segs = idx.idx.iter_by_start();
+        // without overlapping segments and deletes every u of a segment is
+        // served by that segment: no lookup per u
+        let direct = !src.dense_overlap_keys.contains(key) && !src.has_deletes(key);
+        while let Some(seg) = segs.next(src)? {
+            let mut u = match &cursor {
+                Some(c) if c > &seg.u_start => c.clone(),
+                _ => seg.u_start.clone(),
+            };
+            while u <= seg.u_end {
+                let win = if direct { Some(seg.clone()) } else { src.resolve_segment(&rid, &u, lane)? };
+                if let Some(win) = win {
+                    // sparse cells of u without a live dense record
+                    while let Some(c) = peek_cell!() {
+                        if c.u >= u {
+                            break;
+                        }
+                        let c = look.take().unwrap();
+                        if let Some(cell) = sparse_cell_out(&c, None) {
+                            // the chunk may hold cells of a pending dense
+                            // batch: that batch goes first (F1)
+                            if sparse_out.add(cell, c.bytes) {
+                                let n = flush(dst, &mut area, &mut offsets, &start, cur_shape)?;
+                                if n > 0 {
+                                    cnt.records += n as i64;
+                                    cnt.lanes[lane as usize] += n as i64;
+                                    cnt.batches += 1;
+                                }
+                                sparse_out.flush(dst, &rid, lane)?;
+                            }
+                        }
+                    }
+                    let shape = src.shape_of(win.shape_id)?;
+                    let rows = offsets.len() - 1;
+                    let compatible = rows > 0
+                        && cur_shape == Some(win.shape_id)
+                        && last_u.as_ref().map(|l| l.add_u64(1) == u).unwrap_or(false)
+                        && rows < batch_records;
+                    if rows > 0 && !compatible {
+                        let n = flush(dst, &mut area, &mut offsets, &start, cur_shape)?;
+                        cnt.records += n as i64;
+                        cnt.lanes[lane as usize] += n as i64;
+                        cnt.batches += 1;
+                    }
+                    if offsets.len() == 1 {
+                        start = Some(u.clone());
+                        cur_shape = Some(win.shape_id);
+                    }
+                    let mut exts = src.with_record_bytes(&win, &u, |raw| {
+                        let mut p = 0usize;
+                        for f in &shape.fields {
+                            crate::codec::skip_value(f, raw, &mut p)?;
+                        }
+                        area.extend_from_slice(&raw[..p]);
+                        let (ext, end) = src.decode_extensions(&rid, raw, p)?;
+                        if end != raw.len() {
+                            return Err(Error::Corruption("Dense record trailing bytes".into()));
+                        }
+                        Ok(ext)
+                    })?;
+                    let end = u32::try_from(area.len())
+                        .map_err(|_| Error::Value("a DATA batch may contain at most 4 GiB of record data".into()))?;
+                    offsets.push(end);
+                    // sparse cells of u: they win over the dense EXT values
+                    exts.sort_by(|a, b| a.0.cmp(&b.0));
+                    let ext_vs: Vec<Nat> = exts.iter().map(|(v, _)| v.clone()).collect();
+                    let mut hidden = vec![false; exts.len()];
+                    while let Some(c) = peek_cell!() {
+                        if c.u != u {
+                            break;
+                        }
+                        let c = look.take().unwrap();
+                        if let Ok(i) = ext_vs.binary_search(&c.v) {
+                            hidden[i] = true;
+                        }
+                        if let Some(cell) = sparse_cell_out(&c, Some((shape, &ext_vs, win.block_id))) {
+                            // F1: the cells of u must follow the dense record
+                            // of u in the target, so the pending dense batch
+                            // is written before a full chunk
+                            if sparse_out.add(cell, c.bytes) {
+                                let n = flush(dst, &mut area, &mut offsets, &start, cur_shape)?;
+                                if n > 0 {
+                                    cnt.records += n as i64;
+                                    cnt.lanes[lane as usize] += n as i64;
+                                    cnt.batches += 1;
+                                }
+                                sparse_out.flush(dst, &rid, lane)?;
+                            }
+                        }
+                    }
+                    for ((v, val), h) in exts.into_iter().zip(hidden) {
+                        if !h {
+                            ext_out.push(dst, &rid, lane, CellInput::new(u.clone(), v, val), 0)?;
+                        }
+                    }
+                    last_u = Some(u.clone());
+                    if offsets.len() > batch_records {
+                        let n = flush(dst, &mut area, &mut offsets, &start, cur_shape)?;
+                        cnt.records += n as i64;
+                        cnt.lanes[lane as usize] += n as i64;
+                        cnt.batches += 1;
+                    }
+                }
+                u = u.add_u64(1);
+            }
+            cursor = Some(u);
+        }
+        let n = flush(dst, &mut area, &mut offsets, &start, cur_shape)?;
+        if n > 0 {
+            cnt.records += n as i64;
+            cnt.lanes[lane as usize] += n as i64;
+            cnt.batches += 1;
+        }
+    }
+    // remaining sparse cells: no live dense record at their u
+    while peek_cell!().is_some() {
+        let c = look.take().unwrap();
+        if let Some(cell) = sparse_cell_out(&c, None) {
+            sparse_out.push(dst, &rid, lane, cell, c.bytes)?;
+        }
+    }
+    ext_out.flush(dst, &rid, lane)?;
+    sparse_out.flush(dst, &rid, lane)?;
+    Ok(())
+}

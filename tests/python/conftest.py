@@ -22,13 +22,23 @@ def _source_files(root):
     return rel
 
 
+def _hashed_bytes(rel, data):
+    """Same as ``hashed_bytes`` in build.rs: manifests without ``license-file``
+    lines (``maturin sdist`` rewrites them, P-08)."""
+    if not rel.endswith("Cargo.toml"):
+        return data
+    parts = data.split(b"\n")
+    lines = [x + b"\n" for x in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+    return b"".join(x for x in lines if not x.lstrip(b" \t\n\x0c\r").startswith(b"license-file"))
+
+
 def source_hash(root=ROOT):
     """CRC-32 fingerprint of the Rust sources (None outside a source checkout)."""
     if not (root / "crates/nhydb-core/src").is_dir():
         return None
     crc = 0
     for rel, p in _source_files(root):
-        for part in (rel.encode(), b"\0", p.read_bytes(), b"\0"):
+        for part in (rel.encode(), b"\0", _hashed_bytes(rel, p.read_bytes()), b"\0"):
             crc = zlib.crc32(part, crc)
     return f"crc32:{crc:08x}"
 

@@ -62,13 +62,26 @@ pub enum Error {
     QueryDomain(String),
     /// NHySQL: syntax/semantic error (`SQLSyntaxError`).
     SqlSyntax(String),
+    /// Query rejected by the configured `[query] max_result_rows`
+    /// (`QueryLimitError`).
+    QueryLimit(String),
+    /// RUN¹⁰: a large job was cancelled by the application, by the RAM
+    /// limiter or after `[limiter] wait_timeout_s` (`ResourceLimitError`
+    /// with `reason`). Boxed: `Error` keeps its size.
+    ResourceLimit(Box<(&'static str, String)>),
     /// Resource exhaustion (allocation would fail or exceed the physical
     /// memory); Python `MemoryError`.
     Memory(String),
     Io(std::io::Error),
     /// OS error on a specific side file (layout plan, key file) – carries the
     /// affected path so Python gets the right `OSError.filename` (F048).
-    IoPath(std::io::Error, std::path::PathBuf),
+    /// `Box<Path>` (16 bytes): a `PathBuf` is 32 bytes on Windows and made
+    /// `Error` 48 bytes there (P-02).
+    IoPath(std::io::Error, Box<std::path::Path>),
+    /// OS error with an explanation of what NHyDB was doing and how to
+    /// help it (RUN6, RD4-06); the OS code and the path stay as they are.
+    /// Boxed: `Error` (and every `Result`) keeps its size.
+    IoHint(Box<(std::io::Error, Option<std::path::PathBuf>, String)>),
     /// Error raised by a runtime plugin (e.g. a Python exception from a
     /// CUSTOM layout plugin). The binding layer can unwrap the object and
     /// re-raise it unchanged.
@@ -107,10 +120,16 @@ impl fmt::Display for Error {
             | Error::Query(m)
             | Error::QueryPlan(m)
             | Error::QueryDomain(m)
+            | Error::QueryLimit(m)
             | Error::SqlSyntax(m)
             | Error::Memory(m) => f.write_str(m),
+            Error::ResourceLimit(b) => f.write_str(&b.1),
             Error::Io(e) => write!(f, "{e}"),
             Error::IoPath(e, p) => write!(f, "{e}: '{}'", p.display()),
+            Error::IoHint(b) => match &**b {
+                (e, Some(p), h) => write!(f, "{h}: {e}: '{}'", p.display()),
+                (e, None, h) => write!(f, "{h}: {e}"),
+            },
             Error::Foreign(_, m) => f.write_str(m),
         }
     }
@@ -129,7 +148,7 @@ impl Error {
     /// every other error is returned unchanged (F048).
     pub fn at_path(self, path: &std::path::Path) -> Error {
         match self {
-            Error::Io(e) | Error::IoPath(e, _) => Error::IoPath(e, path.to_path_buf()),
+            Error::Io(e) | Error::IoPath(e, _) => Error::IoPath(e, path.into()),
             other => other,
         }
     }
@@ -163,11 +182,24 @@ impl Error {
             Error::Query(_) => "QueryError",
             Error::QueryPlan(_) => "QueryPlanError",
             Error::QueryDomain(_) => "QueryDomainError",
+            Error::QueryLimit(_) => "QueryLimitError",
+            Error::ResourceLimit(_) => "ResourceLimitError",
             Error::SqlSyntax(_) => "SQLSyntaxError",
             Error::Memory(_) => "MemoryError",
-            Error::Io(_) | Error::IoPath(..) => "OSError",
+            Error::Io(_) | Error::IoPath(..) | Error::IoHint(..) => "OSError",
             Error::Foreign(..) => "ForeignError",
         }
     }
 }
 
+
+#[cfg(test)]
+mod size_tests {
+    /// RUN6: `Error` travels in every `Result` of the hot paths; a larger
+    /// variant (unboxed `IoHint`, 56 bytes) made the KQ-10M import about
+    /// 5 % slower. Large payloads belong in a `Box`.
+    #[test]
+    fn error_stays_small() {
+        assert!(std::mem::size_of::<super::Error>() <= 40, "Error is {} bytes", std::mem::size_of::<super::Error>());
+    }
+}
