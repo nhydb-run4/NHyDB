@@ -93,8 +93,10 @@ version number.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs Clippy once (Linux) and the smoke tests
-(`tests/smoke` and the file format golden test, against the built wheel,
-CPython 3.12–3.15) on Linux, macOS and Windows on every push to `main` and
-on pull requests. The full test suites are not run on GitHub; they run
-locally before every release. CI never publishes anything.
+`.github/workflows/ci.yml` is started manually only (Actions → CI → Run
+workflow). It runs Clippy once (Linux) and the smoke tests (`tests/smoke`
+and the file format golden test, against the built wheel, CPython
+3.12–3.15) on Linux and Windows. The release workflow builds and
+smoke-tests all platform packages, including macOS. The full test suites
+are not run on GitHub; they run locally before every release. CI never
+publishes anything.
