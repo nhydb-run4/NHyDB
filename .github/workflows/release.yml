@@ -32,7 +32,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: v
         name: Version from Cargo.toml, tag and CHANGELOG must match
         run: |
@@ -62,7 +62,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -74,7 +74,7 @@ jobs:
             if command -v dnf >/dev/null; then dnf install -y zlib-devel
             elif command -v yum >/dev/null; then yum install -y zlib-devel
             fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-linux-${{ matrix.target }}
           path: dist
@@ -91,20 +91,20 @@ jobs:
           - runner: macos-latest
             target: aarch64
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         id: py312
         with:
           python-version: "3.12"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py313
         with:
           python-version: "3.13"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py314
         with:
           python-version: "3.14"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py315
         with:
           python-version: "3.15"
@@ -115,7 +115,7 @@ jobs:
           # explicit interpreters only: automatic discovery would also pick up
           # other Python versions preinstalled on the runner (e.g. pre-releases)
           args: --release --out dist -i ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }} ${{ steps.py315.outputs.python-path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-macos-${{ matrix.target }}
           path: dist
@@ -124,20 +124,20 @@ jobs:
     needs: check-version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         id: py312
         with:
           python-version: "3.12"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py313
         with:
           python-version: "3.13"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py314
         with:
           python-version: "3.14"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         id: py315
         with:
           python-version: "3.15"
@@ -148,7 +148,7 @@ jobs:
           # explicit interpreters only: automatic discovery would also pick up
           # other Python versions preinstalled on the runner (e.g. pre-releases)
           args: --release --out dist -i ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }} ${{ steps.py315.outputs.python-path }}
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-windows-x64
           path: dist
@@ -157,13 +157,13 @@ jobs:
     needs: check-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-sdist
           path: dist
@@ -173,8 +173,8 @@ jobs:
     needs: [check-version, linux, macos, windows, sdist]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
@@ -183,7 +183,7 @@ jobs:
         run: python3 tools/check_dist.py dist --version "${{ needs.check-version.outputs.version }}"
       - name: Check package metadata
         run: pipx run twine check --strict dist/*
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-files
           path: dist
@@ -200,11 +200,11 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-latest, windows-latest]
         python: ["3.12", "3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: release-files
           path: dist
@@ -224,8 +224,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: release-files
           path: dist
@@ -254,7 +254,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download the files attached to the release
         env:
           GH_TOKEN: ${{ github.token }}
