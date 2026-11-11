@@ -30,10 +30,12 @@ change keeps it.
    If dependencies changed (`Cargo.lock`), regenerate the third-party
    notices: `cargo fetch && python tools/gen_third_party_licenses.py`, and
    commit `THIRD-PARTY-LICENSES.txt`.
-3. Build and test locally (see [BUILDING.md](BUILDING.md)).
+3. Build and run the full test suites locally on Linux, macOS and Windows
+   (see [BUILDING.md](BUILDING.md)). GitHub Actions only runs short smoke
+   tests; the complete Rust and Python tests are part of this step.
 4. Optional dry run: start the workflow *Release* manually
-   (Actions → Release → Run workflow). It builds and tests all wheels and
-   the source distribution and publishes nothing.
+   (Actions → Release → Run workflow). It builds and smoke-tests all wheels
+   and the source distribution and publishes nothing.
 5. Commit and tag:
 
    ```bash
@@ -44,15 +46,14 @@ change keeps it.
 
 6. The tag starts `.github/workflows/release.yml`:
    * checks that tag, `Cargo.toml` version and `CHANGELOG.md` section match,
-   * runs the Rust tests (`cargo test --workspace --release`) on Linux,
-     macOS and Windows,
    * builds wheels for CPython 3.12–3.15 on Linux (x86_64, aarch64;
      manylinux_2_28), macOS (x86_64, arm64) and Windows (x64) plus the
      source distribution,
    * checks the complete file set (`tools/check_dist.py`) and the package
      metadata (`twine check`),
-   * installs the wheels and runs the Python tests on every platform with
-     every supported Python version (3.12–3.15, 20 jobs),
+   * installs the wheels and runs the smoke tests (`tests/smoke` and the
+     file format golden test) on every platform with every supported
+     Python version (3.12–3.15, 20 jobs),
    * creates a **draft** GitHub release with all files. If a release for
      the tag already exists, the job fails and changes nothing.
 7. Check the draft release on GitHub and publish it.
@@ -60,7 +61,7 @@ change keeps it.
 ## Supply chain
 
 `.github/dependabot.yml` proposes weekly update pull requests for the GitHub
-Actions and the Cargo dependencies; CI tests them before they are merged.
+Actions and the Cargo dependencies; CI checks them before they are merged.
 Recommended before a release, run locally: `cargo audit` (RustSec advisories)
 or `cargo deny check advisories licenses sources`. Pinning the actions to
 commit SHAs can be done with the SHAs of the reviewed action releases;
@@ -92,6 +93,8 @@ version number.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs Clippy, the Rust tests and the Python tests
-(against the built wheel, CPython 3.12–3.15) on Linux, macOS and Windows on
-every push to `main` and on pull requests. CI never publishes anything.
+`.github/workflows/ci.yml` runs Clippy once (Linux) and the smoke tests
+(`tests/smoke` and the file format golden test, against the built wheel,
+CPython 3.12–3.15) on Linux, macOS and Windows on every push to `main` and
+on pull requests. The full test suites are not run on GitHub; they run
+locally before every release. CI never publishes anything.

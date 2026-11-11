@@ -48,6 +48,7 @@ Alternatively, build and install in one step: `pip install .`
 cargo test --workspace --release           # Rust core
 pip install numpy pytest
 python -m pytest tests/python                 # Python package (installed wheel)
+python -m pytest tests/smoke                  # short smoke tests (as in GitHub Actions)
 ```
 
 The Python tests import the *installed* package, not the sources in

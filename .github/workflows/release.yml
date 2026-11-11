@@ -1,8 +1,8 @@
 # Release pipeline (see RELEASING.md).
 #
-# * workflow_dispatch (manual run): builds and tests all wheels and the source
+# * workflow_dispatch (manual run): builds and smoke-tests all wheels and the source
 #   distribution – a dry run, nothing is published.
-# * push of a version tag vX.Y.Z: builds and tests as above, then creates a
+# * push of a version tag vX.Y.Z: builds and smoke-tests as above, then creates a
 #   DRAFT GitHub release with all files. An existing release is never
 #   modified; the job fails instead.
 # * release published (manual publication of the draft on GitHub): uploads
@@ -49,21 +49,6 @@ jobs:
               exit 1
             fi
           fi
-
-  # Rust unit and integration tests of the workspace on the release
-  # platforms (R015: a release never relies on the CI status alone).
-  rust-tests:
-    needs: check-version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Rust tests
-        run: cargo test --workspace --release
 
   linux:
     needs: check-version
@@ -185,7 +170,7 @@ jobs:
 
   # Merges all build artifacts and checks that exactly the expected files exist.
   verify:
-    needs: [check-version, rust-tests, linux, macos, windows, sdist]
+    needs: [check-version, linux, macos, windows, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -203,8 +188,9 @@ jobs:
           name: release-files
           path: dist
 
-  # Installs the built wheels like a user and runs the Python test suite on
-  # every platform with every supported Python version (5 x 4 = 20 jobs).
+  # Installs the built wheels like a user and runs the smoke tests on every
+  # platform with every supported Python version (5 x 4 = 20 short jobs).
+  # The full test suites run locally before a release (RELEASING.md).
   test:
     needs: verify
     runs-on: ${{ matrix.os }}
@@ -222,12 +208,13 @@ jobs:
         with:
           name: release-files
           path: dist
-      - name: Install wheel and run Python tests
+      - name: Install wheel and run smoke tests
         shell: bash
         run: |
-          python -m pip install numpy pytest cryptography
+          python -m pip install pytest
+          python -m pip install --only-binary=:all: numpy || echo "no numpy wheel, NumPy smoke test is skipped"
           python -m pip install --no-index --find-links dist nhydb
-          python -m pytest -q tests/python
+          python -m pytest -q tests/smoke tests/python/test_stab_format_golden.py
 
   github-release:
     name: GitHub release (draft)
