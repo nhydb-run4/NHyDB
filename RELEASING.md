@@ -60,12 +60,12 @@ change keeps it.
 
 ## Supply chain
 
-`.github/dependabot.yml` proposes weekly update pull requests for the GitHub
-Actions and the Cargo dependencies; CI checks them before they are merged.
+Updates of the GitHub Actions and the Cargo dependencies are managed
+manually; the normal GitHub CI only runs when started manually. Security
+alerts for dependencies are independent of this.
 Recommended before a release, run locally: `cargo audit` (RustSec advisories)
 or `cargo deny check advisories licenses sources`. Pinning the actions to
-commit SHAs can be done with the SHAs of the reviewed action releases;
-Dependabot keeps pinned SHAs up to date as well.
+commit SHAs can be done with the SHAs of the reviewed action releases.
 
 ## Publishing on PyPI
 
