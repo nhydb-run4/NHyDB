@@ -5,6 +5,15 @@ The project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `benchmarks/kq10m/`: KQ-10M benchmark for your own machine (writing,
+  indexing and reading 10 million records, NHyDB only), with a Markdown/JSON
+  report and an issue template for sharing results. Requires NHyDB 0.28.2 or
+  newer.
+- `benchmarks/kq10m/results/`: reference results of NHyDB 0.28.2 (Apple M1 Max,
+  Lenovo ThinkPad P52 with Windows 11 and an Ubuntu Hyper-V VM).
+
 ## [0.28.2] – 2026-11-11
 
 **Engine 0.28.2, file format 0.28.2.** Files start with the signature

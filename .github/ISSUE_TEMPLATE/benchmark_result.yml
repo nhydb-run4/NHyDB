@@ -1,0 +1,37 @@
+name: Benchmark result
+description: Share the result of the NHyDB KQ-10M benchmark (benchmarks/kq10m)
+title: "Benchmark result: <CPU / machine>, NHyDB <version>"
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for running the benchmark! Please paste the complete content of
+        `report_<timestamp>.md` below. The report contains only hardware and software
+        information (no user name, host name or paths). Issues are public: please
+        check your text and the note in the report and remove any personal
+        information before you submit.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: e.g. "MacBook Pro 14-inch, M5 Max" or "Desktop, AMD Ryzen 9 9950X"
+    validations:
+      required: true
+  - type: input
+    id: storage
+    attributes:
+      label: Storage device (optional)
+      description: e.g. "internal SSD", "NVMe Samsung 990 Pro", "external USB SSD"
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: Content of report_<timestamp>.md
+    validations:
+      required: true
+  - type: textarea
+    id: remarks
+    attributes:
+      label: Remarks (optional)
+      description: Anything unusual during the run (other load, power saving, virtual machine, ...)

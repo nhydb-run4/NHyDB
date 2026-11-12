@@ -167,6 +167,22 @@ Step-by-step instructions are in the notebook READMEs.
 * Command line: `nhydb --help` (or `python -m nhydb`); query CLI:
   `python -m nhydb.query --help`.
 
+## Benchmark: KQ-10M on your own machine
+
+[`benchmarks/kq10m/`](https://github.com/nhydb-run4/NHyDB/tree/main/benchmarks/kq10m)
+contains a self-contained benchmark that measures NHyDB on your hardware:
+importing 10 million records with 11 integer fields, building three
+secondary indexes and five read queries. Only NHyDB is measured; no other
+database is involved. It needs Python 3.12+ and
+`python -m pip install "nhydb[numpy]>=0.28.2"`, then a single
+`python orchestrator.py`. The result is a short Markdown report with tables
+and charts that contains hardware and software information only. See the
+[benchmark README](https://github.com/nhydb-run4/NHyDB/blob/main/benchmarks/kq10m/README.md)
+for the details and for how to share your results, and the
+[reference results](https://github.com/nhydb-run4/NHyDB/blob/main/benchmarks/kq10m/results/README.md)
+of NHyDB 0.28.2 on an Apple M1 Max and a Lenovo ThinkPad P52 (Windows 11 and an
+Ubuntu VM).
+
 ## Sibling project: dNHyDB
 
 [**dNHyDB**](https://github.com/nhydb/dNHyDB) (`pip install dnhydb`) applies

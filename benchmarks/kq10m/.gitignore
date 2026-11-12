@@ -1,0 +1,12 @@
+# results and databases created by the benchmark
+Benchmarkrun_*/
+*.nhydb
+*.nhydb.*
+limiter.txt
+# Python
+__pycache__/
+*.pyc
+# virtual environments
+nhydb-bench/
+.venv/
+venv/

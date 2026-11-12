@@ -1,0 +1,1231 @@
+{
+  "benchmark_version": "1.0.0",
+  "started": "2026-11-12 13:09:24 +0100",
+  "finished": "2026-11-12 13:11:16 +0100",
+  "parameters": {
+    "records": 10000000,
+    "batch": 10000,
+    "runs": 3,
+    "data_commits": 1,
+    "durability": "fsync",
+    "keep_dbs": false
+  },
+  "environment": {
+    "system": {
+      "os": "Windows 11 (build 10.0.26300)",
+      "cpu": "Intel(R) Core(TM) i7-8850H CPU @ 2.60GHz",
+      "machine_model": "LENOVO 20M9001MGE ThinkPad P52",
+      "memory_bytes": 68412456960,
+      "physical_cores": null,
+      "architecture": "AMD64",
+      "logical_cpus": 12,
+      "python": "CPython 3.14.5",
+      "numpy": "2.5.4"
+    },
+    "nhydb": {
+      "engine_version": "0.28.2",
+      "file_format": "0.28.2",
+      "package_version": "0.28.2",
+      "build_hash": "crc32:c3fd58f6"
+    },
+    "note": "Lenovo P52, Samsung SSD (drive E:)"
+  },
+  "steps": [
+    {
+      "step": "0_testdata",
+      "rc": 0,
+      "seconds": 2.3
+    },
+    {
+      "step": "1_write_run1",
+      "rc": 0,
+      "seconds": 19.6
+    },
+    {
+      "step": "1_write_run2",
+      "rc": 0,
+      "seconds": 19.5
+    },
+    {
+      "step": "1_write_run3",
+      "rc": 0,
+      "seconds": 19.6
+    },
+    {
+      "step": "2_index_run1",
+      "rc": 0,
+      "seconds": 10.2
+    },
+    {
+      "step": "2_index_run2",
+      "rc": 0,
+      "seconds": 10.2
+    },
+    {
+      "step": "2_index_run3",
+      "rc": 0,
+      "seconds": 10.2
+    },
+    {
+      "step": "3_read_build",
+      "rc": 0,
+      "seconds": 9.1
+    },
+    {
+      "step": "3_read_rep1",
+      "rc": 0,
+      "seconds": 3.7
+    },
+    {
+      "step": "3_read_rep2",
+      "rc": 0,
+      "seconds": 3.7
+    },
+    {
+      "step": "3_read_rep3",
+      "rc": 0,
+      "seconds": 3.7
+    }
+  ],
+  "write": [
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "batches": 1000,
+      "data_commits": 1,
+      "times_s": {
+        "setup": 0.053809,
+        "prep": 0.006619,
+        "write_calls": 1.180887,
+        "commit": 0.1109199,
+        "import_total": 1.2984259,
+        "close": 0.001833
+      },
+      "cpu_s_import": 1.21875,
+      "size": {
+        "files": 4,
+        "total_bytes": 251820563,
+        "main_bytes": 251818456
+      },
+      "memory": {
+        "rss_test_data_bytes": 841281536,
+        "peak_after_import_bytes": 854491136,
+        "peak_after_close_bytes": 854491136
+      },
+      "validation": {
+        "verify_ok": true,
+        "physical_records": 10000000,
+        "count_ok": true,
+        "full_compare_failed_chunks": 0,
+        "spot_checks": 1002,
+        "spot_check_mismatches": 0,
+        "beyond_last_absent": true,
+        "ok": true
+      },
+      "db_kept": false
+    },
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "batches": 1000,
+      "data_commits": 1,
+      "times_s": {
+        "setup": 0.051996,
+        "prep": 0.0050043,
+        "write_calls": 1.1580175,
+        "commit": 0.1120727,
+        "import_total": 1.2750945,
+        "close": 0.0016318
+      },
+      "cpu_s_import": 1.21875,
+      "size": {
+        "files": 4,
+        "total_bytes": 251820563,
+        "main_bytes": 251818456
+      },
+      "memory": {
+        "rss_test_data_bytes": 841146368,
+        "peak_after_import_bytes": 854478848,
+        "peak_after_close_bytes": 854478848
+      },
+      "validation": {
+        "verify_ok": true,
+        "physical_records": 10000000,
+        "count_ok": true,
+        "full_compare_failed_chunks": 0,
+        "spot_checks": 1002,
+        "spot_check_mismatches": 0,
+        "beyond_last_absent": true,
+        "ok": true
+      },
+      "db_kept": false
+    },
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "batches": 1000,
+      "data_commits": 1,
+      "times_s": {
+        "setup": 0.0531526,
+        "prep": 0.0049443,
+        "write_calls": 1.1916097,
+        "commit": 0.1142419,
+        "import_total": 1.3107959,
+        "close": 0.0018255
+      },
+      "cpu_s_import": 1.1875,
+      "size": {
+        "files": 4,
+        "total_bytes": 251820563,
+        "main_bytes": 251818456
+      },
+      "memory": {
+        "rss_test_data_bytes": 840830976,
+        "peak_after_import_bytes": 854372352,
+        "peak_after_close_bytes": 854372352
+      },
+      "validation": {
+        "verify_ok": true,
+        "physical_records": 10000000,
+        "count_ok": true,
+        "full_compare_failed_chunks": 0,
+        "spot_checks": 1002,
+        "spot_check_mismatches": 0,
+        "beyond_last_absent": true,
+        "ok": true
+      },
+      "db_kept": false
+    }
+  ],
+  "index": [
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "import_s": 1.2936507,
+      "times_s": {
+        "define": 9.74e-05,
+        "define_commit": 0.0042072,
+        "build": 7.0444692,
+        "build_commit": 0.0259611,
+        "total_incl_commits": 7.0747349
+      },
+      "cpu_s_build": 7.03125,
+      "per_index": {
+        "idx_lage": {
+          "distinct_values": 4,
+          "u_references": 10000000,
+          "payload_bytes": 13894681
+        },
+        "idx_stufe": {
+          "distinct_values": 1582,
+          "u_references": 10000000,
+          "payload_bytes": 14897907
+        },
+        "idx_tq": {
+          "distinct_values": 3162,
+          "u_references": 10000000,
+          "payload_bytes": 14012157
+        }
+      },
+      "size": {
+        "after_import": {
+          "files": 4,
+          "total_bytes": 251820563,
+          "main_bytes": 251818456
+        },
+        "after_index": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "after_close": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "added_bytes": 42809880
+      },
+      "memory": {
+        "rss_test_data_bytes": 841064448,
+        "peak_after_import_bytes": 854478848,
+        "peak_after_index_bytes": 1019572224
+      },
+      "validation": {
+        "checks": {
+          "verify": true,
+          "count lage = N0": true,
+          "count lage = NL": true,
+          "count lage = Gz": true,
+          "count lage = NR": true,
+          "hits lage = Gz": true,
+          "hits stufe = 100": true,
+          "hits tq = 1000": true,
+          "hits tq BETWEEN 3000 AND 3001": true,
+          "distinct lage": true,
+          "references lage": true,
+          "distinct stufe": true,
+          "references stufe": true,
+          "distinct tq": true,
+          "references tq": true
+        },
+        "ok": true
+      },
+      "db_kept": false
+    },
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "import_s": 1.2804699,
+      "times_s": {
+        "define": 6.33e-05,
+        "define_commit": 0.0041549,
+        "build": 7.0428244,
+        "build_commit": 0.028878,
+        "total_incl_commits": 7.0759206
+      },
+      "cpu_s_build": 7.0625,
+      "per_index": {
+        "idx_lage": {
+          "distinct_values": 4,
+          "u_references": 10000000,
+          "payload_bytes": 13894681
+        },
+        "idx_stufe": {
+          "distinct_values": 1582,
+          "u_references": 10000000,
+          "payload_bytes": 14897907
+        },
+        "idx_tq": {
+          "distinct_values": 3162,
+          "u_references": 10000000,
+          "payload_bytes": 14012157
+        }
+      },
+      "size": {
+        "after_import": {
+          "files": 4,
+          "total_bytes": 251820563,
+          "main_bytes": 251818456
+        },
+        "after_index": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "after_close": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "added_bytes": 42809880
+      },
+      "memory": {
+        "rss_test_data_bytes": 841203712,
+        "peak_after_import_bytes": 854663168,
+        "peak_after_index_bytes": 1021267968
+      },
+      "validation": {
+        "checks": {
+          "verify": true,
+          "count lage = N0": true,
+          "count lage = NL": true,
+          "count lage = Gz": true,
+          "count lage = NR": true,
+          "hits lage = Gz": true,
+          "hits stufe = 100": true,
+          "hits tq = 1000": true,
+          "hits tq BETWEEN 3000 AND 3001": true,
+          "distinct lage": true,
+          "references lage": true,
+          "distinct stufe": true,
+          "references stufe": true,
+          "distinct tq": true,
+          "references tq": true
+        },
+        "ok": true
+      },
+      "db_kept": false
+    },
+    {
+      "records": 10000000,
+      "batch": 10000,
+      "import_s": 1.2773725,
+      "times_s": {
+        "define": 6.46e-05,
+        "define_commit": 0.0043358,
+        "build": 7.0476245,
+        "build_commit": 0.0291804,
+        "total_incl_commits": 7.0812053
+      },
+      "cpu_s_build": 7.0625,
+      "per_index": {
+        "idx_lage": {
+          "distinct_values": 4,
+          "u_references": 10000000,
+          "payload_bytes": 13894681
+        },
+        "idx_stufe": {
+          "distinct_values": 1582,
+          "u_references": 10000000,
+          "payload_bytes": 14897907
+        },
+        "idx_tq": {
+          "distinct_values": 3162,
+          "u_references": 10000000,
+          "payload_bytes": 14012157
+        }
+      },
+      "size": {
+        "after_import": {
+          "files": 4,
+          "total_bytes": 251820563,
+          "main_bytes": 251818456
+        },
+        "after_index": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "after_close": {
+          "files": 4,
+          "total_bytes": 294630443,
+          "main_bytes": 294626768
+        },
+        "added_bytes": 42809880
+      },
+      "memory": {
+        "rss_test_data_bytes": 841043968,
+        "peak_after_import_bytes": 854421504,
+        "peak_after_index_bytes": 1020669952
+      },
+      "validation": {
+        "checks": {
+          "verify": true,
+          "count lage = N0": true,
+          "count lage = NL": true,
+          "count lage = Gz": true,
+          "count lage = NR": true,
+          "hits lage = Gz": true,
+          "hits stufe = 100": true,
+          "hits tq = 1000": true,
+          "hits tq BETWEEN 3000 AND 3001": true,
+          "distinct lage": true,
+          "references lage": true,
+          "distinct stufe": true,
+          "references stufe": true,
+          "distinct tq": true,
+          "references tq": true
+        },
+        "ok": true
+      },
+      "db_kept": false
+    }
+  ],
+  "read": {
+    "build": {
+      "build_s": 8.4403057,
+      "size": {
+        "files": 4,
+        "total_bytes": 294630389,
+        "main_bytes": 294626720
+      },
+      "verify_ok": true,
+      "ok": true
+    },
+    "reps": [
+      {
+        "entries": [
+          {
+            "case": "stufe = 100",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.7192,
+            "cold_ms": 0.1205,
+            "warm_ms": 0.0044,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 9.1535,
+            "cold_ms": 0.4833,
+            "warm_ms": 0.0504,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.1181,
+            "cold_ms": 37.2904,
+            "warm_ms": 4.5363,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.5137,
+            "cold_ms": 38.8863,
+            "warm_ms": 5.9414,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.3962,
+            "cold_ms": 38.1854,
+            "warm_ms": 5.6535,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.5114,
+            "cold_ms": 35.4698,
+            "warm_ms": 3.0982,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.5936,
+            "cold_ms": 0.0544,
+            "warm_ms": 0.002,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 9.1046,
+            "cold_ms": 0.4067,
+            "warm_ms": 0.0685,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.1825,
+            "cold_ms": 6.9202,
+            "warm_ms": 8.1828,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.5071,
+            "cold_ms": 10.7906,
+            "warm_ms": 11.5079,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2462,
+            "cold_ms": 11.1581,
+            "warm_ms": 13.0027,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3222,
+            "cold_ms": 7.2046,
+            "warm_ms": 6.5904,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.3277,
+            "cold_ms": 1.4065,
+            "warm_ms": 0.8408,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.2708,
+            "cold_ms": 0.0578,
+            "warm_ms": 0.0021,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9518,
+            "cold_ms": 1.214,
+            "warm_ms": 0.3052,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.4486,
+            "cold_ms": 45.8237,
+            "warm_ms": 47.8244,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 10.9859,
+            "cold_ms": 69.7943,
+            "warm_ms": 78.414,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2797,
+            "cold_ms": 68.9534,
+            "warm_ms": 71.5411,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.5795,
+            "cold_ms": 44.1174,
+            "warm_ms": 43.2508,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.3817,
+            "cold_ms": 5.9954,
+            "warm_ms": 4.8983,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4818,
+            "cold_ms": 0.0223,
+            "warm_ms": 0.0016,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 10.3993,
+            "cold_ms": 0.2985,
+            "warm_ms": 0.1445,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.028,
+            "cold_ms": 159.2301,
+            "warm_ms": 34.6229,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.474,
+            "cold_ms": 166.8288,
+            "warm_ms": 42.9549,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.3547,
+            "cold_ms": 164.7037,
+            "warm_ms": 41.7574,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3819,
+            "cold_ms": 161.1821,
+            "warm_ms": 33.7214,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4718,
+            "cold_ms": 0.0296,
+            "warm_ms": 0.0016,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 9.0801,
+            "cold_ms": 315.2644,
+            "warm_ms": 226.7359,
+            "correct": true
+          }
+        ],
+        "peak_bytes": 1495916544,
+        "ok": true
+      },
+      {
+        "entries": [
+          {
+            "case": "stufe = 100",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.7234,
+            "cold_ms": 0.1078,
+            "warm_ms": 0.0038,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9795,
+            "cold_ms": 0.4498,
+            "warm_ms": 0.0563,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.0816,
+            "cold_ms": 35.5628,
+            "warm_ms": 4.544,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.6143,
+            "cold_ms": 37.9171,
+            "warm_ms": 5.8266,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.324,
+            "cold_ms": 36.8389,
+            "warm_ms": 5.3196,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.4632,
+            "cold_ms": 35.3811,
+            "warm_ms": 2.9926,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4101,
+            "cold_ms": 0.0648,
+            "warm_ms": 0.0019,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9487,
+            "cold_ms": 0.4376,
+            "warm_ms": 0.0613,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.0013,
+            "cold_ms": 6.7466,
+            "warm_ms": 7.9169,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.3509,
+            "cold_ms": 10.5975,
+            "warm_ms": 11.1799,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2125,
+            "cold_ms": 10.9715,
+            "warm_ms": 12.8264,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.4055,
+            "cold_ms": 7.0815,
+            "warm_ms": 6.423,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.2718,
+            "cold_ms": 1.4773,
+            "warm_ms": 0.8016,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.2945,
+            "cold_ms": 0.0615,
+            "warm_ms": 0.0022,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.8702,
+            "cold_ms": 1.2162,
+            "warm_ms": 0.3222,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.1416,
+            "cold_ms": 45.2309,
+            "warm_ms": 47.0736,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.3639,
+            "cold_ms": 68.5557,
+            "warm_ms": 76.6642,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2123,
+            "cold_ms": 67.8113,
+            "warm_ms": 70.9045,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3373,
+            "cold_ms": 42.4019,
+            "warm_ms": 41.7589,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.3344,
+            "cold_ms": 6.2523,
+            "warm_ms": 4.8441,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4028,
+            "cold_ms": 0.0213,
+            "warm_ms": 0.0016,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.8982,
+            "cold_ms": 0.4507,
+            "warm_ms": 0.1806,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 8.9116,
+            "cold_ms": 155.7914,
+            "warm_ms": 34.3307,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.3985,
+            "cold_ms": 168.4172,
+            "warm_ms": 42.8729,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2539,
+            "cold_ms": 166.5767,
+            "warm_ms": 41.7154,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3542,
+            "cold_ms": 157.0923,
+            "warm_ms": 33.9012,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4081,
+            "cold_ms": 0.0274,
+            "warm_ms": 0.0015,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.8985,
+            "cold_ms": 312.4059,
+            "warm_ms": 225.8469,
+            "correct": true
+          }
+        ],
+        "peak_bytes": 1496776704,
+        "ok": true
+      },
+      {
+        "entries": [
+          {
+            "case": "stufe = 100",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.6306,
+            "cold_ms": 0.1115,
+            "warm_ms": 0.0039,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 9.0995,
+            "cold_ms": 0.4676,
+            "warm_ms": 0.0534,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.0341,
+            "cold_ms": 39.2426,
+            "warm_ms": 9.0937,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.6756,
+            "cold_ms": 37.4938,
+            "warm_ms": 5.8586,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.4968,
+            "cold_ms": 37.316,
+            "warm_ms": 5.3284,
+            "correct": true
+          },
+          {
+            "case": "stufe = 100",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.6596,
+            "cold_ms": 35.4556,
+            "warm_ms": 3.0473,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.5162,
+            "cold_ms": 0.0588,
+            "warm_ms": 0.0019,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 9.0578,
+            "cold_ms": 0.4247,
+            "warm_ms": 0.0726,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.1003,
+            "cold_ms": 6.8462,
+            "warm_ms": 7.8835,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.3244,
+            "cold_ms": 10.6612,
+            "warm_ms": 11.2561,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2631,
+            "cold_ms": 10.9599,
+            "warm_ms": 12.8401,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3161,
+            "cold_ms": 7.1894,
+            "warm_ms": 6.7528,
+            "correct": true
+          },
+          {
+            "case": "tq = 1000",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.1974,
+            "cold_ms": 1.3551,
+            "warm_ms": 0.8516,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.1731,
+            "cold_ms": 0.0574,
+            "warm_ms": 0.0022,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9471,
+            "cold_ms": 1.2886,
+            "warm_ms": 0.3532,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 9.1477,
+            "cold_ms": 45.6883,
+            "warm_ms": 47.1482,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.2228,
+            "cold_ms": 68.2293,
+            "warm_ms": 76.6842,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.2783,
+            "cold_ms": 68.0117,
+            "warm_ms": 71.8501,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.3407,
+            "cold_ms": 43.7794,
+            "warm_ms": 41.4961,
+            "correct": true
+          },
+          {
+            "case": "tq BETWEEN 3000 AND 3001",
+            "phase": "range",
+            "api": "find_u + read_numpy",
+            "open_ms": 9.18,
+            "cold_ms": 6.3212,
+            "warm_ms": 4.9788,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.3285,
+            "cold_ms": 0.0288,
+            "warm_ms": 0.0016,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9233,
+            "cold_ms": 0.2773,
+            "warm_ms": 0.1688,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "select_us",
+            "open_ms": 8.8087,
+            "cold_ms": 155.7079,
+            "warm_ms": 34.4965,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "rows",
+            "api": "get loop",
+            "open_ms": 9.3224,
+            "cold_ms": 168.0666,
+            "warm_ms": 42.8369,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "find",
+            "open_ms": 9.3437,
+            "cold_ms": 167.3707,
+            "warm_ms": 41.4462,
+            "correct": true
+          },
+          {
+            "case": "lage = Gz",
+            "phase": "query",
+            "api": "execute_numpy",
+            "open_ms": 9.387,
+            "cold_ms": 160.5939,
+            "warm_ms": 34.2668,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "count",
+            "api": "posting_count",
+            "open_ms": 9.4721,
+            "cold_ms": 0.0285,
+            "warm_ms": 0.0017,
+            "correct": true
+          },
+          {
+            "case": "lage = NL",
+            "phase": "ids",
+            "api": "find_u",
+            "open_ms": 8.9687,
+            "cold_ms": 311.1386,
+            "warm_ms": 225.4301,
+            "correct": true
+          }
+        ],
+        "peak_bytes": 1496829952,
+        "ok": true
+      }
+    ]
+  },
+  "validation": [
+    {
+      "ok": true,
+      "text": "all 11 steps finished without error"
+    },
+    {
+      "ok": true,
+      "text": "write (3 runs): deep verify, record count, all records compared with the test data, 1002 spot checks via get()"
+    },
+    {
+      "ok": true,
+      "text": "index (3 runs): verify, counts per lage value, exact hit lists, distinct values and references per index"
+    },
+    {
+      "ok": true,
+      "text": "read (3 repetitions): every result (IDs, counts, all field values) compared with the test data"
+    }
+  ],
+  "valid": true
+}
