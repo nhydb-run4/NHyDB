@@ -1,5 +1,5 @@
 {
- "comment": "T004 format golden; regenerate with: python tests/python/test_stab_format_golden.py --update",
+ "comment": "format golden; regenerate with: python tests/smoke/test_format_golden.py --update",
  "contents": {
   "classic": [
    {

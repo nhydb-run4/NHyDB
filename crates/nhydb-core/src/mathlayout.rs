@@ -499,48 +499,6 @@ pub fn to_u64(b: &BigInt) -> Option<u64> {
     b.to_u64()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn b(x: i64) -> BigInt {
-        BigInt::from(x)
-    }
-
-    #[test]
-    fn planner_like_python_selftest() {
-        let state = CoreLayoutSnapshot::new(
-            b(7),
-            vec![
-                OwnedRealmExtent::new(b(1), b(54), "CLASSIC", b(1)).unwrap(),
-                OwnedRealmExtent::new(b(60), b(70), "PACKED", b(2)).unwrap(),
-            ],
-        )
-        .unwrap();
-        let map = MathRealmMap::new(b(17), "fp", vec![], b(4096)).unwrap();
-        let p1 = plan_math_realms(&state, &map, &[b(1), b(2), b(3)]).unwrap();
-        assert_eq!(p1.proposed_extents, vec![MathRealmExtent::new(b(1), b(3), b(55), b(57)).unwrap()]);
-        let (state, map) = commit_plan_simulated(&state, &map, &p1).unwrap();
-        assert_eq!(state.revision, b(8));
-        let p2 = plan_math_realms(&state, &map, &[b(1), b(2), b(3), b(4), b(5), b(800), b(801), b(802)]).unwrap();
-        assert_eq!(p2.missing_logical_extents, vec![(b(4), b(5)), (b(800), b(802))]);
-        assert_eq!(p2.proposed_extents[1], MathRealmExtent::new(b(800), b(802), b(71), b(73)).unwrap());
-        let (_s, map) = commit_plan_simulated(&state, &map, &p2).unwrap();
-        assert_eq!(map.extents[0], MathRealmExtent::new(b(1), b(5), b(55), b(59)).unwrap());
-        let frag = CoreLayoutSnapshot::new(
-            b(0),
-            vec![
-                OwnedRealmExtent::new(b(1), b(10), "CLASSIC", b(1)).unwrap(),
-                OwnedRealmExtent::new(b(12), b(20), "COLUMN", b(2)).unwrap(),
-            ],
-        )
-        .unwrap();
-        let fm = MathRealmMap::new(b(24), "fp", vec![], b(4096)).unwrap();
-        let fp = plan_math_realms(&frag, &fm, &[b(1), b(2)]).unwrap();
-        assert_eq!(fp.proposed_extents, vec![MathRealmExtent::new(b(1), b(2), b(21), b(22)).unwrap()]);
-        let over: Vec<BigInt> = (1..4098).map(b).collect();
-        let budget = MathRealmMap::new(b(25), "fp", vec![], b(4096)).unwrap();
-        let p = plan_math_realms(&CoreLayoutSnapshot::new(b(0), vec![]).unwrap(), &budget, &over).unwrap();
-        assert!(!p.allowed && p.resulting_count == b(4097));
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "mathlayout_tests.rs"]
+mod tests;

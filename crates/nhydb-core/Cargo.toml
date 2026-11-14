@@ -11,10 +11,10 @@ description = "NHyDB native storage engine (pure Rust core)"
 name = "nhydb_core"
 
 [features]
-# RUN8 AP0 (A7 analysis): counts cache-lock acquisitions, contended
+# measurement only: counts cache-lock acquisitions, contended
 # acquisitions and wait time; not part of normal builds
 lock_stats = []
-# RUN8 AP0 (A7 experiment P4c, measurement only): a dense read state keeps
+# experiment, measurement only: a dense read state keeps
 # the cached block of the previous record instead of locking per record
 exp_block_state = []
 

@@ -1,5 +1,5 @@
 {
- "comment": "T004 format golden; regenerate with: python tests/python/test_stab_format_golden.py --update",
+ "comment": "format 0.16 golden (old format, must be rejected)",
  "contents": {
   "classic": [
    {

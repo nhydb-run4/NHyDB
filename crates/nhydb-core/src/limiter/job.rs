@@ -504,7 +504,7 @@ impl Meter {
         Meter { kind, path, step: METER_STEP, pending: 0, job: None, lim: None }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, nhydb_internal_tests))]
     pub(crate) fn new_in(lim: &'static Limiter, kind: JobKind, path: JobPath) -> Meter {
         Meter { lim: Some(lim), ..Meter::new(kind, path) }
     }

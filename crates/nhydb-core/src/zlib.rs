@@ -61,19 +61,6 @@ pub fn decompress_with_limit(data: &[u8], max_out: usize) -> Result<Vec<u8>, Str
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn roundtrip() {
-        let d: Vec<u8> = (0..10000u32).flat_map(|x| x.to_le_bytes()).collect();
-        let c = super::compress(&d, 1);
-        assert!(c.len() < d.len());
-        assert_eq!(super::decompress(&c).unwrap(), d);
-        assert_eq!(super::decompress_with_limit(&c, d.len()).unwrap(), d);
-        assert!(super::decompress_with_limit(&c, d.len() - 1).is_err());
-        // "zip bomb": 64 MiB of zeros, limited to 1 MiB → error, no large allocation
-        let bomb = super::compress(&vec![0u8; 64 << 20], 9);
-        assert!(super::decompress_with_limit(&bomb, 1 << 20).unwrap_err().contains("exceeds"));
-        assert!(super::decompress(b"not zlib").is_err());
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "zlib_tests.rs"]
+mod tests;

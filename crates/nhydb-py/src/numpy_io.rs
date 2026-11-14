@@ -459,44 +459,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod col_builder_tests {
-    use super::*;
-
-    fn same(a: &OutCol, b: &OutCol) -> bool {
-        match (a, b) {
-            (OutCol::I64(x), OutCol::I64(y)) => x == y,
-            (OutCol::F64(x), OutCol::F64(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
-            (OutCol::Bool(x), OutCol::Bool(y)) => x == y,
-            (OutCol::Vals(x), OutCol::Vals(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| format!("{p:?}") == format!("{q:?}")),
-            _ => false,
-        }
-    }
-
-    /// R4-B: the incremental builder equals `vals_to_out` on random columns.
-    #[test]
-    fn builder_equals_vals_to_out() {
-        let pool = [
-            Val::Int(1), Val::Int(-7), Val::Int(1 << 53), Val::Int((1 << 53) + 1), Val::Int(i64::MIN), Val::Float(0.5),
-            Val::Float(-0.0), Val::Float(f64::NAN), Val::Bool(true), Val::Bool(false), Val::None, Val::str("x"),
-        ];
-        let mut seed = 12345u64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for _ in 0..20_000 {
-            let len = (next() % 7) as usize;
-            // mostly homogeneous columns with occasional other values
-            let base = (next() % pool.len() as u64) as usize;
-            let col: Vec<Val> = (0..len).map(|_| if next() % 4 == 0 { pool[(next() % pool.len() as u64) as usize].clone() } else { pool[base].clone() }).collect();
-            let mut b = ColBuilder::default();
-            for v in col.iter().cloned() {
-                b.push(v);
-            }
-            assert!(same(&b.finish(), &vals_to_out(col.clone())), "{col:?}");
-        }
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "numpy_io_col_builder_tests.rs"]
+mod col_builder_tests;

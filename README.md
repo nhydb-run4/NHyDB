@@ -261,9 +261,9 @@ Building from source: [`BUILDING.md`](https://github.com/nhydb-run4/NHyDB/blob/m
 release procedure: [`RELEASING.md`](https://github.com/nhydb-run4/NHyDB/blob/main/RELEASING.md)
 
 ```bash
-cargo test --workspace --release        # Rust core
+cargo clippy --workspace --all-targets -- -D warnings
 pip install ".[test]"
-python -m pytest tests/python           # Python package, cookbook and examples
+python -m pytest tests/smoke            # smoke and file format tests of the installed package
 ```
 
 ## Contact

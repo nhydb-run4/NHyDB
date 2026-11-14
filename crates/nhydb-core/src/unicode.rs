@@ -273,26 +273,6 @@ pub fn prop_bits(cp: u32) -> u8 {
     b
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spot_checks() {
-        assert!(is_word('_') && is_word('ä') && is_word('٣') && !is_word('-') && !is_word('\u{0301}'));
-        assert!(is_digit('²') && decimal_value('²').is_none() && decimal_value('٣') == Some(3));
-        assert_eq!(casefold("Straße ΣΑΣ"), "strasse σασ");
-        assert_eq!(upper("ſelect ı"), "SELECT I");
-        assert!(is_space('\u{3000}') && is_space('\x1f') && !is_space('\u{200b}'));
-        assert!(is_identifier("äx_1") && !is_identifier("1a") && !is_identifier(""));
-        assert!(identifier_needs_nfkc("ﬁ") && !identifier_needs_nfkc("fi"));
-        assert_eq!(strip("\u{3000} a \n"), "a");
-        // F043: NFC sequences
-        assert!(is_nfc("caf\u{e9}") && !is_nfc("cafe\u{301}"));
-        assert!(identifier_needs_nfkc("cafe\u{301}") && !identifier_needs_nfkc("caf\u{e9}"));
-        assert!(is_nfc("x\u{304}")); // no precomposed form
-        assert_eq!(nfc("\u{e9}\u{323}"), "\u{1eb9}\u{301}");
-        assert_eq!(nfc("\u{1100}\u{1161}\u{11a8}"), "\u{ac01}");
-        assert!(is_nfc("\u{ac01}") && !is_nfc("\u{1100}\u{1161}"));
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "unicode_tests.rs"]
+mod tests;

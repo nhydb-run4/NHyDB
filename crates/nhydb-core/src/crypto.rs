@@ -154,46 +154,6 @@ pub fn wipe(buf: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ct_eq_compares_all_bytes() {
-        assert!(ct_eq(b"", b""));
-        assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
-        assert!(!ct_eq(b"xbc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abcd"));
-    }
-
-    #[test]
-    fn known_answers() {
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        // RFC 4231 test case 2
-        assert_eq!(
-            hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-        // NIST GCM test case 14 (AES-256, zero key, 16 zero bytes)
-        let ct = aes_gcm_seal_with_nonce(&[0u8; 32], &[0u8; 12], &[0u8; 16], b"").unwrap();
-        assert_eq!(hex(&ct), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919");
-        let pt = aes_gcm_open(&[0u8; 32], &[0u8; 12], &ct, b"").unwrap();
-        assert_eq!(pt, vec![0u8; 16]);
-        let mut bad = ct.clone();
-        bad[0] ^= 1;
-        assert!(matches!(aes_gcm_open(&[0u8; 32], &[0u8; 12], &bad, b""), Err(Error::Corruption(_))));
-        assert!(aes_gcm_open(&[0u8; 32], &[0u8; 12], &ct, b"x").is_err());
-    }
-
-    #[test]
-    fn seal_roundtrip_and_uuid() {
-        let key = random_bytes(32).unwrap();
-        let (n, c) = layout_seal(&key, b"{\"a\":1}", b"aad").unwrap();
-        assert_eq!(layout_open(&key, &n, &c, b"aad").unwrap(), b"{\"a\":1}");
-        let u = uuid4().unwrap();
-        assert_eq!(u.len(), 36);
-        assert_eq!(&u[14..15], "4");
-        assert!(b64decode("not base64!").is_err());
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "crypto_tests.rs"]
+mod tests;

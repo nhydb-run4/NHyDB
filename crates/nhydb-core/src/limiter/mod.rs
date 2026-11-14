@@ -984,5 +984,6 @@ fn job_status(j: &Slot, notify_wait_s: u64) -> Val {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "limiter_tests.rs"]
 mod tests;

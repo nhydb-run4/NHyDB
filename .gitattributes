@@ -1,2 +1,2 @@
-# Format golden files (T004) must be checked out byte-exact on every platform
-tests/python/golden/* -text
+# Format golden files must be checked out byte-exact on every platform
+tests/smoke/golden/* -text

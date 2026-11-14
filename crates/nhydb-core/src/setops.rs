@@ -105,66 +105,10 @@ pub fn sorted_unique<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn kernels() {
-        let a = [1, 3, 5, 7, 9];
-        let b = [2, 3, 6, 7, 10];
-        assert_eq!(intersect_sorted(&a, &b), vec![3, 7]);
-        assert_eq!(union_sorted(&a, &b), vec![1, 2, 3, 5, 6, 7, 9, 10]);
-        assert_eq!(difference_sorted(&a, &b), vec![1, 5, 9]);
-        let big: Vec<i32> = (0..10000).collect();
-        assert_eq!(intersect_sorted(&[5, 77, 20000], &big), vec![5, 77]);
-        assert_eq!(sorted_unique(vec![7, 1, 7, 3]), vec![1, 3, 7]);
-        let n = |x: u64| Nat::from(x);
-        let r = [(n(1), n(4)), (n(8), n(9))];
-        assert_eq!(ranges_minus_sorted(&r, &[n(0), n(2), n(4), n(9), n(12)]), vec![n(1), n(3), n(8)]);
-        assert_eq!(ranges_minus_sorted(&r, &[]), vec![n(1), n(2), n(3), n(4), n(8), n(9)]);
-        let big = Nat::from(u64::MAX);
-        let rb = [(big.clone(), big.add_u64(2))];
-        assert_eq!(ranges_minus_sorted(&rb, &[big.add_u64(1)]), vec![big.clone(), big.add_u64(2)]);
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "setops_tests.rs"]
+mod tests;
 
-#[cfg(test)]
-mod stab_tests {
-    use super::*;
-
-    fn merge_ref(a: &[i64], b: &[i64]) -> Vec<i64> {
-        let (mut i, mut j, mut out) = (0, 0, Vec::new());
-        while i < a.len() && j < b.len() {
-            match a[i].cmp(&b[j]) {
-                std::cmp::Ordering::Equal => {
-                    out.push(a[i]);
-                    i += 1;
-                    j += 1;
-                }
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn intersect_with_duplicates_f044() {
-        let mut seed = 12345u64;
-        let mut rnd = |m: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 33) % m
-        };
-        for _ in 0..3000 {
-            let mut a: Vec<i64> = (0..rnd(6)).map(|_| rnd(20) as i64).collect();
-            let mut b: Vec<i64> = (0..rnd(200)).map(|_| rnd(20) as i64).collect();
-            a.sort();
-            b.sort();
-            assert_eq!(intersect_sorted(&a, &b), merge_ref(&a, &b), "{a:?} {b:?}");
-            assert_eq!(intersect_sorted(&b, &a), merge_ref(&a, &b), "{a:?} {b:?}");
-        }
-        let mut big: Vec<i64> = (0..100).chain([10, 10, 10]).collect();
-        big.sort();
-        assert_eq!(intersect_sorted(&[10, 10], &big), vec![10, 10]);
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "setops_stab_tests.rs"]
+mod stab_tests;

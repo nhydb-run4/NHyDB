@@ -917,100 +917,10 @@ pub fn bm25_scores(postings: &TermPostings<'_>, corpus: &FtCorpus, candidates: O
     Ok(order.into_iter().map(|u| { let s = scores[&u]; (u, s) }).collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "textindex_tests.rs"]
+mod tests;
 
-    /// RB3-05: segment keys round-trip for every last u, including 0, and
-    /// sort like their u.
-    #[test]
-    fn doclen_segment_keys_round_trip() {
-        let us: Vec<Nat> = [0u64, 1, 255, 256, 65535, u64::MAX].iter().map(|u| Nat::S(*u)).chain([Nat::from(num_bigint::BigUint::from(1u8) << 200usize)]).collect();
-        for w in us.windows(2) {
-            let (a, b) = (doclen_segment_key(&w[0]), doclen_segment_key(&w[1]));
-            assert_eq!(doclen_segment_last(&a), Some(w[0].clone()), "{a}");
-            assert!(a < b, "{a} !< {b}");
-        }
-        assert_eq!(doclen_segment_last(&doclen_segment_key(us.last().unwrap())), us.last().cloned());
-    }
-
-    #[test]
-    fn normalize() {
-        assert_eq!(normalize_kind(&Val::None).unwrap(), IndexKind::Value);
-        assert_eq!(normalize_kind(&Val::str(" fulltext ")).unwrap(), IndexKind::Fulltext);
-        assert!(matches!(normalize_kind(&Val::str("x")), Err(Error::IndexConfig(_))));
-        let o = normalize_options(IndexKind::Trigram, &vmap! {"ngram" => "4", "casefold" => 1i64}).unwrap();
-        assert_eq!(o, vmap! {"ngram" => 4i64, "casefold" => true});
-        assert!(normalize_options(IndexKind::Trigram, &vmap! {"ngram" => 1i64}).is_err());
-        assert!(normalize_options(IndexKind::Token, &vmap! {"tokenizer" => "icu"}).is_err());
-        assert_eq!(
-            normalize_options(IndexKind::Fulltext, &Val::None).unwrap(),
-            vmap! {"tokenizer" => "simple", "casefold" => true, "positions" => true}
-        );
-    }
-
-    #[test]
-    fn tokens_ngrams_codecs() {
-        assert_eq!(simple_tokens(&Val::str("The quick, quick FOX_1 ä!"), true), vec!["the", "quick", "quick", "fox_1", "ä"]);
-        assert_eq!(ngrams(&Val::str("äbcd"), 3, false), vec!["äbc", "bcd"]);
-        let (dl, pos) = fulltext_document(&Val::str("a b a"), &Val::None).unwrap();
-        assert_eq!(dl, 3);
-        assert_eq!(pos, vec![("a".to_string(), vec![0, 2]), ("b".to_string(), vec![1])]);
-        let e = vec![(Nat::S(3), vec![0, 5]), (Nat::S(9), vec![2])];
-        let raw = encode_fulltext_posting(&e).unwrap();
-        let d = decode_fulltext_posting(&raw, Some(2)).unwrap();
-        assert_eq!(d[1], FtPosting { u: Nat::S(9), positions: vec![2] });
-        let raw = encode_fulltext_doc_lengths(&[(Nat::S(3), 4), (Nat::S(9), 1)]).unwrap();
-        let c = decode_fulltext_doc_lengths(&raw, Some(2)).unwrap();
-        assert_eq!((c.total_docs, c.total_tokens), (2, 5));
-        let b = [FtPosting { u: Nat::S(3), positions: vec![1] }];
-        let ph = phrase_candidate_docs(&["a".into(), "b".into()], &[("a".into(), &d[..]), ("b".into(), &b[..])]);
-        assert_eq!(ph, vec![Nat::S(3)]);
-        assert!(predicate_matches(&Val::str("Hello World"), "icontains", &Val::str("WORLD"), &Val::None).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod doclen_key_tests {
-    use super::*;
-    use crate::db::secindex::{cmp_keys, encode_key_vec};
-
-    /// Segment keys sort like their u (big `Nat` included), round-trip, and
-    /// sort after the summary key; segmentation covers every document once.
-    #[test]
-    fn segment_keys_order_and_split() {
-        let mut us: Vec<Nat> = vec![Nat::S(1), Nat::S(2), Nat::S(255), Nat::S(256), Nat::S(u64::MAX)];
-        for bits in [64u32, 65, 70, 128, 300] {
-            let b = Nat::from(num_bigint::BigUint::from(1u8) << bits);
-            us.push(b.clone());
-            us.push(b.add_u64(1));
-        }
-        us.sort();
-        let keys: Vec<Vec<u8>> = us.iter().map(|u| encode_key_vec(&Val::Str(doclen_segment_key(u))).unwrap()).collect();
-        let summary = encode_key_vec(&Val::str(FULLTEXT_DOCLEN_KEY)).unwrap();
-        for w in keys.windows(2) {
-            assert_eq!(cmp_keys(&w[0], &w[1]), std::cmp::Ordering::Less);
-        }
-        assert_eq!(cmp_keys(&summary, &keys[0]), std::cmp::Ordering::Less);
-        for u in &us {
-            assert_eq!(doclen_segment_last(&doclen_segment_key(u)).as_ref(), Some(u));
-        }
-        for bad in ["", FULLTEXT_DOCLEN_KEY, "\u{0}NHYDB_FULLTEXT_DOCUMENT_LENGTHS\u{1}00000001", "\u{0}NHYDB_FULLTEXT_DOCUMENT_LENGTHS\u{1}0000000100", "\u{0}NHYDB_FULLTEXT_DOCUMENT_LENGTHS\u{1}000000010A"] {
-            assert!(doclen_segment_last(bad).is_none(), "{bad:?}");
-        }
-        let entries: Vec<(Nat, u64)> = (1..=5000u64).map(|u| (Nat::S(u * 3), u % 50)).collect();
-        let segs = doclen_segments(&entries, 256);
-        assert!(segs.len() > 10);
-        assert_eq!(segs.iter().map(|s| s.len()).sum::<usize>(), entries.len());
-        let mut back = Vec::new();
-        for s in &segs {
-            let d = decode_doclen_segment(&encode_fulltext_doc_lengths(s).unwrap(), Some(s.len() as u64)).unwrap();
-            assert_eq!(d.tokens, s.iter().map(|e| e.1).sum::<u64>());
-            back.extend(d.us.into_iter().zip(d.lens));
-        }
-        assert_eq!(back, entries);
-        assert!(decode_doclen_segment(&encode_fulltext_doc_lengths(&entries[..10]).unwrap(), Some(11)).is_err());
-        assert_eq!(decode_doclen_summary(&encode_doclen_summary(7, 9, 2), Some(7)).unwrap(), (7, 9, 2));
-        assert!(decode_doclen_summary(&encode_doclen_summary(7, 9, 2), Some(8)).is_err());
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "textindex_doclen_key_tests.rs"]
+mod doclen_key_tests;

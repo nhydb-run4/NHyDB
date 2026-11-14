@@ -1107,7 +1107,7 @@ impl SparseMerge {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, nhydb_internal_tests))]
 pub(crate) fn overlap_exceeds_pub(db: &Db, key: &RL) -> bool {
     overlap_exceeds(db, key, u64::MAX).unwrap()
 }

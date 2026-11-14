@@ -193,13 +193,6 @@ impl Error {
 }
 
 
-#[cfg(test)]
-mod size_tests {
-    /// RUN6: `Error` travels in every `Result` of the hot paths; a larger
-    /// variant (unboxed `IoHint`, 56 bytes) made the KQ-10M import about
-    /// 5 % slower. Large payloads belong in a `Box`.
-    #[test]
-    fn error_stays_small() {
-        assert!(std::mem::size_of::<super::Error>() <= 40, "Error is {} bytes", std::mem::size_of::<super::Error>());
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "error_size_tests.rs"]
+mod size_tests;

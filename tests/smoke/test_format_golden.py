@@ -1,4 +1,4 @@
-"""Format golden test (T004).
+"""Format golden test.
 
 A deterministic scenario touching every block type that lives in the
 database file (DATA_DENSE incl. extensions and overlays, SPARSE_CELLS,
@@ -21,7 +21,7 @@ version must open and read it.
 
 An intentional format change: regenerate both with
 
-    python tests/python/test_stab_format_golden.py --update
+    python tests/smoke/test_format_golden.py --update
 
 and document the change (CHANGELOG, docs/FORMAT.md).
 """
@@ -360,7 +360,7 @@ GOLDEN_016_DB = HERE / "golden_016" / "golden.nhydb"
 
 
 def test_format_016_golden_db_is_rejected(tmp_path):
-    """RUN7 (no backward compatibility): the golden database of file format
+    """No backward compatibility: the golden database of file format
     0.16 (NHyDB 0.28.0, before the block directory) is not opened; the
     error names its format, and the file stays unchanged."""
     p = _copy_triad(GOLDEN_016_DB, tmp_path / "copy016")
@@ -388,7 +388,7 @@ def _update():
         with nhydb.NHyDB(p, readonly=True) as db:
             cont = contents(db)
         data = {
-            "comment": "T004 format golden; regenerate with: python tests/python/test_stab_format_golden.py --update",
+            "comment": "format golden; regenerate with: python tests/smoke/test_format_golden.py --update",
             "engine_version": nhydb.__version__ if hasattr(nhydb, "__version__") else None,
             "format": describe_file(p),
             "contents": cont,

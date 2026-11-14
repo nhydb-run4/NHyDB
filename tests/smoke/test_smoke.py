@@ -1,7 +1,7 @@
 """Smoke tests for an installed nhydb package (used by GitHub Actions).
 
 A few short checks of the basic functions: import, create, write, read,
-SQL, index, persistence. The full test suite is in ``tests/python``.
+SQL, index, persistence. The full test suites run before every release.
 """
 from importlib.metadata import version
 from pathlib import Path

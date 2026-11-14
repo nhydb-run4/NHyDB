@@ -45,31 +45,20 @@ Alternatively, build and install in one step: `pip install .`
 ## Test
 
 ```bash
-cargo test --workspace --release           # Rust core
+cargo clippy --workspace --all-targets -- -D warnings
 pip install numpy pytest
-python -m pytest tests/python                 # Python package (installed wheel)
-python -m pytest tests/smoke                  # short smoke tests (as in GitHub Actions)
+python -m pytest tests/smoke                  # smoke and file format tests (installed wheel)
 ```
 
-The Python tests import the *installed* package, not the sources in
-`python/`. The test run prints a fingerprint of the Rust sources
-(`nhydb._native.BUILD_SOURCE_HASH`) and warns if the installed module was
-built from different sources.
-
-Longer runs of the robustness tests are controlled by environment
-variables (the defaults keep the suite fast):
-
-| Variable | Effect |
-|---|---|
-| `NHYDB_FUZZ_SCALE` | scale factor for the number of fuzz cases (byte flips, truncation, mutated payloads) |
-| `NHYDB_FUZZ_SEED` | start seed of the fuzz tests (reproduce a run) |
-| `NHYDB_CRASH_ROUNDS` | number of rounds of the crash simulator (process killed while committing) |
+The smoke tests import the *installed* package, not the sources in
+`python/`. The full test suites are maintained in the development
+repository and run on macOS, Linux and Windows before every release.
 
 The format golden file (SHA-256 per block of a deterministic scenario) is
 regenerated only after an intended format change:
 
 ```bash
-python tests/python/test_stab_format_golden.py --update
+python tests/smoke/test_format_golden.py --update
 ```
 
 ## Disk space

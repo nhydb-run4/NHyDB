@@ -214,7 +214,7 @@ jobs:
           python -m pip install pytest
           python -m pip install --only-binary=:all: numpy || echo "no numpy wheel, NumPy smoke test is skipped"
           python -m pip install --no-index --find-links dist nhydb
-          python -m pytest -q tests/smoke tests/python/test_stab_format_golden.py
+          python -m pytest -q tests/smoke
 
   github-release:
     name: GitHub release (draft)

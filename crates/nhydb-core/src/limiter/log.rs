@@ -285,26 +285,6 @@ fn dos_time(t: SystemTime) -> (u16, u16) {
     (time, date)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn utc_stamps() {
-        assert_eq!(utc_stamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        assert_eq!(utc_stamp(UNIX_EPOCH + Duration::from_secs(1_793_631_845)), "2026-11-02T15:04:05Z");
-        assert_eq!(utc_stamp(UNIX_EPOCH + Duration::from_secs(951_782_400)), "2000-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn file_location() {
-        let c = LogConfig::default();
-        let db = Path::new("/data/x/k.nhydb");
-        assert_eq!(c.file_for(Some(db)), Some(PathBuf::from("/data/x/limiter.txt")));
-        assert_eq!(c.file_for(None), None);
-        let c = LogConfig { path: Some("/var/log/nhydb".into()), ..c };
-        assert_eq!(c.file_for(Some(db)), Some(PathBuf::from("/var/log/nhydb/limiter.txt")));
-        let c = LogConfig { path: Some("logs/stat.txt".into()), ..c };
-        assert_eq!(c.file_for(Some(db)), Some(PathBuf::from("/data/x/logs/stat.txt")));
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "log_tests.rs"]
+mod tests;

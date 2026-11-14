@@ -98,7 +98,7 @@ mod imp {
         if p > 0 { p as u64 } else { 4096 }
     }
 
-    fn parse_rss(buf: &[u8]) -> Option<u64> {
+    pub(super) fn parse_rss(buf: &[u8]) -> Option<u64> {
         let s = std::str::from_utf8(buf).ok()?;
         s.split_ascii_whitespace().nth(1)?.parse::<u64>().ok()
     }
@@ -130,14 +130,6 @@ mod imp {
         max.trim().parse::<u64>().ok()
     }
 
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn statm_rss_field() {
-            assert_eq!(super::parse_rss(b"12345 678 90 1 0 2 0\n"), Some(678));
-            assert_eq!(super::parse_rss(b""), None);
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -198,24 +190,6 @@ pub fn ram_cap() -> Option<u64> {
     imp::ram_cap()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn footprint_follows_a_large_allocation() {
-        let ram = phys_ram().expect("phys_ram");
-        assert!(ram >= 256 << 20, "{ram}");
-        let a = footprint().expect("footprint");
-        assert!(a > 0);
-        let mut v = vec![0u8; 64 << 20];
-        for i in (0..v.len()).step_by(4096) {
-            v[i] = (i >> 12) as u8 | 1;
-        }
-        let b = footprint().expect("footprint");
-        std::hint::black_box(&v);
-        // other test threads allocate too: only a lower bound is stable
-        assert!(b >= a + (48 << 20) || b >= (64 << 20), "before {a}, with 64 MiB {b}");
-        drop(v);
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "footprint_tests.rs"]
+mod tests;

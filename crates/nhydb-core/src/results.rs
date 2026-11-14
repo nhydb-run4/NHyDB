@@ -497,45 +497,6 @@ pub fn submit_sql(db: &Db, text: &str, params: &Params, lane: Lane, target: Resu
     Ok(st)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// P-01/RD4-02 on every platform: a writer fills its part file under its
-    /// own lock, `cleanup_results` leaves the part file and the finished file
-    /// alone while any owner holds it, and takes the file once all owners
-    /// released their locks.
-    #[test]
-    fn cleanup_waits_for_every_owner_and_takes_released_files() {
-        let d = std::env::temp_dir().join(format!("nhydb_results_owner_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = new_managed_path(&d);
-        let mut part = path.as_os_str().to_owned();
-        part.push(".part");
-        let part = PathBuf::from(part);
-        let mut w = ContainerWriter::create(&path, KIND_ROWS, &Val::map(), false, None, None).unwrap();
-        let item = vec![7u8; 4096];
-        for _ in 0..1024 {
-            w.push_raw(&item).unwrap(); // 4 MiB: many physical writes under the lock
-        }
-        assert_eq!(cleanup_results(&d).unwrap(), 0, "active writer");
-        assert!(part.exists());
-        let (writer_lock, _) = w.finish_locked(&Val::map()).unwrap();
-        assert!(path.exists() && !part.exists());
-        assert_eq!(cleanup_results(&d).unwrap(), 0, "writer still holds the finished file");
-        let reader = crate::platform::OwnerLock::new(File::open(&path).unwrap());
-        lock_shared(reader.file(), &path).unwrap();
-        drop(writer_lock);
-        assert_eq!(cleanup_results(&d).unwrap(), 0, "open result holds it");
-        assert_eq!(ContainerReader::open(&path).unwrap().info.items, 1024);
-        drop(reader);
-        assert_eq!(cleanup_results(&d).unwrap(), 1, "nobody holds it any more");
-        assert!(!path.exists());
-        // an unfinished writer removes its own part file
-        let w = ContainerWriter::create(&new_managed_path(&d), KIND_ROWS, &Val::map(), false, None, None).unwrap();
-        drop(w);
-        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "results_tests.rs"]
+mod tests;

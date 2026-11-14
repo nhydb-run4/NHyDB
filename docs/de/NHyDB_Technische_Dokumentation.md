@@ -93,8 +93,8 @@ erfolgen ausschließlich über die API.
 Dieser Abschnitt beschränkt sich auf die Mathematik, die im
 Quellcode **tatsächlich implementiert** ist. Jede Formel ist einer
 Rust-Funktion zugeordnet; die Rechenbeispiele wurden mit der Engine
-nachgerechnet (Python-Aufrufe in das native Modul) bzw. sind Testfälle aus
-`crates/nhydb-core/src/address.rs` und `tests/python/test_math.py`. Wie die
+nachgerechnet (Python-Aufrufe in das native Modul) bzw. sind Testfälle der
+internen Testsuite. Wie die
 Formeln im Kern umgesetzt sind (Datentypen, Rechenpfade), beschreibt
 Abschnitt 3.
 
@@ -544,7 +544,7 @@ einen sauberen `MemoryError` statt eines Absturzes. Getestet sind Koordinaten
 und Werte mit 2^16 380, 2^16 400, 10^5 und 10^6 Bit über Einzel-API,
 `put_points`, `create_realm`, Dense-Batches und MATH-Durchreichung,
 jeweils mit Commit, Wiederöffnen, Lesen und `verify(deep=True)`
-(`tests/python/test_stab_bigint.py`).
+(interne Testsuite).
 
 | Art | Grenze | Wirkungsbereich |
 |---|---|---|
@@ -589,8 +589,8 @@ derselbe Wert.
 | `address.rs::exhaustive_small_range` | alle `N` in `[1, 200 000)`: entweder GZ/N0 oder exakt invertierbar; > 199 000 gültige Zellen |
 | `address.rs::parse_refs` | Textformen von N-Referenzen |
 | `nat.rs` (Unit-Tests) | VarUInt/VarInt inkl. `i64::MIN`, abgeschnittene Eingaben |
-| `tests/python/test_math.py` | Ablehnung von GZ-/N0-Zahlen, Rechenbeispiel `(23, 14, 744)` |
-| `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Zugriff mit `u = 2^70` und `v ≥ 10^40` gegen ein unabhängiges Modell |
+| Python-Tests | Ablehnung von GZ-/N0-Zahlen, Rechenbeispiel `(23, 14, 744)` |
+| Rust-Integrationstest | Sparse-Zugriff mit `u = 2^70` und `v ≥ 10^40` gegen ein unabhängiges Modell |
 
 ---
 
@@ -977,7 +977,7 @@ das Superblockfeld `dir_root`, eine **Präfixprüfsumme** in DATA_DENSE- und
 SPARSE_CELLS-Payloads (Tags `D28D`/`SP28`, Abschnitte 7.6/7.7) und
 SECONDARY-Indizes als **Schlüsselbäume** (Tag `SI28`, Blocktyp 15
 `SECONDARY_PAGE`, Abschnitt 7.8) hinzu; alle übrigen Blöcke und Payloads
-sind unverändert (Golden-Test `test_stab_format_golden.py`). Alle Ganzzahlen
+sind unverändert (Golden-Test `tests/smoke/test_format_golden.py`). Alle Ganzzahlen
 sind Little-Endian.
 
 **Kompatibilität mit NHyDB 0.28.0.** Dateien im Format 0.16 werden
@@ -3516,20 +3516,20 @@ pip install .
 Ein Wheel ist spezifisch für Betriebssystem, CPU-Architektur und
 Python-Version, mit denen es gebaut wurde.
 
-Tests aus dem Quellbaum:
+Prüfung aus dem Quellbaum:
 
 ```bash
-cargo test --workspace --release     # Rust-Kern
+cargo clippy --workspace --all-targets -- -D warnings
 pip install ".[test]"                # oder: pip install numpy pytest
-python -m pytest tests/python        # Python-Paket (gegen das installierte Paket)
+python -m pytest tests/smoke         # Smoke- und Formattests (gegen das installierte Paket)
 ```
 
-Die Python-Tests importieren das **installierte** Paket, nicht die Quellen
+Die Smoke-Tests importieren das **installierte** Paket, nicht die Quellen
 unter `python/`. Ausführliche Hinweise zu Toolchain, Plattformen und Wheels
 enthält `BUILDING.md`. Die GitHub-Actions-Workflows unter
-`.github/workflows/` führen die Tests aus (`ci.yml`) und bauen Wheels für
-Linux, macOS und Windows (`release.yml`, ausgelöst durch einen Versions-Tag;
-siehe `RELEASING.md`).
+`.github/workflows/` führen auf manuellen Start Clippy und die Smoke-Tests
+aus (`ci.yml`) und bauen Wheels für Linux, macOS und Windows (`release.yml`,
+ausgelöst durch einen Versions-Tag; siehe `RELEASING.md`).
 
 ### 17.4 Plattformen
 
@@ -3601,92 +3601,30 @@ Durability, Sperre und Schlüsseldateien je Plattform stehen in
 
 ### 18.1 Teststrategie
 
-1. **Unit- und Integrationstests im Kern** (`cargo test --workspace --release`):
-   Unit-Tests in `crates/nhydb-core/src/**` sowie die Integrationstests
-   `crates/nhydb-core/tests/selftest.rs`,
-   `crates/nhydb-core/tests/sparse_access.rs` und (seit 0.28.2)
-   `crates/nhydb-core/tests/memory_bounds.rs`.
-2. **Python-Tests** (`python -m pytest tests/python`) über das installierte
-   Paket `nhydb`.
-3. **Erschöpfende Tests** (alle Unicode-Code-Points, Adressbereiche).
+Die vollständigen Testsuiten werden im Entwicklungs-Repository gepflegt und
+laufen vor jedem Release unter macOS, Linux und Windows, die Python-Tests
+gegen das gebaute Wheel jeder unterstützten Python-Version (3.12–3.15):
+
+1. **Unit- und Integrationstests im Kern:** Adressmathematik und große Zahlen,
+   Codec, Blockformat und Blockverzeichnis, Sekundär- und Volltextindizes,
+   Abfragepfade, Speicher- und Laufzeitgrenzen, Limiter.
+2. **Python-Tests** über das installierte Paket `nhydb`: Einzel- und
+   NumPy-API, Iteratoren, QueryEngine, NHySQL, MATH_MAP, Cookbook- und
+   README-Beispiele.
+3. **Erschöpfende Tests** (alle Unicode-Codepunkte, Adressbereiche).
 4. **System- und Wartungstests** (Sperren, Manipulation, Konfiguration,
-   Durability, Repair, Kompaktierung).
-5. **Funktionstests je Bereich** (Indizes, QueryEngine, NHySQL, MATH_MAP)
-   mit erwarteten Ergebnissen, die unabhängig aus den Testdaten berechnet
-   sind.
+   Dauerhaftigkeit, Absturz, Reparatur, Kompaktierung, Fuzzing).
+5. **Fachliche Tests je Bereich** mit unabhängig aus den Testdaten
+   berechneten Erwartungen.
 
-### 18.2 Testinventar
+### 18.2 Öffentliche Tests
 
-Rust (`cargo test --workspace --release`): 50 Unit-Tests in
-`crates/nhydb-core/src/**`, 5 Tests in `selftest.rs`, 2 Tests in
-`sparse_access.rs`; die PyO3-Crate `nhydb-py` enthält keine eigenen Tests.
-
-| Datei | Schwerpunkt |
-|---|---|
-| `crates/nhydb-core/src/**` (Unit) | Adressmathematik, Nat/VarUInt, Format, Codec, Krypto (NIST-GCM-, RFC-4231-, SHA-KATs), R0-Kette, Plattform (Sperre, Sync, atomarer Austausch), Freigabe des Dateihandles bei `close`, Rücknahme nach Schreibfehler (Fehlerinjektion, die nur in Test-Builds existiert), Konfiguration, Mengenoperationen, Textindex, MATH, SQL-Lexer |
-| `crates/nhydb-core/tests/selftest.rs` | End-to-End im Kern |
-| `crates/nhydb-core/tests/sparse_access.rs` | Sparse-Punkt-/Bereichszugriff gegen unabhängiges Modell und Vollmerge (12 Seeds, `u = 2^70`, `v ≥ 10^40`) |
-| `tests/python/test_math.py` (6) | Adressmathematik: Ablehnung von GZ/N0, Rechenbeispiel `(23, 14, 744)` |
-| `tests/python/test_math_map.py` (5) | MATH-Ausdrücke, Abbildungsziele einer MathMap, MATH-Layout schreiben/lesen/wieder öffnen, Bitgrenze, Rollback von `put_math_batch` bei Größengrenze |
-| `tests/python/test_index.py` (4) | Aufbau von VALUE-, TOKEN-, TRIGRAM- und FULLTEXT-Indizes, Gleichheits- und Bereichssuche, Token-/Teilstring-/Volltextkandidaten, Erkennung und Neuaufbau veralteter Indizes |
-| `tests/python/test_iterators.py` (3) | Lazy-Iteratoren (`range`/`find`, Schreiben zwischen Iterationsschritten) |
-| `tests/python/test_kernel.py` (8) | Kernelfunktionen, Unicode-16.0.0-Referenzwerte (alle Python-Versionen), Unicode-Tabellen gegen das laufende Python über alle Code Points (nur wenn es ebenfalls Unicode 16.0.0 verwendet, also CPython 3.14), AES-256-GCM gegen `cryptography`, Plan-MAC, JSON |
-| `tests/python/test_kiss_api.py` (6) | Einzel-API, Kontextmanager, Durability-Option, Verlust unkommittierter Daten |
-| `tests/python/test_numpy_api.py` (7) | NumPy ≙ Listen-API bytegleich, Dtypes, Endianness, Strides, Fehler ohne Teil-Append |
-| `tests/python/test_numpy_columns.py` (5) | `put_math_numpy`, Abfrageergebnisse als NumPy-Spalten |
-| `tests/python/test_query.py` (6) | QueryEngine: Zählen über einen frischen VALUE-Index, Aggregation und Gruppierung, Sortierung und Limit, BM25-Suche, Sparse-Überlagerungen über alle Zugriffspfade, große `STRUCT_RANGE` |
-| `tests/python/test_sql.py` (8) | NHySQL: Filter, Gruppierung, Sortierung, positionelle und benannte Parameter, Volltext-Relevanz, NumPy-Ausgabe, Syntaxfehler und nicht unterstützte Anweisungen, Query-CLI |
-| `tests/python/test_system.py` (6) | R0,u1, externer Layoutplan, fail closed, umbenannte DB, Sperre zwischen Prozessen, Konfiguration, Durability `full`, Repair |
-| `tests/python/test_maintenance.py` (9) | Repair, Superblock-Fallback, Kompaktierung, Freigabe des Dateihandles bei `close`, zurückgenommene Appends, manipulierte Header, Plugin-Re-Entrancy, CLI |
-
-Ein Lauf am 2026-10-18 (macOS, Python 3.14, mit `numpy` und
-`cryptography`) ergab **73 bestandene Python-Testfälle** (gezählt
-einschließlich Parametrisierungen) ohne übersprungene Tests, dazu 57
-bestandene Rust-Tests. Die Unicode-Tabellen der Engine sind fest auf
-Unicode 16.0.0 (CPython 3.14) festgelegt, unabhängig vom laufenden Python.
-Unter CPython 3.12, 3.13 und 3.15 (Unicode 15.0, 15.1 und 17.0) werden deshalb die beiden
-vollständigen Vergleiche gegen das laufende `unicodedata` übersprungen
-(71 bestanden, 2 übersprungen); die festen Unicode-16.0.0-Referenzwerte
-werden auf jeder Version geprüft. Unter Windows wird
-`test_failed_append_is_rolled_back` übersprungen, weil er die
-POSIX-Dateigrößengrenze (`RLIMIT_FSIZE`) benötigt; dieselbe Eigenschaft
-(kein Teilblock nach einem Schreibfehler) prüft auf allen Plattformen der
-Rust-Test `db::file_handle_tests::failed_append_is_rolled_back`. `test_kernel.py` überspringt den AES-GCM-Vergleich,
-wenn das Paket `cryptography` fehlt; `test_sql.py` überspringt die
-NumPy-Ausgabe ohne `numpy`.
-
-Die Zahlen oben beschreiben den Release-Stand 0.27.1. Mit der Stabilisierung
-in 0.28.0 (`CHANGELOG.md`) kamen die Regressionstests
-`tests/python/test_stab_*.py` hinzu: Persistenz, Öffnen, Repair und Restore
-(`test_stab_persistence.py`), Schema-Digest und Ablehnung von
-0.27.1-Datenbanken (`test_stab_schema_digest.py`), CLI (`test_stab_cli.py`), große Zahlen
-(`test_stab_bigint.py`), Codec und Eingabeumwandlung (`test_stab_codec.py`),
-ID-Grenzen (`test_stab_ids.py`), MATH-Grenzen (`test_stab_math.py`),
-Index gegen Scan als Matrix aus Szenarien, Prädikaten und Rückgabemodi
-(`test_stab_index_vs_scan.py`), Query-API und geschlossene Datenbank
-(`test_stab_query_api.py`), Rekursionsgrenzen im Subprozess
-(`test_stab_recursion_limits.py`) sowie Python- und NumPy-API einschließlich
-Threads (`test_stab_api.py`); dazu weitere Rust-Unit-Tests (u. a.
-Fehlerinjektion für fsync und Kompaktierung).
-
-Die Leistungsüberarbeitung von 0.28.0 ergänzt Ergebnisgleichheits- und Invariantentests:
-Lesepfad und Block-Cache bei Budgets 0 bis 256 MiB inkl. Korruption
-(`test_perf_lesen.py`), Schnellpfade der Abfragen gegen den allgemeinen Pfad
-(`test_perf_query_paths.py`), Kompaktierung, `put_math`, GIL-Freigabe,
-NumPy-Ausgabe, `batch()` und `rollback()` (`test_perf_schreiben.py`) sowie
-Cache-Kohärenz nach `rollback`, `batch` und Kompaktierung
-(`test_perf_integration.py`); Rust-Tests u. a. in `db/blockcache.rs`.
-
-Mit 0.28.2 kamen hinzu: Blockverzeichnis über die Python-API mit sehr
-kleinen Schwellen, beschädigte Verzeichnisblöcke und speicherbegrenzte
-Kompaktierung (`test_stab_directory.py`), Golden-Test der Blockpayloads
-(`test_stab_format_golden.py`), der Regressionspool zu 0.28.2
-(`test_regress_0282.py`); in Rust Zwillingsvergleiche mit und ohne
-Verzeichnis (`db/directory_tests.rs`), Komplexitätstests über gezählte
-Lesezugriffe (`db/complexity_tests.rs`) und Speichergrenzen mit zählendem
-Allokator (`crates/nhydb-core/tests/memory_bounds.rs`), Unit-Tests der
-Schlüsselbäume (`db/secindex.rs`: Schlüsselkodierung und Ordnung von
-Schreiber und Leser, tiefe Bäume gegen eine Brute-Force-Suche).
+Veröffentlicht sind die Smoke-Tests `tests/smoke/`: kurze Prüfungen der
+Grundfunktionen gegen das installierte Paket und der Format-Golden-Test.
+Dieser vergleicht ein deterministisches Szenario blockweise mit
+`tests/smoke/golden/` und prüft, dass eine Datenbank des alten Formats 0.16
+(`tests/smoke/golden_016/`) abgelehnt wird. GitHub Actions führt Clippy und
+diese Tests aus.
 
 ### 18.3 Versionskennungen
 
@@ -3900,6 +3838,6 @@ Zusätze wie Pfade oder Hinweise); Programme sollen Fehlerklassen und – bei
 | Wartung | `crates/nhydb-core/src/db/maint.rs`, `db/merge.rs` (speicherbegrenzte Sparse-Zusammenführung) |
 | Plattform, Konfiguration | `crates/nhydb-core/src/platform.rs`, `config.rs` |
 | Python | `crates/nhydb-py/src/*.rs`, `python/nhydb/*.py` |
-| Tests | `crates/nhydb-core/tests/*.rs`, `tests/python/test_*.py` |
+| Tests | `tests/smoke/` (Smoke- und Formattests); die vollständigen Testsuiten liegen im Entwicklungs-Repository |
 | Beispielkonfiguration | `config/nhydb_config.example.toml` |
 | Build | `BUILDING.md`, `pyproject.toml`, `Cargo.toml` |

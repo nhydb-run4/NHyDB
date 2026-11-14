@@ -913,49 +913,6 @@ impl Db {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::address::NL;
-    use crate::codec::FieldDef;
-    use crate::db::OpenOptions;
-
-    fn db_with(name: &str) -> (Db, std::path::PathBuf) {
-        let d = std::env::temp_dir().join(format!("nhydb_cols_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("c.nhydb");
-        let r = Nat::S(1);
-        let mut db = Db::create(&p, true, OpenOptions::default()).unwrap();
-        db.create_realm(&r, "r", "", None, &Nat::ZERO).unwrap();
-        db.create_shape(1, &r, "s", vec![FieldDef::new(Nat::S(1), "n", TypeCode::VarUInt)], "").unwrap();
-        db.create_classic_layout(1, &r, "c", 1, &Nat::ZERO, &Nat::S(1), None, 0, "").unwrap();
-        let rows = vec![vec![Val::Int(5)], vec![Val::from_bigint(num_bigint::BigInt::from(1u8) << 70)]];
-        db.put_dense_batch(&r, &Nat::S(1), &DenseRows::Tuples(&rows), Some(1), &[], NL, false).unwrap();
-        (db, d)
-    }
-
-    /// F018: a huge `count` is an error, never an abort/panic.
-    #[test]
-    fn read_columns_huge_count_is_memory_error() {
-        let (db, d) = db_with("huge");
-        for count in [usize::MAX, usize::MAX / 2, 1usize << 40] {
-            let e = db.read_columns(&Nat::S(1), &Nat::S(1), count, None, NL, false).unwrap_err();
-            assert!(matches!(e, Error::Memory(_)), "{e}");
-        }
-        let _ = std::fs::remove_dir_all(d);
-    }
-
-    /// F033: dtype depends on the field type; misfits raise unless allowed.
-    #[test]
-    fn read_columns_deterministic_dtype() {
-        let (db, d) = db_with("dtype");
-        let ok = db.read_columns(&Nat::S(1), &Nat::S(1), 1, None, NL, false).unwrap();
-        assert!(matches!(ok.cols[0], OutCol::U64(_)));
-        assert!(matches!(db.read_columns(&Nat::S(1), &Nat::S(1), 2, None, NL, false), Err(Error::Value(_))));
-        let obj = db.read_columns(&Nat::S(1), &Nat::S(1), 3, None, NL, true).unwrap();
-        assert!(matches!(&obj.cols[0], OutCol::Vals(v) if v.len() == 3));
-        assert_eq!(obj.present, vec![1, 1, 0]);
-        let _ = std::fs::remove_dir_all(d);
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "columns_tests.rs"]
+mod tests;

@@ -1385,42 +1385,6 @@ pub fn execute_sql(engine: &QueryEngine<'_>, text: &str, params: &Params, lane: 
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// F016: parentheses/NOT nesting is limited, AND/OR chains are n-ary.
-    #[test]
-    fn nesting_limit_and_flat_chains() {
-        let deep = format!("SELECT a FROM t WHERE {}a = 1{}", "(".repeat(MAX_EXPR_DEPTH + 1), ")".repeat(MAX_EXPR_DEPTH + 1));
-        assert!(matches!(parse_sql(&deep, &Params::None), Err(Error::SqlSyntax(m)) if m.contains("nested deeper")));
-        let ok = format!("SELECT a FROM t WHERE {}a = 1{}", "(".repeat(MAX_EXPR_DEPTH), ")".repeat(MAX_EXPR_DEPTH));
-        assert!(parse_sql(&ok, &Params::None).is_ok());
-        let nots = format!("SELECT a FROM t WHERE {}a = 1", "NOT ".repeat(100_000));
-        assert!(matches!(parse_sql(&nots, &Params::None), Err(Error::SqlSyntax(_))));
-        let chain = format!("SELECT a FROM t WHERE {}", vec!["a = 1"; 50_000].join(" AND "));
-        let st = parse_sql(&chain, &Params::None).unwrap();
-        assert!(matches!(st.where_, Expr::Bool { ref op, ref children } if op == "and" && children.len() == 50_000));
-    }
-
-    #[test]
-    fn lexer_and_errors() {
-        let t = scan("SELECT a, \"b c\" FROM r WHERE x <> 'it''s' AND y >= -1.5e3 -- c\n AND z = ?").unwrap();
-        assert_eq!(t.last().unwrap().kind, TokKind::Eof);
-        assert!(t.iter().any(|x| x.kind == TokKind::Ident && x.value == Val::str("b c")));
-        assert!(t.iter().any(|x| x.kind == TokKind::Str && x.value == Val::str("it's")));
-        assert!(t.iter().any(|x| x.kind == TokKind::Number && x.value == Val::Float(-1500.0)));
-        assert!(t.iter().any(|x| x.kind == TokKind::Param && x.value == Val::Int(0)));
-        assert_eq!(scan("x = ٣").unwrap()[2].value, Val::Int(3));
-        assert!(matches!(scan("x = ①"), Err(Error::SqlSyntax(m)) if m == "invalid number '①'"));
-        assert_eq!(py_float_literal("1."), Some(1.0));
-        assert_eq!(py_float_literal("1.e2"), Some(100.0));
-        assert_eq!(py_float_literal("1e"), None);
-        let e = parse_sql("SELECT id\nFROM records WHERE", &Params::None).unwrap_err().to_string();
-        assert_eq!(e, "identifier expected (line 2, column 19, near '')");
-        let s = parse_sql("SELECT COUNT(*), r.id x FROM main.records AS r WHERE NOT r.a = 1 OR @u BETWEEN 1 AND 3 LIMIT 5", &Params::None).unwrap();
-        assert_eq!(s.select_items[0].alias.as_deref(), Some("count_all"));
-        assert_eq!(s.source, vec!["main".to_string(), "records".to_string()]);
-        assert_eq!(s.limit, Some(BigInt::from(5)));
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "sql_tests.rs"]
+mod tests;

@@ -607,23 +607,6 @@ impl IndexDef {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn persisted_ids_out_of_range_are_corruption() {
-        // F004: negative or > 2^63-1 IDs are never clamped on load.
-        for bad in ["-5", "9223372036854775808", "18446744073709551615", "1.5", "\"7\""] {
-            let js = format!(r#"{{"shape_id": {bad}, "realm_id": 1, "name": "s", "fields": []}}"#);
-            let v = Val::from_json(&js).unwrap();
-            assert!(matches!(ShapeDef::from_val(&v), Err(Error::Corruption(_))), "{bad}");
-        }
-        let v = Val::from_json(r#"{"shape_id": 9223372036854775807, "realm_id": 1, "name": "s", "fields": []}"#).unwrap();
-        assert_eq!(ShapeDef::from_val(&v).unwrap().shape_id, MAX_ID);
-        let s = ShapeDef::new(MAX_ID, Nat::ONE, "s".into(), vec![], String::new()).unwrap();
-        assert_eq!(ShapeDef::from_val(&Val::from_json(&s.to_val().to_json().unwrap()).unwrap()).unwrap().shape_id, MAX_ID);
-        assert!(matches!(ShapeDef::new(MAX_ID + 1, Nat::ONE, "s".into(), vec![], String::new()), Err(Error::Value(_))));
-        assert!(matches!(check_id("index_id", u64::MAX), Err(Error::Value(_))));
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "schema_tests.rs"]
+mod tests;

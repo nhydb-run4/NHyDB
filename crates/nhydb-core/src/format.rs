@@ -266,48 +266,10 @@ pub fn unpack_block_header(raw: &[u8]) -> Result<BlockHeader> {
     Ok(h)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "format_tests.rs"]
+mod tests;
 
-    #[test]
-    fn super_roundtrip() {
-        let s = SuperState { generation: 7, checkpoint_offset: 9, last_valid_end: 8192, next_block_id: 3, created_ns: 1, updated_ns: 2, flags: 0, dir_root: 8192 };
-        let raw = pack_super(&s);
-        assert_eq!(unpack_super(&raw).unwrap(), s);
-        let mut bad = raw.clone();
-        bad[20] ^= 1;
-        assert!(unpack_super(&bad).is_err());
-    }
-
-    #[test]
-    fn header_roundtrip() {
-        let h = pack_block_header(BT_SHAPE, 5, b"hello", 1);
-        let p = unpack_block_header(&h).unwrap();
-        assert_eq!((p.block_type, p.block_id, p.payload_len, p.flags), (BT_SHAPE, 5, 5, 1));
-        assert_eq!(p.payload_crc, crc32(b"hello"));
-        let mut bad = h;
-        bad[9] ^= 1;
-        assert!(unpack_block_header(&bad).is_err());
-    }
-}
-
-#[cfg(test)]
-mod prefix_crc_tests {
-    use super::*;
-
-    #[test]
-    fn prefix_crc_is_crc32c_and_independent_of_the_payload_crc() {
-        assert_eq!(prefix_crc(b"123456789"), 0xE306_9283); // CRC-32C check value
-        let mut a = b"D28D\x01\x01\x0b\x0d".to_vec();
-        let mut b = b"D28D\x01\x01\x29\x0d".to_vec();
-        seal_prefix(&mut a);
-        seal_prefix(&mut b);
-        a.extend_from_slice(b"records");
-        b.extend_from_slice(b"records");
-        assert_ne!(crc32(&a), crc32(&b), "the payload CRC must still see a forged prefix");
-        let mut p = 8;
-        check_prefix_crc(&a, &mut p).unwrap();
-        assert_eq!(p, 12);
-    }
-}
+#[cfg(all(test, nhydb_internal_tests))]
+#[path = "format_prefix_crc_tests.rs"]
+mod prefix_crc_tests;

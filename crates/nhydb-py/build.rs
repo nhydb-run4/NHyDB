@@ -1,7 +1,6 @@
-//! Build fingerprint (T024): CRC-32 over the Rust sources of the workspace,
-//! exported as `nhydb._native.BUILD_SOURCE_HASH`. `tests/python/conftest.py`
-//! computes the same value from the checkout and warns if the installed
-//! native module was built from a different source state.
+//! Build fingerprint: CRC-32 over the Rust sources of the workspace,
+//! exported as `nhydb._native.BUILD_SOURCE_HASH`, so that a source checkout
+//! can tell whether the installed native module was built from it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,8 +28,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Relative paths (with `/`) of the fingerprinted files; must match
-/// `_source_files()` in `tests/python/conftest.py`.
+/// Relative paths (with `/`) of the fingerprinted files.
 fn source_files(root: &Path) -> Vec<(String, PathBuf)> {
     let mut files: Vec<PathBuf> = ["Cargo.toml", "Cargo.lock", "crates/nhydb-core/Cargo.toml", "crates/nhydb-py/Cargo.toml"]
         .iter()
@@ -54,7 +52,7 @@ fn source_files(root: &Path) -> Vec<(String, PathBuf)> {
 /// Content that enters the fingerprint. Manifests without their
 /// `license-file` lines: `maturin sdist` rewrites `license-file.workspace =
 /// true` to `license-file = "LICENSE.md"` (P-08), which does not change
-/// the build. Must match `_hashed_bytes()` in `tests/python/conftest.py`.
+/// the build.
 fn hashed_bytes(rel: &str, data: Vec<u8>) -> Vec<u8> {
     if !rel.ends_with("Cargo.toml") {
         return data;
@@ -87,4 +85,16 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(r).display());
     }
     println!("cargo:rerun-if-changed=build.rs");
+    internal_tests_cfg(&manifest, "src/numpy_io_col_builder_tests.rs");
+}
+
+/// Unit tests that are not part of the published sources live in separate
+/// `*_tests.rs` files; they are compiled only where those files exist.
+fn internal_tests_cfg(manifest: &Path, marker: &str) {
+    println!("cargo::rustc-check-cfg=cfg(nhydb_internal_tests)");
+    let m = manifest.join(marker);
+    println!("cargo:rerun-if-changed={}", m.display());
+    if m.is_file() {
+        println!("cargo:rustc-cfg=nhydb_internal_tests");
+    }
 }

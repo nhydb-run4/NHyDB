@@ -6,9 +6,8 @@ need no knowledge of the Rust core.
 
 Every Python block in this cookbook is a complete program: it has its own
 imports, creates its databases in a fresh temporary directory and closes
-them again. The blocks are executed automatically by the test suite
-(`tests/python/test_cookbook.py`), so what you read here is what the
-published package does. Blocks marked `# requires: numpy` need the optional
+them again. The blocks are executed automatically by the test suite before
+every release, so what you read here is what the published package does. Blocks marked `# requires: numpy` need the optional
 NumPy package.
 
 ## Contents

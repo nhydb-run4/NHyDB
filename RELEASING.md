@@ -30,9 +30,10 @@ change keeps it.
    If dependencies changed (`Cargo.lock`), regenerate the third-party
    notices: `cargo fetch && python tools/gen_third_party_licenses.py`, and
    commit `THIRD-PARTY-LICENSES.txt`.
-3. Build and run the full test suites locally on Linux, macOS and Windows
-   (see [BUILDING.md](BUILDING.md)). GitHub Actions only runs short smoke
-   tests; the complete Rust and Python tests are part of this step.
+3. Build (see [BUILDING.md](BUILDING.md)) and run the full test suites of
+   the development repository locally on Linux, macOS and Windows. GitHub
+   Actions only runs the short smoke tests (`tests/smoke`); the complete
+   Rust and Python tests are part of this step.
 4. Optional dry run: start the workflow *Release* manually
    (Actions → Release → Run workflow). It builds and smoke-tests all wheels
    and the source distribution and publishes nothing.

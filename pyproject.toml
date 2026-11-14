@@ -52,4 +52,4 @@ module-name = "nhydb._native"
 features = []
 
 [tool.pytest.ini_options]
-testpaths = ["tests/python"]
+testpaths = ["tests/smoke"]
